@@ -7,6 +7,12 @@
 <p align="center">一个运行在 Windows 桌面的可自定义 AI 桌宠</p>
 
 <p align="center">
+  <a href="https://petra.xin/"><b>🌐 官方网站：petra.xin</b></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/ks-kbl/petra/releases">下载最新版</a>
+</p>
+
+<p align="center">
   <img src="assets/wink.gif" height="200" alt="Petra Wink Demo" />
   <img src="assets/sleep.gif" height="200" alt="Petra Sleep Demo" />
   <img src="assets/sway.gif" height="200" alt="Petra Sway Demo" />
