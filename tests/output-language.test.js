@@ -60,7 +60,7 @@ check(
   greet.slice(greet.indexOf(jaReminder) + jaReminder.length).trim() === "",
   JSON.stringify(greet.slice(greet.indexOf(jaReminder) + jaReminder.length)),
 );
-check("问候正文仍是中文 prompt（指令语言与输出语言无关）", greet.includes("[主动问候]") && greet.includes("自然地和用户打个招呼"));
+check("问候正文仍是中文 prompt（指令语言与输出语言无关）", greet.includes("[主动问候]") && greet.includes("两个信息来源") && greet.includes("窗口检查"));
 check("旧的「把语言指令埋在中段」的写法已消失", !greet.includes("【最高优先级·最终指令】"));
 
 // ---------- 抽卡点评：同一不变式 ----------
@@ -73,7 +73,7 @@ check("抽卡点评正文保留卡面信息", comment.includes("SSR") && comment
 // ---------- 中文用户：一个字都不能变 ----------
 const zhGreet = pp.buildGreetingPrompt({ ...parts, outputLanguage: "zh-cn" });
 check("中文时不追加提醒", !zhGreet.includes("[系统提醒"));
-check("中文时问候正文以中文要求收尾", zhGreet.trimEnd().endsWith("不要说\"作为AI\"之类的话。"));
+check("中文时问候正文以 JSON 格式要求收尾", zhGreet.trimEnd().endsWith("要发给用户的问候\"}"));
 const autoGreet = pp.buildGreetingPrompt({ ...parts, outputLanguage: "" });
 check("语言为自动时同样不追加提醒", autoGreet === zhGreet);
 
@@ -96,6 +96,27 @@ check(
   "三条出口都通过 proactivePrompts / 提醒函数带语言指令（没有裸 prompt 直拼）",
   (panelSrc.match(/proactiveLangInstruction\(/g) || []).length >= 2,
 );
+
+// ---------- 主动问候：双来源 + 未回复话题约束 + JSON 解析 ----------
+const insight = pp.buildGreetingPrompt({
+  ...parts,
+  windowInfo: "VS Code（窗口标题：main.ts - Petra - Visual Studio Code）",
+  screenshotAvailable: true,
+  previousGreeting: { summary: "主人在写代码", greeting: "又在敲代码呀？" },
+  recentGreetingTopics: ["主人在写代码"],
+});
+check("问候 prompt 同时包含窗口检查与截图来源", insight.includes("窗口检查") && insight.includes("屏幕截图"));
+check("问候 prompt 写入上一次未回复的问候", insight.includes("上一次问候用户没有回复") && insight.includes("又在敲代码呀"));
+check("问候 prompt 写入今天已问候话题", insight.includes("今天已经问候过的话题"));
+check("问候 prompt 要求换不同话题", insight.includes("必须换一个完全不同的话题"));
+check("问候 prompt 要求输出 summary/greeting JSON", insight.includes('"summary"') && insight.includes('"greeting"'));
+
+const parsedGreeting = pp.parseGreetingResult('```json\n{"summary":"主人在写代码","greeting":"写累了吧，喝口水～"}\n```');
+check("能解析带代码块的 JSON 问候", parsedGreeting.parsed === true && parsedGreeting.summary === "主人在写代码" && parsedGreeting.greeting === "写累了吧，喝口水～");
+const badGreeting = pp.parseGreetingResult("今天辛苦啦");
+check("非 JSON 输出回退为整段问候", badGreeting.parsed === false && badGreeting.greeting === "今天辛苦啦");
+const loose = pp.parseGreetingResult('{"summary":"在看文档","greeting":"第一行\n第二行"}');
+check("JSON 字符串里未转义换行也能救出 greeting", loose.parsed === true && loose.greeting.includes("第一行") && loose.greeting.includes("第二行"), JSON.stringify(loose));
 
 console.log(`\noutput-language: pass=${pass} fail=${fail}`);
 if (fail > 0) process.exit(1);

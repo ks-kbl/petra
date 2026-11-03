@@ -1574,8 +1574,8 @@ fn active_window_title() -> String {
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindow, GetWindowTextW, GetWindowThreadProcessId,
-        IsWindowVisible, GW_HWNDNEXT,
+        GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindow,
+        GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GW_HWNDNEXT,
     };
     unsafe {
         let mut hwnd = GetForegroundWindow();
@@ -1583,11 +1583,27 @@ fn active_window_title() -> String {
             return String::new();
         }
         let own_pid = std::process::id();
+        let shell_window = GetShellWindow();
+        let desktop_window = GetDesktopWindow();
         let mut walked = 0u32;
         loop {
             let mut wpid: u32 = 0;
             GetWindowThreadProcessId(hwnd, Some(&mut wpid));
-            if wpid != own_pid && IsWindowVisible(hwnd).as_bool() {
+            // 桌面壳 / 任务栏 / 开始菜单不是"主人正在用的软件"：
+            // 只停桌面时 z 序第一个可见窗口常是 Program Manager [explorer.exe]，
+            // 旧逻辑会把它当成文件管理器，主动问候于是老说"你在用文件管理器"。
+            let mut class_buf = [0u16; 256];
+            let class_len = GetClassNameW(hwnd, &mut class_buf);
+            let class_name = String::from_utf16_lossy(&class_buf[..class_len.max(0) as usize])
+                .to_ascii_lowercase();
+            let is_shell = hwnd == shell_window
+                || hwnd == desktop_window
+                || matches!(
+                    class_name.as_str(),
+                    "progman" | "workerw" | "shell_traywnd" | "shell_secondarytraywnd"
+                        | "windows.ui.core.corewindow"
+                );
+            if wpid != own_pid && !is_shell && IsWindowVisible(hwnd).as_bool() {
                 break;
             }
             // 上限兜底：z 序理论上有限，但异常窗口链不该让这里转死

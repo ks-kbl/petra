@@ -16,6 +16,8 @@
  * 窗口形状，因此 ✕ 点得到（桌宠窗口其余部分仍是点击穿透的）。
  */
 
+import { localizeUiText } from "../utils/uiText";
+
 export type ErrorPopupKind = "error" | "warn" | "http";
 
 /** 三种提示的颜色与文案：红=错误、橙=需要注意、黄=请求失败 */
@@ -62,7 +64,7 @@ export function initErrorPopup(opts: ErrorPopupOptions): void {
 }
 
 function normalize(text: string): string {
-  return text.replace(/\s+/g, " ").trim().slice(0, 200);
+  return localizeUiText(text.replace(/\s+/g, " ").trim().slice(0, 200));
 }
 
 function ensureElement(): HTMLElement {

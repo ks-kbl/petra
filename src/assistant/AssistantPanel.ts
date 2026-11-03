@@ -9,17 +9,26 @@ import { loadDiaries, getDiary } from "../features/diary/DiaryManager";
 import { loadSettings, saveSettings } from "../utils/settings";
 import { getApiKey, currentKeyScope, normalizeOpenAIBase } from "./apiKey";
 import { buildLanguageInstruction, buildLanguageReminder, langNameOf, splitTranslation } from "../utils/outputLanguage";
-import { appNameFromTitle, frontWindowForModel, isOwnWindow } from "../utils/foregroundApp";
+import { appNameFromTitle, frontWindowForModel, isDesktopWindow, isOwnWindow } from "../utils/foregroundApp";
 import {
   buildCardCommentPrompt,
   buildGreetingPrompt,
+  parseGreetingResult,
   proactiveLangInstruction,
 } from "./proactivePrompts";
+import {
+  markLatestGreetingReplied,
+  previousUnansweredGreeting,
+  recentGreetingTopics,
+  type GreetingRecord,
+} from "./greetingMemory";
+import { markGreetingForHistory } from "./greetingHistory";
 import { ToolLoopBudget, formatToolError, toolNames, truncateToolResult, validateToolArgs } from "./toolRuntime";
 import { ttsPlayer } from "../tts/TTSPlayer";
 import { getVisibleRect } from "../ui/visible";
 import { deleteWrongHistory } from "./ChatHistory";
 import { toast } from "../ui/Toast";
+import { localizeUiText } from "../utils/uiText";
 import { notifyHttpError } from "../ui/ErrorPopup";
 import { getSpeechRecognizer, type SpeechRecognizer } from "../asr/SpeechRecognizer";
 import { pluginRuntime } from "../plugins/runtime";
@@ -33,6 +42,8 @@ function idleHideMs(): number {
 }
 const HIST_KEY = "live2d-pet-assistant-history";
 const MEM_KEY = "live2d-pet-assistant-memory";
+/** 主动问候话题记录：最近几次问候的 summary / 是否被回复，用于避免一天内重复话题 */
+const GREETING_LOG_KEY = "petra-greeting-log";
 
 let inputBar: HTMLElement | null = null;
 let bubbles: HTMLElement | null = null;
@@ -42,8 +53,10 @@ let history: ChatMessage[] = [];
 let memory: MemoryStore = [];
 let timer: number | null = null;
 let busy = false;
-/** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant） */
+/** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant / triggerProactive） */
 let historyLoaded = false;
+/** 最近一次用户主动聊天/打开对话面板的时间：判断"问候到点时用户是不是正在聊" */
+let lastConversationActivityAt = 0;
 let lifecycleOnOpen: (() => void) | null = null;
 let lifecycleOnClose: (() => void) | null = null;
 
@@ -269,6 +282,71 @@ async function loadHistory() {
 function saveHistory() {
   // 整体覆盖写到 app_data_dir/chat-history.json；fire-and-forget，失败不阻塞对话
   void invoke("save_chat_history", { content: JSON.stringify(history) }).catch(() => {});
+}
+
+// ---------- 主动问候：对话活动判断 + 话题记录 ----------
+function markConversationActivity(): void {
+  lastConversationActivityAt = Date.now();
+}
+
+function assistantPanelIsOpen(): boolean {
+  return !!inputBar && !inputBar.classList.contains("hidden");
+}
+
+/** 用户是不是正在和 AI 对话（面板开着、AI 正在回复，或刚聊完两分钟内） */
+export function isAssistantConversationActive(): boolean {
+  return busy || assistantPanelIsOpen() || Date.now() - lastConversationActivityAt < 2 * 60 * 1000;
+}
+
+/** 问候流程内部用：不含 busy（问候自身会把 busy 置真） */
+function isUserConversationActive(): boolean {
+  return assistantPanelIsOpen() || Date.now() - lastConversationActivityAt < 2 * 60 * 1000;
+}
+
+function loadGreetingLog(): GreetingRecord[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GREETING_LOG_KEY) || "[]");
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter((r): r is GreetingRecord =>
+        !!r && typeof r === "object"
+        && Number.isFinite((r as GreetingRecord).at)
+        && typeof (r as GreetingRecord).greeting === "string",
+      )
+      .map((r) => ({
+        at: r.at,
+        summary: typeof r.summary === "string" ? r.summary : "",
+        greeting: r.greeting,
+        replied: r.replied === true,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function saveGreetingLog(records: GreetingRecord[]): void {
+  try {
+    const now = Date.now();
+    // 只保留最近 7 天、最多 50 条，避免 localStorage 无限增长
+    const kept = records
+      .filter((r) => now - r.at < 7 * 24 * 60 * 60 * 1000)
+      .slice(-50);
+    localStorage.setItem(GREETING_LOG_KEY, JSON.stringify(kept));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+function recordGreeting(summary: string, greeting: string): void {
+  const records = loadGreetingLog();
+  records.push({ at: Date.now(), summary: summary.trim(), greeting: greeting.trim(), replied: false });
+  saveGreetingLog(records);
+}
+
+/** 用户发出任意聊天消息 = 回复了最近一次主动问候 */
+function markGreetingRepliedByUser(): void {
+  const records = loadGreetingLog();
+  if (markLatestGreetingReplied(records, Date.now())) saveGreetingLog(records);
 }
 
 function ensureInput() {
@@ -903,6 +981,7 @@ function trimBubbles(keepLastUser: boolean) {
 }
 
 export async function openAssistant(modelRect?: { left: number; top: number; right: number; bottom: number }) {
+  markConversationActivity();
   ensureInput();
   ensureBubbles();
   loadMemory();
@@ -1107,22 +1186,30 @@ function makeStreamColorHook(el: HTMLElement): {
 /** 把原始 API 错误翻译成友善提示（402 余额不足 / 401 Key 无效 / 429 限流等） */
 function friendlyApiError(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);
-  if (/402|insufficient balance|余额不足|欠费/i.test(raw)) {
-    return "💸 API 余额不足（402）：请到「小助手设置」充值，或换一个可用的 API Key。\n（AI 暂时下线，但右键 →「🎮 小游戏」，桌宠还能陪你打麻将哦～）";
+  const status = Number((/API 错误\s*(\d{3})/i.exec(raw) || /HTTP\s*(\d{3})/i.exec(raw) || [])[1] || 0);
+  if (/402|insufficient balance|余额不足|欠费|quota exceeded/i.test(raw) || status === 402) {
+    return "💸 API 余额不足或额度已用完：请到「小助手设置」充值，或换一个可用的 API Key。\n（AI 暂时下线，但右键 →「🎮 小游戏」，桌宠还能陪你打麻将哦～）";
   }
-  if (/401|invalid_api_key|unauthorized|令牌|鉴权/i.test(raw)) {
-    return "🔑 API Key 无效或已过期，请到「小助手设置」重新填写。";
+  if (/401|403|invalid_api_key|unauthorized|forbidden|令牌|鉴权/i.test(raw) || status === 401 || status === 403) {
+    return "🔑 API Key 无效、已过期或没有权限，请到「小助手设置」重新填写。";
   }
-  if (/429|rate limit|too many requests|限流/i.test(raw)) {
-    return "⏳ 请求太频繁了（429），缓一缓再聊吧～";
+  if (/429|rate limit|too many requests|限流/i.test(raw) || status === 429) {
+    return "⏳ 请求太频繁了，缓一缓再聊吧～";
   }
-  if (/timeout|超时|failed to fetch|networkerror|网络/i.test(raw)) {
-    return "🌐 网络不可用或超时，检查网络/代理后再试。";
+  if (/timeout|超时|failed to fetch|networkerror|load failed|网络|econn|enotfound/i.test(raw)) {
+    return "🌐 网络不可用或请求超时，请检查网络/代理后再试。";
   }
-  if (/404|model not found|模型/i.test(raw)) {
-    return "🤖 模型名无效（404）：请在设置里点「自动获取模型」重新选一个。";
+  if (/404|model not found|model_not_found|模型/i.test(raw) || status === 404) {
+    return "🤖 模型名或接口地址不存在：请在设置里检查「API 端点 / 模型名」，或点「自动获取模型」重新选择。";
   }
-  return raw;
+  if (status === 400 || status === 422) {
+    return "⚠️ 请求参数不被服务端接受（400/422）：请检查模型名、端点地址，以及当前模型是否支持该功能。";
+  }
+  if (status >= 500 && status <= 599) {
+    return "🛠️ 服务端暂时不可用，请稍后重试。";
+  }
+  // 未知错误：给用户一句中文兜底，原始英文只写日志（send 的 catch 已调用 debug_mark）
+  return localizeUiText(raw) || "AI 请求失败，请稍后重试。";
 }
 
 /** 注入 system prompt 的紧凑环境上下文（约 20-30 token：称呼 + 时间 + 陪伴时长，增强陪伴感） */
@@ -1153,6 +1240,7 @@ async function send(text: string) {
   // 于是 AI 回了一句「刚关过了呀，那页已经没了」。
   if (recognizer?.isRecording()) recognizer.cancel();
   if (busy) return;
+  markConversationActivity();
   const s = loadSettings();
   const ttsKey = await invoke<string>("get_tts_key").catch(() => "");
   ttsPlayer.setConfig(s.tts.enabled, ttsKey, s.tts.speakerId, s.assistant.outputLanguage ?? "");
@@ -1197,6 +1285,8 @@ async function send(text: string) {
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑
   const langReminder = buildLanguageReminder(outLang ?? "");
   const userContent = langReminder ? `${text}\n${langReminder}` : text;
+  // 消息真正发出去才算"回应了主动问候"（没回应则下一轮问候要换话题）
+  markGreetingRepliedByUser();
   history.push({ role: "user", content: userContent });
   saveHistory();
   // 记下"确实发出去了"的原文：语音收尾迟到时 onFinal 靠它去重
@@ -1978,25 +2068,44 @@ export function sayPetLine(text: string, holdMs = 6000): void {
   scheduleFade(b, holdMs);
 }
 
-export async function triggerProactive() {
-  if (busy) return;
+export async function triggerProactive(): Promise<boolean> {
+  // 已经在回复 / 用户正开着对话框聊天：取消本次问候（用户要求：正在聊天时不插话）
+  if (busy || isUserConversationActive()) return false;
+
   const s = loadSettings();
   const apiKey = await ensureApiKey();
-  if (!s.assistant.enabled || !isProviderReady(s.assistant, apiKey)) return;
+  if (!s.assistant.enabled || !isProviderReady(s.assistant, apiKey)) return false;
 
-  // 收集上下文
-  let currentTitle = "";
-  let currentApp = "";
-  try {
-    currentTitle = await invoke<string>("active_window_title");
-  } catch { /* 忽略 */ }
-  // 桌宠自己置顶，用户点它 / 用小助手时它就是前台窗口 —— 那不是"主人在用别的软件"，
-  // 否则问候里会说"Petra 还开着呢"（它自己就是 Petra）
-  if (isOwnWindow(currentTitle)) {
-    currentTitle = "";
-  } else {
-    currentApp = appNameFromTitle(currentTitle);
+  // 问候要进主对话历史，所以先把磁盘历史加载好，避免之后第一条消息把历史文件覆盖掉
+  if (!historyLoaded) {
+    await loadHistory();
+    historyLoaded = true;
   }
+
+  // 固定并发调用两个"问候工具"：截屏 + 前台窗口检查。
+  // 用户要求 AI 通过两个来源自行总结，再生成相关问候。
+  const [winRes, shotRes] = await Promise.allSettled([
+    invoke<string>("active_window_title"),
+    invoke<string>("capture_screen"),
+  ]);
+  const rawWindow = winRes.status === "fulfilled" ? (winRes.value || "") : "";
+  const screenshotB64 = shotRes.status === "fulfilled" ? (shotRes.value || "") : "";
+  const screenshot = screenshotB64 ? `data:image/png;base64,${screenshotB64}` : undefined;
+
+  let windowInfo = "";
+  if (rawWindow) {
+    if (isOwnWindow(rawWindow)) {
+      windowInfo = "前台是桌宠自己，主人没有在用别的软件";
+    } else if (isDesktopWindow(rawWindow)) {
+      windowInfo = "当前前台是 Windows 桌面，没有打开具体软件";
+    } else {
+      const app = appNameFromTitle(rawWindow);
+      windowInfo = `${app || "未知软件"}（窗口标题：${rawWindow.slice(0, 120)}）`;
+    }
+  }
+
+  // 采集过程中用户可能已经打开对话框开始聊天：这时取消本次问候
+  if (isUserConversationActive()) return false;
 
   const now = new Date();
   const hour = now.getHours();
@@ -2011,51 +2120,72 @@ export async function triggerProactive() {
   const dayOfWeek = now.toLocaleDateString("zh-CN", { weekday: "long" });
   const timeStr = now.toLocaleString("zh-CN", { hour12: false });
 
-  // 召回相关记忆
-  const relevantMemories = recallRelevantMemories({ timeOfDay, currentApp, currentTitle });
+  // 召回相关记忆（桌宠自己的窗口不当作"主人在用的软件"）
+  const currentApp = rawWindow && !isOwnWindow(rawWindow) ? appNameFromTitle(rawWindow) : "";
+  const relevantMemories = recallRelevantMemories({ timeOfDay, currentApp, currentTitle: rawWindow });
 
-  // 构建 prompt
   const memoryBlock = relevantMemories.length > 0
     ? "\n关于用户的记忆：\n" + relevantMemories.map(m => `- [${m.category}] ${m.content}`).join("\n")
     : "";
-  const ctx = [currentApp ? `正在使用：${currentApp}` : "", currentTitle ? `窗口标题：${currentTitle.slice(0, 60)}` : ""].filter(Boolean).join("；");
 
   // 心情低谷 → 安慰模式
   const comfortLine = getMood().happiness < 0.35
     ? "\n【安慰模式】用户的心情最近有些低落，用你的人设温柔地安慰、陪伴一句，别提\"心情指数\"这类系统概念。"
     : "";
-  // 语言要求：system 侧一份 + 用户消息末尾一份（位置要求见 proactivePrompts.ts）
   const outLang = s.assistant.outputLanguage ?? "";
   const langInstruction = proactiveLangInstruction(outLang);
+
+  // 上一次未回复的问候 + 今天已经问候过的话题：用于避免一天内反复围绕同一话题
+  const greetLog = loadGreetingLog();
+  const previous = previousUnansweredGreeting(greetLog, Date.now());
+  const todayTopics = recentGreetingTopics(greetLog, Date.now(), 3);
   const prompt = buildGreetingPrompt({
     timeStr,
     dayOfWeek,
-    ctx,
+    windowInfo,
+    screenshotAvailable: !!screenshot,
     memoryBlock,
     comfortLine,
     outputLanguage: outLang,
+    previousGreeting: previous ? { summary: previous.summary, greeting: previous.greeting } : null,
+    recentGreetingTopics: todayTopics,
   });
 
-  // token 优化：问候用独立临时历史，不污染主对话历史（后续请求不携带问候上下文）
-  const tmpHistory: ChatMessage[] = [{ role: "user", content: prompt }];
   busy = true;
   lifecycleOnOpen?.();
   const bubble = addBubble("ai", "");
-  const colorHook = makeStreamColorHook(bubble);
+  setBubbleText(bubble, "正在看看你在做什么…");
+  let streamed = "";
   try {
-    // enableTools=false：问候不需要工具，省掉整套工具定义的输入 token
-    await chatStream(s.assistant.provider, apiKey, s.assistant.model, tmpHistory, s.assistant.persona, memory, s.assistant.customBaseUrl, (d) => {
-      colorHook.push(d);
-      ttsPlayer.pushDelta(d);
-    }, false, langInstruction);
+    // 问候不暴露通用工具，避免模型乱开软件；截屏与窗口检查已经由前端并发执行。
+    const greetingHistory: ChatMessage[] = [...history, { role: "user", content: prompt }];
+    await chatStream(
+      s.assistant.provider, apiKey, s.assistant.model, greetingHistory, s.assistant.persona,
+      memory, s.assistant.customBaseUrl,
+      (d) => { streamed += d; },
+      false, langInstruction, "",
+      screenshot ? { screenImage: screenshot } : {},
+    );
+
+    const parsed = parseGreetingResult(streamed);
+    const greeting = parsed.greeting.trim();
+    if (!greeting) throw new Error("模型没有生成问候内容");
+    const { main: mainText, trans: transText } = splitTranslation(greeting);
+    if (!mainText.trim()) throw new Error("模型没有生成问候正文");
+
+    // 生成期间用户已经打开对话框开始聊天：本次问候作废，不要打断用户
+    if (isUserConversationActive()) {
+      bubble.remove();
+      return false;
+    }
+
     for (const m of relevantMemories) {
       const orig = memory.find(e => e.id === m.id);
       if (orig) orig.lastUsedAt = Date.now();
     }
     saveMemory();
     boostMood("greeting_sent");
-    // 分离翻译
-    const { main: mainText, trans: transText } = splitTranslation(getBubbleText(bubble));
+
     setBubbleText(bubble, "");
     bubbleBody(bubble).append(document.createTextNode(mainText));
     if (transText) {
@@ -2064,19 +2194,31 @@ export async function triggerProactive() {
       div.textContent = transText;
       bubbleBody(bubble).appendChild(div);
     }
+    ttsPlayer.pushDelta(mainText);
     ttsPlayer.flush();
+
     const finalEmo = classifyAssistantEmotion(mainText);
-    const emo = finalEmo !== "neutral" ? finalEmo : colorHook.lastEmotion();
-    if (emo !== "neutral") reactNow(emo);
+    const emo = finalEmo !== "neutral" ? finalEmo : "love";
+    reactNow(emo);
     bubble.dataset.emotion = bubbleEmotion(emo);
-    // 语音开着等播完再消失
+
+    // 关键：主动问候也是正常对话，必须写进主历史并标【问候】，
+    // 这样用户下一句回复时，模型知道"自己刚刚主动说过什么"。
+    history.push({ role: "assistant", content: markGreetingForHistory(greeting) });
+    saveHistory();
+    recordGreeting(parsed.summary || mainText.slice(0, 80), mainText);
+
     if (ttsPlayer.configured) {
       ttsPlayer.onIdle(() => scheduleFade(bubble, 3000));
     } else {
       scheduleFade(bubble, 10000);
     }
-  } catch {
+    return true;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    void invoke("debug_mark", { msg: `[greeting] 主动问候失败：${msg}` }).catch(() => {});
     bubble.remove();
+    return false;
   } finally {
     busy = false;
     lifecycleOnClose?.();

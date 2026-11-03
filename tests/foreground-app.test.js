@@ -32,7 +32,14 @@ check("普通软件照旧", fg.isOwnWindow("main.ts - petra-project - Visual Stu
 // ---------- 喂给模型的文本 ----------
 check("★ 是自己时明说是自己", fg.frontWindowForModel("Petra [petra.exe]").includes("桌宠自己的窗口"));
 check("是别人时原样透传", fg.frontWindowForModel("某文档 - Word [WINWORD.EXE]") === "某文档 - Word [WINWORD.EXE]");
-check("空串透传成空串", fg.frontWindowForModel("") === "");
+check("空串视为桌面，不退化成文件管理器", fg.frontWindowForModel("").includes("Windows 桌面"));
+
+// ---------- Windows 桌面壳不能误判成文件管理器 ----------
+check("★ Program Manager 是桌面壳", fg.isDesktopWindow("Program Manager [explorer.exe]") === true);
+check("★ 桌面壳的短名是桌面", fg.appNameFromTitle("Program Manager [explorer.exe]") === "桌面", fg.appNameFromTitle("Program Manager [explorer.exe]"));
+check("★ 喂给模型时明确说在桌面", fg.frontWindowForModel("Program Manager [explorer.exe]").includes("Windows 桌面"));
+check("真正的资源管理器窗口仍然识别成文件管理器", fg.isDesktopWindow("下载 - 文件资源管理器 [explorer.exe]") === false && fg.appNameFromTitle("下载 - 文件资源管理器 [explorer.exe]") === "文件管理器");
+check("空标题按桌面处理", fg.isDesktopWindow("") === true);
 
 // ---------- 标题 → 软件短名 ----------
 check("VS Code", fg.appNameFromTitle("main.ts - Petra - Visual Studio Code") === "VS Code");

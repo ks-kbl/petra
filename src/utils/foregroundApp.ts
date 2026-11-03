@@ -32,7 +32,33 @@ export function isOwnWindow(rawTitle: string): boolean {
  * 是自己 → 明说"那是我自己的窗口"，而不是把标题丢过去让模型猜（猜就会说"Petra 还开着呢"）。
  */
 export function frontWindowForModel(rawTitle: string): string {
-  return isOwnWindow(rawTitle) ? "（前台是桌宠自己的窗口，主人没在用别的软件）" : rawTitle || "";
+  if (isOwnWindow(rawTitle)) return "（前台是桌宠自己的窗口，主人没在用别的软件）";
+  if (isDesktopWindow(rawTitle)) return "（当前前台是 Windows 桌面，主人没有打开具体软件）";
+  return rawTitle || "";
+}
+
+/**
+ * 这条前台信息是不是 Windows 桌面壳 / 任务栏，而不是用户真的打开了文件管理器。
+ *
+ * 实测：用户什么软件都没开、只停在桌面时，z 序里第一个可见窗口经常是
+ * `Program Manager [explorer.exe]`（Progman/WorkerW 桌面壳）。旧映射只要看到
+ * `explorer` 就归成「文件管理器」，于是主动问候反复说"你在用文件管理器"。
+ * 这里先把桌面壳识别出来，`appNameFromTitle` 就不会再把它当文件管理器。
+ */
+export function isDesktopWindow(rawTitle: string): boolean {
+  const raw = (rawTitle || "").trim();
+  if (!raw) return true; // 前台信息为空时按"桌面/未知"处理，不要编造软件名
+  const exeMatch = /\[([^\]]+)\]\s*$/.exec(raw);
+  const exe = (exeMatch?.[1] ?? "").trim().toLowerCase();
+  const title = raw.replace(/\[[^\]]+\]\s*$/, "").trim().toLowerCase();
+  // 任务栏/桌面壳的典型标题
+  if (/^(program manager|desktop|桌面|progman|workerw)$/i.test(title)) return true;
+  if (!exe) return false;
+  if (exe === "explorer.exe") {
+    // explorer.exe + 空标题 = 桌面壳；真正的资源管理器窗口通常带文件夹名或"文件资源管理器"
+    return title === "" || /^(program manager|desktop|桌面)$/i.test(title);
+  }
+  return ["progman", "workerw", "shell_traywnd"].includes(exe);
 }
 
 /**
@@ -43,6 +69,8 @@ export function frontWindowForModel(rawTitle: string): string {
 export function appNameFromTitle(title: string): string {
   const raw = (title || "").trim();
   if (!raw) return "";
+  // 桌面壳不是"文件管理器"：这是问候里反复出现"文件管理器"的根因
+  if (isDesktopWindow(raw)) return "桌面";
   const seg = raw.split(" - ").pop()?.trim() || raw;
   const tl = seg.toLowerCase();
   const known: Array<[string[], string]> = [
