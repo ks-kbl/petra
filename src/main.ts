@@ -878,8 +878,8 @@ function translateRigWarning(raw: string): string {
     [/eye_?close.*自動/, "闭眼图层是自动补的，可能与原画略有差异"],
   ];
   for (const [re, text] of rules) if (re.test(raw)) return text;
-  // 未收录的文案保留原文，但去掉"警告"的红色观感（由调用方统一用 info）
-  return raw;
+  // 未收录的文案不再原样弹给用户（vendor 里可能是日文/英文）；原始内容仍写日志
+  return "模型自动绑定有一处提示（已自动处理，详情已写入日志）";
 }
 
 function showRigWarnings(warnings: string[], modelKey: string): void {
@@ -1300,9 +1300,9 @@ async function fireScheduledGreeting(dueAt: number): Promise<void> {
     scheduleNextGreeting();
     return;
   }
+  const sent = await triggerProactive();
   markGreeted(Date.now());
-  void triggerProactive();
-  trackEvent({ type: "greeting", summary: "主动问候了用户" });
+  if (sent) trackEvent({ type: "greeting", summary: "主动问候了用户" });
   scheduleNextGreeting();
 }
 
@@ -1517,9 +1517,9 @@ async function boot() {
         // 回归问候同样要守用户设的间隔：离开 15 分钟以上回来，但距上次问候还没到
         // 设定间隔时就不补，交给精确定时器（否则用户会觉得"间隔忽长忽短"）
         if (awayMs > 15 * 60 * 1000 && hasGreetingIntervalElapsed(lastGreetAt, settings.assistant.greetInterval, now)) {
+          const sent = await triggerProactive();
           markGreeted(now);
-          void triggerProactive();
-          trackEvent({ type: "greeting", summary: "主动问候了用户" });
+          if (sent) trackEvent({ type: "greeting", summary: "主动问候了用户" });
           scheduleNextGreeting();
           return;
         }
@@ -5695,7 +5695,7 @@ async function toggleAssistantSettings() {
     sep(); // 分组：隐私
     const privacyHint = document.createElement("div");
     privacyHint.className = "as-privacy";
-    privacyHint.textContent = "隐私提示：主动问候会读取前台窗口标题和进程名发给 AI；API Key 经系统 DPAPI 加密存储";
+    privacyHint.textContent = "隐私提示：主动问候会截取一次屏幕，并读取前台窗口标题/进程名发给 AI；API Key 经系统 DPAPI 加密存储";
     host.appendChild(privacyHint);
     // 直接 append 到 host 会是左对齐，和上面那些靠右的按钮不一致；放进按钮组统一靠右
     const clearHistRow = document.createElement("div");

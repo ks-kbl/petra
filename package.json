@@ -27,7 +27,8 @@
     "test:plugins": "tsc src/plugins/manifest.ts src/assistant/toolRuntime.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/plugin-manifest.test.js",
     "test:dsh-bridge": "node tests/dsh-petra-bridge.test.mjs",
     "test:hover": "tsc src/autonomous/BehaviorEngine.ts src/utils/math.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/behavior-hover.test.js",
-    "test:greeting": "tsc src/assistant/greetingSchedule.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/greeting-schedule.test.js"
+    "test:greeting": "tsc src/assistant/greetingSchedule.ts src/assistant/greetingMemory.ts src/assistant/greetingHistory.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/greeting-schedule.test.js && node tests/greeting-memory.test.js",
+    "test:ui-text": "tsc src/utils/uiText.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/ui-text.test.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

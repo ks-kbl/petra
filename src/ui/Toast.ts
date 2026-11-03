@@ -1,3 +1,5 @@
+import { localizeUiText } from "../utils/uiText";
+
 let container: HTMLElement | null = null;
 
 export function toast(text: string, kind: "info" | "warn" = "info") {
@@ -7,7 +9,7 @@ export function toast(text: string, kind: "info" | "warn" = "info") {
   if (!container) return;
   const el = document.createElement("div");
   el.className = `toast${kind === "warn" ? " warn" : ""}`;
-  el.textContent = text;
+  el.textContent = localizeUiText(text);
   container.appendChild(el);
   setTimeout(() => {
     el.classList.add("bye");
