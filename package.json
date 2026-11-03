@@ -16,7 +16,7 @@
     "test:music": "tsc src/music/LrcParser.ts src/music/LyricClock.ts src/music/LyricFollow.ts src/assistant/EmotionEngine.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/lrc.test.js && node tests/lyric-follow.test.js",
     "test:diary": "tsc src/features/diary/DiaryManager.ts src/features/diary/DiaryEventTracker.ts src/features/diary/DiaryDigest.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/diary.test.js",
     "test:app": "tsc src/utils/foregroundApp.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/foreground-app.test.js",
-    "test:assistant": "tsc src/assistant/toolRuntime.ts src/assistant/AssistantClient.ts src/assistant/EmotionEngine.ts src/ui/bubbleTiming.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/assistant-tools.test.js && node tests/screen-vision.test.js",
+    "test:assistant": "tsc src/assistant/toolRuntime.ts src/assistant/AssistantClient.ts src/assistant/EmotionEngine.ts src/ui/bubbleTiming.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/assistant-tools.test.js && node tests/screen-vision.test.js && node tests/assistant-compat.test.js",
     "test:tts": "tsc src/tts/TTSPlayer.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/tts-mute.test.js && node tests/tts-order.test.js",
     "test:panel": "node tests/panel-regressions.test.js",
     "test:asr": "tsc src/asr/asrLogic.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/asr-logic.test.js",
@@ -26,7 +26,8 @@
     "test:visible": "tsc src/ui/visible.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/visible-clamp.test.js",
     "test:plugins": "tsc src/plugins/manifest.ts src/assistant/toolRuntime.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/plugin-manifest.test.js",
     "test:dsh-bridge": "node tests/dsh-petra-bridge.test.mjs",
-    "test:hover": "tsc src/autonomous/BehaviorEngine.ts src/utils/math.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/behavior-hover.test.js"
+    "test:hover": "tsc src/autonomous/BehaviorEngine.ts src/utils/math.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/behavior-hover.test.js",
+    "test:greeting": "tsc src/assistant/greetingSchedule.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/greeting-schedule.test.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

@@ -7,7 +7,7 @@ import { trackEvent } from "../features/diary/DiaryEventTracker";
 import { dailyDraw, hasDrawnToday, getTodayDraw, getCollectionProgress } from "../features/card/DailyCardManager";
 import { loadDiaries, getDiary } from "../features/diary/DiaryManager";
 import { loadSettings, saveSettings } from "../utils/settings";
-import { getApiKey, currentKeyScope } from "./apiKey";
+import { getApiKey, currentKeyScope, normalizeOpenAIBase } from "./apiKey";
 import { buildLanguageInstruction, buildLanguageReminder, langNameOf, splitTranslation } from "../utils/outputLanguage";
 import { appNameFromTitle, frontWindowForModel, isOwnWindow } from "../utils/foregroundApp";
 import {
@@ -1924,9 +1924,12 @@ async function extractMemoriesFromChat(s: any, apiKey: string) {
   try {
     // 修复：按实际 provider 解析端点（此前非 custom 一律硬编码 DeepSeek，其他厂商记忆提取静默失败）
     const base = s.assistant.provider === "custom"
-      ? s.assistant.customBaseUrl
+      ? normalizeOpenAIBase(s.assistant.customBaseUrl)
       : PROVIDERS[s.assistant.provider as AssistantProvider]?.base ?? "https://api.deepseek.com";
-    const model = s.assistant.model || PROVIDERS[s.assistant.provider as AssistantProvider]?.defaultModel || "deepseek-chat";
+    // 自定义端点没有默认模型；空模型名时不要拿 deepseek-chat 去撞中转站（必然 404），
+    // 直接跳过这次后台记忆提取，等用户配好模型再说。
+    const model = s.assistant.model || PROVIDERS[s.assistant.provider as AssistantProvider]?.defaultModel;
+    if (!base || !model) return;
     const res = await fetch(`${base}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },

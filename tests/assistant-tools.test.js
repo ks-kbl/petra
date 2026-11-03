@@ -14,6 +14,7 @@ const fs = require("fs");
 const path = require("path");
 const rt = require("./build/assistant/toolRuntime.js");
 const ac = require("./load-assistant-client.js");
+const ak = require("./build/assistant/apiKey.js");
 const bt = require("./build/ui/bubbleTiming.js");
 const ee = require("./build/assistant/EmotionEngine.js");
 
@@ -220,6 +221,66 @@ check("中文输出时不带语言指令也不炸", ac.systemPrompt("人格", []
   check("5xx 可重试", ac.isRetryableStatus(502) === true && ac.isRetryableStatus(503) === true);
   check("408 可重试", ac.isRetryableStatus(408) === true);
   check("400/401/402/404 不重试", ![400, 401, 402, 404].some((s) => ac.isRetryableStatus(s)));
+
+// ---------- 自定义端点 / 中转站兼容性 ----------
+check("端点补齐 /v1", ak.normalizeOpenAIBase("https://relay.example.com") === "https://relay.example.com/v1");
+check("端点去末尾斜杠", ak.normalizeOpenAIBase("https://relay.example.com/v1/") === "https://relay.example.com/v1");
+check(
+  "端点去掉完整 chat/completions",
+  ak.normalizeOpenAIBase("https://relay.example.com/v1/chat/completions") === "https://relay.example.com/v1",
+);
+check(
+  "端点去掉查询串/锚点后再补路径",
+  ak.normalizeOpenAIBase("https://relay.example.com/v1/chat/completions?x=1#y") === "https://relay.example.com/v1",
+);
+check(
+  "已有版本路径不被改写",
+  ak.normalizeOpenAIBase("https://open.bigmodel.cn/api/paas/v4") === "https://open.bigmodel.cn/api/paas/v4",
+);
+check("空端点仍是空", ak.normalizeOpenAIBase("") === "");
+
+check(
+  "模型列表兼容字符串数组",
+  JSON.stringify(ac.parseModelList(["gpt-4o", "qwen-max"])) === JSON.stringify(["gpt-4o", "qwen-max"]),
+);
+check(
+  "模型列表兼容嵌套 data.models",
+  JSON.stringify(ac.parseModelList({ data: { models: [{ model: "deepseek-chat" }] } })) ===
+    JSON.stringify(["deepseek-chat"]),
+);
+check(
+  "模型列表去重并忽略空值",
+  JSON.stringify(ac.parseModelList({ data: [{ id: "a" }, { id: "" }, { id: "a" }] })) === JSON.stringify(["a"]),
+);
+
+const picked = ac.pickDefaultChatModel(["text-embedding-3-small", "gpt-4o-mini", "whisper-1", "tts-1"]);
+check("自动选择会避开 embedding/tts/whisper", picked === "gpt-4o-mini", picked);
+check("全是非对话模型时仍给一个候选", ac.pickDefaultChatModel(["tts-1", "dall-e-3"]) === "tts-1");
+check("空模型列表返回空", ac.pickDefaultChatModel([]) === "");
+
+check(
+  "数组形式 content 不再拼成 [object Object]",
+  ac.contentToText([{ type: "text", text: "你好" }, { type: "image_url", image_url: {} }, { type: "text", text: "呀" }]) === "你好呀",
+);
+check("字符串 content 原样返回", ac.contentToText("ok") === "ok");
+
+const withTools = [
+  { role: "user", content: "hi" },
+  { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "x", arguments: "{}" } }] },
+  { role: "tool", tool_call_id: "c1", content: "ok" },
+  { role: "assistant", content: "结果是这样", tool_calls: [{ id: "c2", type: "function", function: { name: "y", arguments: "{}" } }] },
+];
+const stripped = ac.stripToolData(withTools);
+check("纯文本降级时清掉 role=tool", stripped.every((m) => m.role !== "tool"));
+check("纯文本降级时清掉 tool_calls", stripped.every((m) => !m.tool_calls));
+check("有正文的 assistant 轮次保留", stripped.some((m) => m.content === "结果是这样"));
+
+check("tools 相关 400 会触发无工具重试", ac.shouldRetryWithoutTools(400, '{"error":{"message":"tools are not supported"}}') === true);
+check("普通 400 也兜底尝试一次", ac.shouldRetryWithoutTools(400, "Bad Request") === true);
+check("401 不触发无工具重试", ac.shouldRetryWithoutTools(401, "tool unsupported") === false);
+check("429 不触发无工具重试", ac.shouldRetryWithoutTools(429, "tools unsupported") === false);
+check("stream 不支持会触发非流式重试", ac.shouldRetryNonStream(400, "stream is not supported") === true);
+check("stream 参数无关错误不触发", ac.shouldRetryNonStream(400, "model not found") === false);
 
 console.log("assistant-tools: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);
 process.exit(fail ? 1 : 0);

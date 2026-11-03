@@ -27,6 +27,12 @@ export interface ChatMessage {
  */
 const RETRY_DELAYS_MS = [600, 1800];
 
+/**
+ * 已经确认"不支持 function calling"的端点（base + model）。
+ * 第一次 400 后自动降级为纯文本请求，后续直接按兼容模式发，避免每条消息都失败一次。
+ */
+const NO_TOOLS_ENDPOINTS = new Set<string>();
+
 export function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
 }
@@ -113,6 +119,118 @@ export function isProviderReady(
  */
 export function isMiniMaxEndpoint(base: string): boolean {
   return /minimax/i.test(base ?? "");
+}
+
+/**
+ * 把 OpenAI 兼容响应里的 `content` 统一转成字符串。
+ *
+ * 大多数端点给字符串，但新版多模态 / 中转站可能给数组：
+ *   [{ type: "text", text: "..." }, { type: "image_url", ... }]
+ * 以前直接 `text += delta.content`，数组会被拼成 "[object Object]"，
+ * 用户看到的就是"模型回了乱码/没回复"。这里只取文本片段，忽略图片等非文本部分。
+ */
+export function contentToText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (!part || typeof part !== "object") return "";
+        const p = part as { type?: string; text?: unknown; content?: unknown };
+        if (typeof p.text === "string") return p.text;
+        if (typeof p.content === "string") return p.content;
+        return "";
+      })
+      .join("");
+  }
+  if (content && typeof content === "object") {
+    const p = content as { text?: unknown; content?: unknown };
+    if (typeof p.text === "string") return p.text;
+    if (typeof p.content === "string") return p.content;
+  }
+  return "";
+}
+
+/** 从响应 JSON 里取一段可读的错误文本（OpenAI 的 {"error":{"message":...}} / 字符串） */
+export function apiErrorMessage(json: unknown): string {
+  const j = json as { error?: unknown; message?: unknown } | null | undefined;
+  if (!j) return "";
+  const err = j.error;
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    const e = err as { message?: unknown; code?: unknown; type?: unknown };
+    if (typeof e.message === "string" && e.message.trim()) return e.message;
+    if (typeof e.code === "string" && e.code.trim()) return e.code;
+    if (typeof e.type === "string" && e.type.trim()) return e.type;
+  }
+  if (typeof j.message === "string" && j.message.trim()) return j.message;
+  return "";
+}
+
+/**
+ * 某些模型/中转站不支持 function calling：把 tools 发过去会直接 400。
+ * 这不是"配置错了"，而是端点能力差异 —— 应该自动降级成纯文本请求再试一次，
+ * 否则用户会看到"这个模型用不了"，其实只是不能调工具。
+ */
+export function shouldRetryWithoutTools(status: number, body: string): boolean {
+  // 401/402/403/404/429 等都不是"工具字段不被支持"，重试没有意义
+  if (![400, 422].includes(status)) return false;
+  const t = (body || "").toLowerCase();
+  // 明确的工具相关报错
+  if (/tool|function[_ ]?call|function calling|tools?[_ ]?(are|is)?[_ ]?not|unknown[_ ]?field|unsupported|unrecognized|extra[_ ]?field|invalid[_ ]?(parameter|value)/i.test(t)) {
+    return true;
+  }
+  // 很多中转站只回一句 "Bad Request" / "invalid request"，没有细节；
+  // 这时也值得剥掉 tools 再试一次（最多多一次请求）。
+  return t.length < 80 || /bad request|invalid request|参数|不支持/i.test(t);
+}
+
+/** 个别兼容端点不接受 stream=true（或只支持非流式）。识别这类报错后降级重试 */
+export function shouldRetryNonStream(status: number, body: string): boolean {
+  if (![400, 422].includes(status)) return false;
+  return /stream|sse|流式/i.test(body || "") && /not|unsupported|invalid|不支持|拒绝/i.test(body || "");
+}
+
+/**
+ * 不支持工具的端点降级后，历史里的 assistant.tool_calls / role=tool 也要清掉：
+ * 只把 tools 字段删掉、却还带着一条 tool 结果，同样会 400。
+ */
+export function stripToolData(messages: ChatMessage[]): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (const m of messages) {
+    if (m.role === "tool") continue;
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const content = (m.content ?? "").trim();
+      if (!content) continue; // 只有 tool_calls、没有正文的 assistant 轮次，对纯文本端点没有意义
+      const plain: ChatMessage = { role: m.role, content: m.content };
+      if (m.name) plain.name = m.name;
+      out.push(plain);
+      continue;
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+/** 模型名里明显不是对话模型的排除项（中转站的 /models 常把 embedding/tts/image 混在一起） */
+const NON_CHAT_MODEL_RE =
+  /(embed|embedding|rerank|whisper|tts|speech|transcri|audio|image|dall[-_ ]?e|moderation|bge|clip|stable[-_ ]?diffusion|sdxl|flux|ocr|guard|safety)/i;
+/** 对话模型的常见关键词，用于在候选里优先挑一个能聊的 */
+const CHAT_MODEL_HINT_RE =
+  /(chat|instruct|gpt|claude|deepseek|qwen|glm|llama|mixtral|gemini|grok|moonshot|kimi|yi-|ernie|command-r|mistral|sonnet|opus|haiku|o1|o3|o4)/i;
+
+/**
+ * 从 `/models` 返回的列表里挑一个默认对话模型。
+ *
+ * 之前直接选 `models[0]` —— 中转站的列表第一位经常是 text-embedding / tts / 画图模型，
+ * 自动选完一发消息就 404/400，用户以为"中转站的模型都用不了"。
+ */
+export function pickDefaultChatModel(models: string[]): string {
+  const all = (models || []).map((m) => String(m || "").trim()).filter(Boolean);
+  if (!all.length) return "";
+  const chatLike = all.filter((m) => !NON_CHAT_MODEL_RE.test(m));
+  const pool = chatLike.length ? chatLike : all;
+  return pool.find((m) => CHAT_MODEL_HINT_RE.test(m)) ?? pool[0] ?? "";
 }
 
 function resolveBase(provider: AssistantProvider, customBaseUrl: string): string {
@@ -632,6 +750,104 @@ function attachScreenImage(messages: ChatMessage[], dataUrl?: string): unknown {
   );
 }
 
+/** 兼容端点的请求头：没有 Key 时不要发 `Bearer `（部分本地服务/中转站会因此 400） */
+function chatHeaders(apiKey: string, accept = "text/event-stream"): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: accept,
+  };
+  const key = (apiKey || "").trim();
+  if (key) headers.Authorization = `Bearer ${key}`;
+  return headers;
+}
+
+/** 一次请求都没填模型名时，按端点自动挑一个对话模型（只在内存里缓存，不写用户设置） */
+const AUTO_MODEL_CACHE = new Map<string, string>();
+
+async function resolveModelForRequest(
+  provider: AssistantProvider,
+  model: string,
+  apiKey: string,
+  base: string,
+  customBaseUrl: string,
+): Promise<string> {
+  const explicit = (model || "").trim();
+  if (explicit) return explicit;
+  const fallback = PROVIDERS[provider]?.defaultModel?.trim();
+  if (fallback) return fallback;
+  // 自定义端点（自定义/中转站）没有默认模型：先问一次 /models，再挑一个像聊天模型的。
+  // 这样用户只填了端点 + Key、忘了填模型时也能直接开聊；失败时给出可操作的提示。
+  const cached = AUTO_MODEL_CACHE.get(base);
+  if (cached) return cached;
+  let models: string[] = [];
+  try {
+    models = await listModels(provider, apiKey, customBaseUrl);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new Error(`未设置模型名，且自动获取模型失败：${detail}`);
+  }
+  const picked = pickDefaultChatModel(models);
+  if (!picked) {
+    throw new Error("未设置模型名：该端点没有返回可用模型，请手动填写模型名（中转站常需要手动填）");
+  }
+  AUTO_MODEL_CACHE.set(base, picked);
+  return picked;
+}
+
+/**
+ * 「测试连接」专用：用最小的一次非流式对话请求验证 端点 + Key + 模型。
+ *
+ * 为什么不用 /models：很多中转站不实现 /models，但 /chat/completions 完全正常。
+ * 只测 /models 会把能用的端点误判成"连接失败"。
+ * 返回值是实际使用的模型名，方便面板提示。
+ */
+export async function probeChatConnection(
+  provider: AssistantProvider,
+  apiKey: string,
+  model: string,
+  customBaseUrl: string,
+): Promise<{ model: string }> {
+  const base = resolveBase(provider, customBaseUrl);
+  const m = await resolveModelForRequest(provider, model, apiKey, base, customBaseUrl);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const res = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      headers: chatHeaders(apiKey, "application/json"),
+      body: JSON.stringify({
+        model: m,
+        messages: [{ role: "user", content: "只回复 OK" }],
+        max_tokens: 8,
+        stream: false,
+      }),
+      signal: ctrl.signal,
+    });
+    const raw = await res.text().catch(() => "");
+    let json: unknown = null;
+    try { json = raw ? JSON.parse(raw) : null; } catch { /* 非 JSON 错误体 */ }
+    if (!res.ok) {
+      const detail = apiErrorMessage(json) || raw.slice(0, 200) || `HTTP ${res.status}`;
+      throw new Error(`HTTP ${res.status}：${detail}`);
+    }
+    const err = apiErrorMessage(json);
+    if (err) throw new Error(err);
+    // 有些端点 200 但 body 是 HTML/代理页；至少要求能解析出 choices 或 message
+    const choices = (json as { choices?: unknown[] } | null)?.choices;
+    if (json && !Array.isArray(choices)) {
+      throw new Error("端点返回的内容不是 OpenAI 兼容格式（缺少 choices）");
+    }
+    return { model: m };
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("请求超时（20 秒）");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** OpenAI 兼容流式 chat；返回完整文本 + 工具调用。enableTools=false 时不带 tools（纯文本生成，如日记/抽卡文案） */
 export async function chatStream(
   provider: AssistantProvider,
@@ -647,156 +863,275 @@ export async function chatStream(
   requestOptions: ChatRequestOptions = {},
 ): Promise<{ text: string; toolCalls: ToolCall[]; usage: ChatUsage }> {
   const base = resolveBase(provider, customBaseUrl);
-  const m = model || PROVIDERS[provider].defaultModel;
+  const m = await resolveModelForRequest(provider, model, apiKey, base, customBaseUrl);
   if (!m) throw new Error("未设置模型名");
-  const messages = buildMessages(history, persona, memory, extraContext, systemOverride);
+  const baseMessages = buildMessages(history, persona, memory, extraContext, systemOverride);
   // 插件工具是运行时注册的：每次请求都重新拼一份，不能缓存在模块级常量里。
   const toolDefs = enableTools ? [...TOOLS, ...(requestOptions.extraTools ?? [])] : [];
-  // 输入 token 估算（消息 + 工具定义），用于本地用量统计兜底
-  const inputTokens = estimateTokens(JSON.stringify(messages)) + (enableTools ? estimateToolsTokens(toolDefs) : 0) + 4;
   // 支持流式 usage 回传的提供商白名单（其余端点可能拒绝未知字段）
   const supportsStreamUsage = USAGE_STREAM_PROVIDERS.has(provider);
-  const requestBody = JSON.stringify({
-    model: m,
-    messages: attachScreenImage(messages, requestOptions.screenImage),
-    // 所有 OpenAI 兼容端点（含 custom，如小米 API）都发工具定义；
-    // enableTools=false（日记/抽卡等纯文本生成）时一律不带 tools，避免模型返回空正文
-    ...(enableTools ? { tools: toolDefs } : {}),
-    ...(supportsStreamUsage ? { stream_options: { include_usage: true } } : {}),
-    ...(requestOptions.maxOutputTokens ? { max_tokens: requestOptions.maxOutputTokens } : {}),
-    // MiniMax：让思考内容与正文分离（详见 isMiniMaxEndpoint 的说明）。
-    // 只对 MiniMax 端点发送，避免其他兼容端点拒绝未知字段。
-    ...(isMiniMaxEndpoint(base) ? { reasoning_split: true } : {}),
-    stream: true,
-  });
+
+  // 某些模型/中转站不支持 tools 或 stream：同一端点降级过一次后记住，后续请求直接走兼容模式，
+  // 不要每条消息都先失败一次。
+  const compatKey = `${base}||${m}`;
+  let useTools = enableTools && !NO_TOOLS_ENDPOINTS.has(compatKey);
+  let useStream = true;
+
+  const bodyFor = (toolsOn: boolean, streamOn: boolean): string => {
+    const messages = toolsOn ? baseMessages : stripToolData(baseMessages);
+    return JSON.stringify({
+      model: m,
+      messages: attachScreenImage(messages, requestOptions.screenImage),
+      // 不支持工具的端点（不少本地模型/中转站/推理模型）一旦带上 tools 就会 400；
+      // 降级后这里自动不带，历史里的 tool_calls 也由 stripToolData 清掉。
+      ...(toolsOn && toolDefs.length ? { tools: toolDefs } : {}),
+      ...(streamOn && supportsStreamUsage ? { stream_options: { include_usage: true } } : {}),
+      ...(requestOptions.maxOutputTokens ? { max_tokens: requestOptions.maxOutputTokens } : {}),
+      // MiniMax：让思考内容与正文分离（详见 isMiniMaxEndpoint 的说明）。
+      // 只对 MiniMax 端点发送，避免其他兼容端点拒绝未知字段。
+      ...(isMiniMaxEndpoint(base) ? { reasoning_split: true } : {}),
+      stream: streamOn,
+    });
+  };
+
   // 偶发失败自动重试：限流(429)、网关/服务端 5xx、408、以及网络层直接失败，
   // 都是"过一会儿再发就好了"的类型 —— 以前只能弹错误让用户手动重发。
   // 注意只在**还没开始接收流**时重试，避免把已经吐出来的文字重复一遍。
   let res: Response | null = null;
   let errText = "";
+  let lastStatus = 0;
   const netErrors: string[] = [];
-  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
-    try {
-      res = await fetch(`${base}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: requestBody,
-        signal: requestOptions.signal,
-      });
-    } catch (e) {
-      if (requestOptions.signal?.aborted) throw e;
-      netErrors.push(e instanceof Error ? e.message : String(e));
-      if (attempt < RETRY_DELAYS_MS.length) {
+  for (let compat = 0; compat < 3; compat++) {
+    const requestBody = bodyFor(useTools, useStream);
+    let attemptRes: Response | null = null;
+    errText = "";
+    lastStatus = 0;
+    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        attemptRes = await fetch(`${base}/chat/completions`, {
+          method: "POST",
+          headers: chatHeaders(apiKey, useStream ? "text/event-stream" : "application/json"),
+          body: requestBody,
+          signal: requestOptions.signal,
+        });
+      } catch (e) {
+        if (requestOptions.signal?.aborted) throw e;
+        netErrors.push(e instanceof Error ? e.message : String(e));
+        if (attempt < RETRY_DELAYS_MS.length) {
+          await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+          continue;
+        }
+        throw new Error(`网络错误：${netErrors[netErrors.length - 1] || "请求失败"}（已重试 ${netErrors.length} 次）`);
+      }
+      if (attemptRes.ok && attemptRes.body) break;
+      lastStatus = attemptRes.status;
+      errText = await attemptRes.text().catch(() => "");
+      if (isRetryableStatus(attemptRes.status) && attempt < RETRY_DELAYS_MS.length) {
         await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
         continue;
       }
-      throw new Error(`网络错误：${netErrors[netErrors.length - 1] || "请求失败"}（已重试 ${netErrors.length} 次）`);
+      break;
     }
-    if (res.ok && res.body) break;
-    errText = await res.text().catch(() => "");
-    if (isRetryableStatus(res.status) && attempt < RETRY_DELAYS_MS.length) {
-      await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+    if (attemptRes && attemptRes.ok && attemptRes.body) {
+      res = attemptRes;
+      break;
+    }
+    // 1) 工具字段不被支持 → 去掉 tools / tool 历史再试。
+    // 先不写入 NO_TOOLS_ENDPOINTS：只有这次降级真的成功才记住，
+    // 免得把"模型名写错 / 参数问题"的 400 也当成端点不支持工具而永久禁用。
+    if (useTools && shouldRetryWithoutTools(lastStatus, errText)) {
+      useTools = false;
       continue;
     }
-    break;
+    // 2) 流式不被支持 → 改非流式再试
+    if (useStream && shouldRetryNonStream(lastStatus, errText)) {
+      useStream = false;
+      continue;
+    }
+    const hint = provider === "custom"
+      ? " (自定义/中转站端点：请确认 URL 是否带 /v1、模型名是否与中转站文档一致)"
+      : "";
+    throw new Error(`API 错误 ${lastStatus || 0}${hint}: ${errText.slice(0, 300)}`);
   }
-  if (!res || !res.ok || !res.body) {
-    const hint = provider === "custom" ? " (自定义端点请确认URL是否正确，部分API需要/v1后缀)" : "";
-    throw new Error(`API 错误 ${res ? res.status : 0}${hint}: ${errText.slice(0, 200)}`);
+  if (!res || !res.body) {
+    throw new Error(`API 错误 ${lastStatus || 0}: ${errText.slice(0, 300) || "没有收到响应"}`);
   }
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  // 只有"带 tools 失败、去掉 tools 后成功"才把端点记为不支持工具
+  if (enableTools && !useTools) NO_TOOLS_ENDPOINTS.add(compatKey);
+
+  const finalMessages = useTools ? baseMessages : stripToolData(baseMessages);
+  const inputTokens = estimateTokens(JSON.stringify(finalMessages))
+    + (useTools ? estimateToolsTokens(toolDefs) : 0) + 4;
+
   let text = "";
   const toolCalls: { id: string; name: string; args: string }[] = [];
-  // 服务端真实 usage（最后一个 chunk 返回，需 include_usage）
   let serverUsage: { input: number; output: number; cached: number } | null = null;
-  // 没有任何新数据超过这个时间就认为连接已死：断网/代理挂住/服务端发完 [DONE] 却不关连接
-  // 都会让 reader.read() 永远不返回，send() 的 finally 不执行 → busy 永久 true，
-  // 之后每条消息都被静默丢弃，只能重启。这里给每次 read 套一个空闲超时。
-  const idleTimeoutMs = requestOptions.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   let sawDone = false;
 
-  for (;;) {
-    if (requestOptions.signal?.aborted) {
-      void reader.cancel().catch(() => {});
-      throw new Error("已取消");
+  const appendToolDelta = (calls: Array<{
+    index?: number;
+    id?: string;
+    type?: string;
+    function?: { name?: string; arguments?: string };
+  }>) => {
+    for (let i = 0; i < calls.length; i++) {
+      const tc = calls[i];
+      // 流式分片一般带 index；非流式返回的完整 tool_calls 不带 index，用数组下标兜底
+      // （否则多个 tool call 会全被塞进第 0 个，后面的调用直接丢失）。
+      const idx = tc.index ?? i;
+      toolCalls[idx] ??= { id: tc.id ?? "", name: "", args: "" };
+      if (tc.id) toolCalls[idx].id = tc.id;
+      if (tc.function?.name) {
+        // 分片拼接：有的兼容端点第一帧只给名字，有的每帧都重发**完整**名字，
+        // 直接 += 会拼出 "run_shellrun_shell"，这里按前缀判断一下
+        const cur = toolCalls[idx].name;
+        const frag = tc.function.name;
+        toolCalls[idx].name = !cur ? frag : frag.startsWith(cur) ? frag : cur.endsWith(frag) ? cur : cur + frag;
+      }
+      if (tc.function?.arguments) toolCalls[idx].args += tc.function.arguments;
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let chunk: { done: boolean; value?: Uint8Array };
+  };
+
+  /** 处理一条完整的 OpenAI chunk（流式/非流式、标准 message/delta 都兼容） */
+  const handleChunkJson = (json: unknown): void => {
+    const j = json as {
+      error?: unknown;
+      choices?: Array<{
+        text?: unknown;
+        delta?: {
+          content?: unknown;
+          tool_calls?: Array<{ index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } }>;
+          function_call?: { name?: string; arguments?: string };
+        };
+        message?: {
+          content?: unknown;
+          tool_calls?: Array<{ index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } }>;
+        };
+      }>;
+      usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } };
+    } | null | undefined;
+    if (!j) return;
+    const err = apiErrorMessage(j);
+    if (err) throw new Error(`API 错误：${err}`);
+    const choice = j.choices?.[0];
+    const delta = choice?.delta;
+    const message = choice?.message;
+    const piece = contentToText(delta?.content)
+      || contentToText(message?.content)
+      || contentToText(choice?.text);
+    if (piece) {
+      text += piece;
+      onDelta(piece);
+    }
+    if (Array.isArray(delta?.tool_calls)) appendToolDelta(delta.tool_calls);
+    if (Array.isArray(message?.tool_calls)) appendToolDelta(message.tool_calls);
+    // 老式 function_call（部分兼容端点仍用这个字段）
+    if (delta?.function_call?.name) {
+      appendToolDelta([{
+        index: 0,
+        type: "function",
+        function: { name: delta.function_call.name, arguments: delta.function_call.arguments ?? "" },
+      }]);
+    }
+    // usage：{ prompt_tokens, completion_tokens, prompt_tokens_details.cached_tokens }
+    const u = j.usage;
+    if (u && (typeof u.total_tokens === "number" || typeof u.prompt_tokens === "number")) {
+      serverUsage = {
+        input: u.prompt_tokens ?? inputTokens,
+        output: u.completion_tokens ?? 0,
+        cached: u.prompt_tokens_details?.cached_tokens ?? 0,
+      };
+    }
+  };
+
+  const consumeSseLine = (rawLine: string): void => {
+    const line = rawLine.trim();
+    if (!line.startsWith("data:")) return;
+    const data = line.slice(5).trim();
+    if (!data) return;
+    if (data === "[DONE]") {
+      // 收到 [DONE] 就主动结束：有的端点在 [DONE] 之后保持连接不关，
+      // 继续 read 会一直挂到超时。
+      sawDone = true;
+      return;
+    }
+    let json: unknown;
     try {
-      chunk = await Promise.race([
-        reader.read() as Promise<{ done: boolean; value?: Uint8Array }>,
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(
-            () => reject(new Error(`响应超时：${Math.round(idleTimeoutMs / 1000)} 秒没有收到新数据（网络或服务端卡住了）`)),
-            idleTimeoutMs,
-          );
-        }),
-      ]);
+      json = JSON.parse(data);
+    } catch {
+      return; // 忽略不完整/非 JSON 行
+    }
+    handleChunkJson(json);
+  };
+
+  const contentType = (res.headers.get("content-type") || "").toLowerCase();
+  // 服务端无视 stream=true、直接回了一整段 JSON（一些中转站会这样）：按非流式解析，
+  // 否则我们的 SSE 解析器一条 data: 都读不到，用户看到空回复。
+  const responseIsJson = contentType.includes("application/json") && !contentType.includes("event-stream");
+  if (!useStream || responseIsJson) {
+    const raw = await res.text();
+    let json: unknown = null;
+    try { json = raw ? JSON.parse(raw) : null; } catch { /* 可能是被标错 content-type 的 SSE */ }
+    if (json) {
+      handleChunkJson(json);
+    } else {
+      for (const line of raw.split(/\r?\n/)) consumeSseLine(line);
+    }
+  } else {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    // 没有任何新数据超过这个时间就认为连接已死：断网/代理挂住/服务端发完 [DONE] 却不关连接
+    // 都会让 reader.read() 永远不返回，send() 的 finally 不执行 → busy 永久 true，
+    // 之后每条消息都被静默丢弃，只能重启。这里给每次 read 套一个空闲超时。
+    const idleTimeoutMs = requestOptions.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    try {
+      for (;;) {
+        if (requestOptions.signal?.aborted) {
+          void reader.cancel().catch(() => {});
+          throw new Error("已取消");
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let chunk: { done: boolean; value?: Uint8Array };
+        try {
+          chunk = await Promise.race([
+            reader.read() as Promise<{ done: boolean; value?: Uint8Array }>,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(`响应超时：${Math.round(idleTimeoutMs / 1000)} 秒没有收到新数据（网络或服务端卡住了）`)),
+                idleTimeoutMs,
+              );
+            }),
+          ]);
+        } catch (err) {
+          // 超时/中止后必须把底层流关掉，否则悬挂的 read 会一直占着连接
+          void reader.cancel().catch(() => {});
+          throw err;
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+        const { done, value } = chunk;
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const rawLine of lines) {
+          consumeSseLine(rawLine);
+          if (sawDone) break;
+        }
+        if (sawDone) {
+          // [DONE] 之后连接可能还挂着，主动取消读取，别让下一次 read 干等
+          void reader.cancel().catch(() => {});
+          break;
+        }
+      }
+      // 流结束前最后一行可能没有换行符
+      if (!sawDone && buffer.trim()) {
+        for (const line of buffer.split(/\r?\n/)) consumeSseLine(line);
+      }
     } catch (err) {
-      // 超时/中止后必须把底层流关掉，否则悬挂的 read 会一直占着连接
       void reader.cancel().catch(() => {});
       throw err;
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
-    const { done, value } = chunk;
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const raw of lines) {
-      const line = raw.trim();
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") {
-        // 收到 [DONE] 就主动结束：有的端点在 [DONE] 之后保持连接不关，
-        // 继续 read 会一直挂到超时。
-        sawDone = true;
-        break;
-      }
-      try {
-        const json = JSON.parse(data);
-        const delta = json.choices?.[0]?.delta;
-        if (delta?.content) {
-          text += delta.content;
-          onDelta(delta.content);
-        }
-        if (Array.isArray(delta?.tool_calls)) {
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index ?? 0;
-            toolCalls[idx] ??= { id: tc.id ?? "", name: "", args: "" };
-            if (tc.id) toolCalls[idx].id = tc.id;
-            if (tc.function?.name) {
-              // 分片拼接：有的兼容端点第一帧只给名字，有的每帧都重发**完整**名字，
-              // 直接 += 会拼出 "run_shellrun_shell"，这里按前缀判断一下
-              const cur = toolCalls[idx].name;
-              const frag = tc.function.name;
-              toolCalls[idx].name = !cur ? frag : frag.startsWith(cur) ? frag : cur.endsWith(frag) ? cur : cur + frag;
-            }
-            if (tc.function?.arguments) toolCalls[idx].args += tc.function.arguments;
-          }
-        }
-        // 末 chunk 的 usage：{ prompt_tokens, completion_tokens, prompt_tokens_details.cached_tokens }
-        if (json.usage && typeof json.usage.total_tokens === "number") {
-          serverUsage = {
-            input: json.usage.prompt_tokens ?? inputTokens,
-            output: json.usage.completion_tokens ?? 0,
-            cached: json.usage.prompt_tokens_details?.cached_tokens ?? 0,
-          };
-        }
-      } catch {
-        /* 忽略不完整 JSON */
-      }
-    }
-    if (sawDone) {
-      // [DONE] 之后连接可能还挂着，主动取消读取，别让下一次 read 干等
-      void reader.cancel().catch(() => {});
-      break;
     }
   }
 
@@ -815,8 +1150,10 @@ export async function chatStream(
     .filter((tc) => tc.name);
   const outputTokens = estimateTokens(text) + estimateTokens(toolCalls.map((t) => t.args).join(" "));
   // 服务端有真实 usage 时优先用真实值
-  const usage: ChatUsage = serverUsage
-    ? { ...serverUsage, source: "server" }
+  // TS 的控制流分析看不到 handleChunkJson 闭包里的赋值，这里显式取一次当前值
+  const finalServerUsage = serverUsage as { input: number; output: number; cached: number } | null;
+  const usage: ChatUsage = finalServerUsage
+    ? { input: finalServerUsage.input, output: finalServerUsage.output, cached: finalServerUsage.cached, source: "server" }
     : { input: inputTokens, output: outputTokens, cached: 0, source: "estimated" };
   recordUsage(usage.input, usage.output, usage.cached);
   requestOptions.onUsage?.(usage);
@@ -919,18 +1256,47 @@ function recordUsage(input: number, output: number, cached = 0): void {
  * - Ollama 原生格式：{ models: [{ name/model }] }
  */
 export function parseModelList(json: unknown): string[] {
-  const j = json as
-    | { data?: Array<{ id?: string }>; models?: Array<{ name?: string; model?: string; id?: string }> }
-    | null
-    | undefined;
-  if (!j) return [];
-  if (Array.isArray(j.data)) {
-    return j.data.map((x) => x?.id).filter((v): v is string => Boolean(v));
-  }
-  if (Array.isArray(j.models)) {
-    return j.models.map((x) => x?.name || x?.model || x?.id).filter((v): v is string => Boolean(v));
-  }
-  return [];
+  const out = new Set<string>();
+  const addObject = (v: unknown) => {
+    if (!v || typeof v !== "object") return;
+    const o = v as { id?: unknown; name?: unknown; model?: unknown; slug?: unknown; model_name?: unknown };
+    for (const key of ["id", "name", "model", "slug", "model_name"] as const) {
+      const val = o[key];
+      if (typeof val === "string" && val.trim()) {
+        out.add(val.trim());
+        return;
+      }
+    }
+  };
+  // 中转站/代理的返回格式很杂：OpenAI 的 {data:[{id}]}、Ollama 的 {models:[{name}]}，
+  // 还有 {data:{models:["a","b"]}}、直接返回 ["a","b"]、甚至套一层 result/items。
+  // 以前只认前两种，导致"自动获取模型"失败、模型名留空，最后每条消息都发不出去。
+  const walk = (node: unknown, depth: number) => {
+    if (node == null || depth > 4) return;
+    if (typeof node === "string") {
+      // 单个字符串不是模型列表；只有数组里的字符串才当模型名（见下面的 Array 分支）
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        if (typeof item === "string") addObject({ id: item });
+        else if (item && typeof item === "object") addObject(item);
+        else walk(item, depth + 1);
+      }
+      return;
+    }
+    if (typeof node !== "object") return;
+    const obj = node as Record<string, unknown>;
+    // 有 id/name 的对象本身就是一个模型项
+    if (["id", "name", "model", "slug", "model_name"].some((k) => typeof obj[k] === "string")) {
+      addObject(obj);
+    }
+    for (const key of ["data", "models", "result", "results", "items", "model_list"]) {
+      if (key in obj) walk(obj[key], depth + 1);
+    }
+  };
+  walk(json, 0);
+  return [...out];
 }
 
 /** Ollama 原生接口在 /api/tags，去掉可能存在的 /v1 尾巴 */
@@ -989,7 +1355,10 @@ export async function listModels(
   const localHint = /(localhost|127\.0\.0\.1)/.test(base)
     ? "（本地服务：若报 Failed to fetch，多半是浏览器跨域被拦——给服务设 OLLAMA_ORIGINS=* 后重启即可）"
     : "";
-  throw new Error(errors.join("；") + localHint);
+  const customHint = provider === "custom"
+    ? "（很多中转站不提供 /models 接口；这不代表不能用。请直接在「模型名」里手动填写中转站文档里的模型名）"
+    : "";
+  throw new Error(errors.join("；") + localHint + customHint);
 }
 
 /** 从 AI 自由文本中提取 CMD: <命令> 行（兜底，不用 function calling 时） */

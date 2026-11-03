@@ -45,16 +45,25 @@ export async function setApiKey(key: string, scope: string = currentKeyScope()):
  * - 完全没有路径时补 `/v1`（已有 `/v1`、`/v4`、`/compatible-mode/...` 等路径不动）
  */
 export function normalizeOpenAIBase(raw: string): string {
-  let url = (raw || "").trim().replace(/\/+$/, "");
+  let url = (raw || "").trim();
   if (!url) return "";
-  url = url.replace(/\/chat\/completions$/i, "");
+  // 用户经常把完整请求地址、查询串、锚点一起贴进来。这些都不是 base URL 的一部分，
+  // 留着会在后面再拼 /chat/completions 时变成 .../chat/completions?x=1/chat/completions。
+  url = url.replace(/[?#].*$/, "").replace(/\/+$/, "");
+  url = url.replace(/\/chat\/completions$/i, "").replace(/\/+$/, "");
   // 解析出 pathname，判断有没有"版本路径"
-  let pathname = "";
   try {
-    pathname = new URL(url).pathname.replace(/\/+$/, "");
+    const u = new URL(url);
+    let pathname = u.pathname.replace(/\/+$/, "");
+    // 有的用户会多贴一层 /chat/completions（大小写、末尾斜杠都见过），这里统一剥掉
+    pathname = pathname.replace(/\/chat\/completions$/i, "").replace(/\/+$/, "");
+    if (!pathname) pathname = "/v1";
+    u.pathname = pathname;
+    u.search = "";
+    u.hash = "";
+    return u.toString().replace(/\/+$/, "");
   } catch {
-    return url; // 不是合法 URL 就原样返回，让请求阶段报错更直观
+    // 不是合法 URL 就原样返回，让请求阶段报错更直观
+    return url;
   }
-  if (!pathname) url += "/v1";
-  return url;
 }

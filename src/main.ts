@@ -136,7 +136,8 @@ import {
 import { startHourlyChime, stopHourlyChime, formatQuietRange } from "./features/hourly/HourlyChime";
 import { mountHandAxisControls } from "./live2d/psd/HandAxisPicker";
 import { buildHourlyQuietMenuItems } from "./features/hourly/HourlyQuietRows";
-import { listModels, PROVIDERS, getUsageStats, resetUsageStats, chatStream } from "./assistant/AssistantClient";
+import { listModels, PROVIDERS, getUsageStats, resetUsageStats, chatStream, pickDefaultChatModel, probeChatConnection } from "./assistant/AssistantClient";
+import { clampGreetInterval, greetIntervalMs, greetingAnchorAfterReset, hasGreetingIntervalElapsed, nextGreetingDueAt } from "./assistant/greetingSchedule";
 import { getApiKey, setApiKey, normalizeOpenAIBase, presetKeyScope, currentKeyScope } from "./assistant/apiKey";
 import { registerEmotionReactor, reactToTouch, getMoodDriverValue, emotionExpression, emotionToAction } from "./assistant/EmotionEngine";
 import { showEmotionPopup } from "./assistant/EmotionPopups";
@@ -1241,24 +1242,29 @@ function markGreeted(at: number): void {
 /**
  * 用户在设置里改了问候间隔后调用：把计时锚点重设到当下，
  * 让新间隔从改动这一刻起算，而不是继续沿用"距上次问候"的旧节奏。
+ *
+ * 注意这个锚点**同时要落盘**：用户改完设置就关掉应用，下次启动也应该从
+ * "改完那一刻"接着算，而不是回到更早的 lastGreetAt。
  */
 function resyncGreetingSchedule() {
-  markGreeted(Date.now());
+  markGreeted(greetingAnchorAfterReset(Date.now()));
   scheduleNextGreeting();
 }
 
-/** 当前生效的问候间隔（分钟→毫秒），带下限保护 */
+/** 当前生效的问候间隔（分钟→毫秒），带产品允许范围钳制 */
 function greetIntervalMsNow(): number {
-  return Math.max(5, Number(settings.assistant.greetInterval) || 20) * 60 * 1000;
+  return greetIntervalMs(settings.assistant.greetInterval);
 }
 
 /**
- * 主动问候的精确调度：**按「上次问候 + 设置间隔」定到秒**，不再靠 60 秒 tick 去撞。
+ * 主动问候的精确调度：**按「锚点 + 设置间隔」定到秒**，不再靠 60 秒 tick 去撞。
  *
  * 旧实现是每 60 秒检查一次 `now - lastGreetAt > interval`，于是实际间隔是
- * 「设置的 N 分钟 + 0~60 秒」；再加上「离开≥15 分钟回来就问候」那条不看间隔，
- * 用户看到的就是"时间间隔不准"。现在改成一次性 setTimeout 定到点，
- * 每次问候/改设置/启动都重排一次，误差只剩定时器本身（毫秒级）。
+ * 「设置的 N 分钟 + 0~60 秒」。现在改成一次性 setTimeout 定到点：
+ * - 启动时按已持久化的锚点排；
+ * - 每次真正问候后重排；
+ * - **用户改完间隔后重新锚定到当下再排**（见 resyncGreetingSchedule）；
+ * - 小助手关掉时清掉定时器，重新打开时也重新锚定（见菜单处理器）。
  */
 let greetTimer: number | null = null;
 function scheduleNextGreeting(): void {
@@ -1267,9 +1273,9 @@ function scheduleNextGreeting(): void {
     greetTimer = null;
   }
   if (!settings.assistant.enabled) return;
-  // 至少 5 秒后才可能触发：避免"刚启动就问候"（锚点很旧时 due 已经过去）
-  const due = Math.max(lastGreetAt + greetIntervalMsNow(), Date.now() + 5000);
-  const delay = Math.max(1000, due - Date.now());
+  const now = Date.now();
+  const due = nextGreetingDueAt(lastGreetAt, settings.assistant.greetInterval, now);
+  const delay = Math.max(1000, due - now);
   greetTimer = window.setTimeout(() => {
     greetTimer = null;
     void fireScheduledGreeting(due);
@@ -1290,7 +1296,7 @@ async function fireScheduledGreeting(dueAt: number): Promise<void> {
     return;
   }
   // 期间可能已经被别的路径问候过（回归问候），到点就别重复
-  if (Date.now() - lastGreetAt < greetIntervalMsNow()) {
+  if (!hasGreetingIntervalElapsed(lastGreetAt, settings.assistant.greetInterval, Date.now())) {
     scheduleNextGreeting();
     return;
   }
@@ -1423,7 +1429,7 @@ async function boot() {
       greetingSchedule: () => ({
         lastGreetAt,
         intervalMs: greetIntervalMsNow(),
-        dueAt: lastGreetAt + greetIntervalMsNow(),
+        dueAt: nextGreetingDueAt(lastGreetAt, settings.assistant.greetInterval, Date.now(), 0),
         timerArmed: greetTimer !== null,
       }),
       // 打开小助手输入框，便于验证空闲收起与关闭按钮
@@ -1510,7 +1516,7 @@ async function boot() {
         const awayMs = now - lastActiveAt;
         // 回归问候同样要守用户设的间隔：离开 15 分钟以上回来，但距上次问候还没到
         // 设定间隔时就不补，交给精确定时器（否则用户会觉得"间隔忽长忽短"）
-        if (awayMs > 15 * 60 * 1000 && now - lastGreetAt > greetIntervalMsNow()) {
+        if (awayMs > 15 * 60 * 1000 && hasGreetingIntervalElapsed(lastGreetAt, settings.assistant.greetInterval, now)) {
           markGreeted(now);
           void triggerProactive();
           trackEvent({ type: "greeting", summary: "主动问候了用户" });
@@ -3019,6 +3025,11 @@ function buildMenu(engine: BehaviorEngine, opts?: { ignoreIdle?: boolean }): Men
         if (!settings.assistant.enabled) {
           closeAssistant();
           clearBubbles();
+          // 关掉时立即清掉问候定时器，别让它空转
+          scheduleNextGreeting();
+        } else {
+          // 重新打开时从"打开这一刻"按设置间隔重新计时（也负责把定时器重新装上）。
+          resyncGreetingSchedule();
         }
         toast(settings.assistant.enabled ? "小助手已开启" : "小助手已关闭");
       },
@@ -5207,11 +5218,19 @@ async function toggleAssistantSettings() {
     mkRow("API Key", keyWrap);
     toggleBaseUrl(); // set initial placeholder
     // API Key 按供应商 / 预设分槽存（Rust 侧加密），打开面板时回填当前那一份。
-    // **必须显式传 provider.value**：无参 getApiKey() 读的是已保存的 settings.assistant.provider，
+    // **必须显式算作用域**：无参 getApiKey() 读的是已保存的 settings.assistant.provider，
     // 而这里下拉可能已经切到别的供应商但还没保存 —— 会回填上一个供应商的 Key，
     // 再点保存就把 A 家的 Key 写进 B 家的槽位（并把它发给 B 家）。
+    // 另外：当前若正套着预设，Key 在 `preset:<id>` 槽位，不是 provider 槽位；
+    // 打开面板却读 provider 槽位的话，输入框会是空的，一保存就把预设的 Key 清掉了。
+    const keyScopeForUi = (): string => {
+      const activeId = settings.assistant.activePresetId;
+      const active = (settings.assistant.presets ?? []).find((p) => p.id === activeId);
+      if (activeId && active && active.provider === provider.value) return presetKeyScope(activeId);
+      return provider.value;
+    };
     const loadKeyForProvider = async () => {
-      key.value = await getApiKey(provider.value);
+      key.value = await getApiKey(keyScopeForUi());
       maskKey();
     };
     void loadKeyForProvider();
@@ -5268,15 +5287,26 @@ async function toggleAssistantSettings() {
           opt.textContent = m;
           modelSelect.appendChild(opt);
         }
-        // 自动选中：优先保留用户之前填的模型名，否则选第一个
         const current = model.value.trim();
-        if (current && models.includes(current)) {
+        if (current) {
+          // 用户手填的模型名必须保留：中转站的 /models 经常只返回一部分模型，
+          // 以前"不在列表里就强制换成 models[0]"，会把用户填好的模型名冲掉，
+          // 自动选中的还可能是 embedding/tts → 一发消息就失败。
+          if (!models.includes(current)) {
+            const opt = document.createElement("option");
+            opt.value = current;
+            opt.textContent = `${current}（手动填写）`;
+            modelSelect.appendChild(opt);
+          }
           modelSelect.value = current;
+          toast(`获取到 ${models.length} 个模型，已保留当前模型：${current}`);
         } else {
-          model.value = models[0];
-          modelSelect.value = models[0];
+          // 没有手填时才自动挑一个"像聊天模型"的，避开中转站列表里的 embedding/tts/画图模型
+          const picked = pickDefaultChatModel(models);
+          model.value = picked;
+          modelSelect.value = picked;
+          toast(`获取到 ${models.length} 个模型，已自动选择对话模型：${picked}`);
         }
-        toast(`获取到 ${models.length} 个模型，已自动选择：${model.value}`);
       } else {
         // error already shown in catch
       }
@@ -5294,20 +5324,38 @@ async function toggleAssistantSettings() {
       try {
         const isCustom = (provider.value as string) === "custom";
         const base = isCustom ? normalizeOpenAIBase(baseUrl.value) : baseUrl.value.trim();
-        const models = await listModels(
-          provider.value as AssistantProvider,
-          key.value.trim(),
-          base,
-        );
-        toast(
-          models.length
-            ? `连接成功：${PROVIDERS[provider.value as keyof typeof PROVIDERS].label} 可用模型 ${models.length} 个`
-            : "连接成功（该端点没有返回模型列表）",
-          "info",
-        );
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        toast(`连接失败：${msg}`, "warn");
+        let listError = "";
+        try {
+          const models = await listModels(
+            provider.value as AssistantProvider,
+            key.value.trim(),
+            base,
+          );
+          if (models.length) {
+            toast(
+              `连接成功：${PROVIDERS[provider.value as keyof typeof PROVIDERS].label} 可用模型 ${models.length} 个`,
+              "info",
+            );
+            return;
+          }
+          listError = "端点没有返回模型列表";
+        } catch (e: unknown) {
+          listError = e instanceof Error ? e.message : String(e);
+        }
+        // 很多中转站不实现 /models，但 /chat/completions 正常。列表失败时再用
+        // 一次最小的真实对话请求验证，避免把"能用的端点"误判成"连接失败"。
+        try {
+          const probed = await probeChatConnection(
+            provider.value as AssistantProvider,
+            key.value.trim(),
+            model.value.trim(),
+            isCustom ? base : baseUrl.value.trim(),
+          );
+          toast(`连接成功：端点可对话（模型：${probed.model}）${listError ? "；但未返回模型列表" : ""}`, "info");
+        } catch (chatErr: unknown) {
+          const detail = chatErr instanceof Error ? chatErr.message : String(chatErr);
+          toast(`连接失败：${detail}${listError ? `（模型列表：${listError}）` : ""}`, "warn");
+        }
       } finally {
         testBtn.disabled = false;
         testBtn.textContent = "测试连接";
@@ -5717,8 +5765,8 @@ async function toggleAssistantSettings() {
       if (cityNext !== settings.weatherCity) cachedWeather = null;
       settings.weatherCity = cityNext;
       // 保存主动问候间隔（钳制到 5-120 分钟）
-      const greetVal = parseInt(greetInput.value, 10);
-      const nextGreetInterval = Math.max(5, Math.min(120, isNaN(greetVal) ? 20 : greetVal));
+      const previousGreetInterval = settings.assistant.greetInterval;
+      const nextGreetInterval = clampGreetInterval(greetInput.value);
       settings.assistant.greetInterval = nextGreetInterval;
       // 输入框空闲收起（秒，0 = 不自动收起；留空/非法值回落到默认 8）
       const idleVal = parseInt(idleInput.value, 10);
@@ -5728,10 +5776,15 @@ async function toggleAssistantSettings() {
       saveSettings(settings);
       // 设置变了要立刻按新值重新计时，否则本次仍按旧的 8 秒/不收起执行
       rearmIdleTimer();
-      // 重排必须在**新间隔写进 settings 之后**：反过来的话 resync 会按旧间隔算下一次，
+      // 重排必须在**新间隔写进 settings 之后**：反过来的话会按旧间隔算下一次，
       // 用户改成 60 分钟却还是 20 分钟来一次（"间隔不准"的另一个来源）。
-      // 顺带把锚点重设到当下，避免"保存前累积的时长已到，刚保存就被问候一下"。
-      resyncGreetingSchedule();
+      // 间隔真的变了才把锚点重设到当下 —— 用户的要求是"改完时间之后按新时间重新计时"；
+      // 只改人格/天气等其他设置时不该偷偷把下一次问候往后推。
+      if (nextGreetInterval !== previousGreetInterval) {
+        resyncGreetingSchedule();
+      } else {
+        scheduleNextGreeting();
+      }
       // API Key 按供应商 / 预设分槽存（Rust 侧 DPAPI / Keychain / Secret Service）。
       // 当前套着预设就写进该预设的槽位：预设之间、预设与供应商之间都互不覆盖。
       try {
