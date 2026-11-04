@@ -69,3 +69,9 @@ logs/
 
 # DSH 记忆库 / 会话日志（含完整聊天记录，禁止入库）
 .dsh-meow/
+
+# 临时自检产物（rustc / 预览页）
+*.pdb
+parse_check*
+websearch_check*
+.panel-preview.html
