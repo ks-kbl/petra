@@ -509,6 +509,27 @@ fn handle_conn(mut stream: TcpStream, panel: &Panel) -> std::io::Result<()> {
                 json!({"ok": true, "seq": seq, "settings": settings, "meta": meta}),
             )
         }
+        // 聊天记录：直接读本地 chat-history.json 给控制面板的「聊天记录」页用。
+        // 只读、只走本机 127.0.0.1 + token，不外传；内容由前端按日期分组渲染。
+        ("GET", "/api/chatlog") => {
+            let app = match APP.get() {
+                Some(a) => a,
+                None => {
+                    return json_resp(&mut stream, 500, json!({"ok": false, "error": "应用未就绪"}))
+                }
+            };
+            let path = match crate::chat_history_path(app) {
+                Ok(p) => p,
+                Err(e) => return json_resp(&mut stream, 500, json!({"ok": false, "error": e})),
+            };
+            let messages: Value = if path.exists() {
+                let raw = std::fs::read_to_string(&path).unwrap_or_default();
+                serde_json::from_str(&raw).unwrap_or_else(|_| json!([]))
+            } else {
+                json!([])
+            };
+            json_resp(&mut stream, 200, json!({"ok": true, "messages": messages}))
+        }
         ("POST", "/api/settings") => {
             let parsed: Value = match serde_json::from_str(&body) {
                 Ok(v) => v,

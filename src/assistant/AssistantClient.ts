@@ -11,6 +11,11 @@ import { normalizeOpenAIBase } from "./apiKey";
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | null;
+  /**
+   * 这条消息写进历史的时间戳。
+   * 控制面板的「聊天记录」按天分组靠它；缺省时（老数据）会归到"更早"。
+   */
+  ts?: number;
   tool_call_id?: string;
   name?: string;
   tool_calls?: Array<{

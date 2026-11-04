@@ -1269,7 +1269,7 @@ fn read_psd(app: AppHandle, name: String) -> Result<Vec<u8>, String> {
 
 /// 聊天历史文件路径：app_data_dir/chat-history.json
 /// 放在用户数据目录（而非软件安装目录），卸载/重装后仍保留。
-fn chat_history_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+pub(crate) fn chat_history_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("chat-history.json"))

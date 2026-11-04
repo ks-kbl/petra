@@ -1490,7 +1490,7 @@ async function send(text: string) {
   if (detectCorrection(text)) pendingCorrection = true;
   // 消息真正发出去才算"回应了主动问候"（没回应则下一轮问候要换话题）
   markGreetingRepliedByUser();
-  history.push({ role: "user", content: userContent });
+  history.push({ role: "user", content: userContent, ts: Date.now() });
   saveHistory();
   // 记下"确实发出去了"的原文：语音收尾迟到时 onFinal 靠它去重
   lastSentText = text.trim();
@@ -1571,6 +1571,7 @@ async function send(text: string) {
       const assistantEntry: ChatMessage = {
         role: "assistant",
         content: transText ? `${mainText}\n---\n${transText}` : mainText,
+        ts: Date.now(),
       };
       history.push(assistantEntry);
       saveHistory();
@@ -2497,7 +2498,7 @@ export async function triggerProactive(): Promise<boolean> {
 
     // 关键：主动问候也是正常对话，必须写进主历史并标【问候】，
     // 这样用户下一句回复时，模型知道"自己刚刚主动说过什么"。
-    history.push({ role: "assistant", content: markGreetingForHistory(greeting) });
+    history.push({ role: "assistant", content: markGreetingForHistory(greeting), ts: Date.now() });
     saveHistory();
     recordGreeting(parsed.summary || mainText.slice(0, 80), mainText);
 

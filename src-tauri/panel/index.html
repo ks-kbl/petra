@@ -138,6 +138,61 @@ body::after{
   backdrop-filter:blur(14px); box-shadow:var(--shadow); padding:16px 18px; min-width:0;
 }
 .card.wide{grid-column:1/-1}
+/* ===================== 聊天记录 ===================== */
+.chatlog-bar{display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; margin:4px 0 12px}
+.chatlog-label{font-size:12.5px; color:var(--txt3)}
+.chatlog-date{
+  padding:7px 10px; border-radius:10px; border:1px solid var(--line-strong);
+  background:var(--card-strong); color:var(--txt); font:inherit; font-size:13px;
+}
+.chatlog-date:focus{outline:none; border-color:var(--brand); box-shadow:0 0 0 3px var(--brand-soft)}
+.chatlog-count{margin-left:auto; font-size:12.5px; color:var(--txt3); font-variant-numeric:tabular-nums}
+.chatlog-chips{display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px}
+.chatlog-chip{
+  padding:4px 11px; border-radius:999px; border:1px solid var(--line);
+  background:var(--card-strong); color:var(--txt2); font:inherit; font-size:12px; cursor:pointer;
+  transition:border-color .15s, color .15s, background .15s;
+}
+.chatlog-chip:hover{border-color:var(--line-strong); color:var(--txt)}
+.chatlog-chip.on{border-color:var(--brand); color:var(--brand); background:var(--brand-soft)}
+.chatlog-view{
+  height:min(68vh, 720px); overflow-y:auto; padding:20px 22px;
+  border-radius:14px; border:1px solid var(--line);
+  background:linear-gradient(180deg, var(--card-strong), var(--card));
+  display:flex; flex-direction:column; gap:14px;
+  scroll-behavior:smooth;
+}
+.chatlog-view::-webkit-scrollbar{width:10px}
+.chatlog-view::-webkit-scrollbar-thumb{background:var(--line-strong); border-radius:99px}
+.cm{display:flex; gap:10px; max-width:min(780px, 88%); align-items:flex-start}
+.cm.me{align-self:flex-end; flex-direction:row-reverse}
+.cm .avatar{
+  width:30px; height:30px; border-radius:50%; flex:0 0 auto;
+  display:grid; place-items:center; font-size:15px;
+  background:var(--brand-soft); border:1px solid var(--line);
+}
+.cm .cw{min-width:0}
+.cm .bubble{
+  padding:10px 14px; border-radius:16px; border:1px solid var(--line);
+  background:var(--card-strong); font-size:13.5px; line-height:1.65;
+  white-space:pre-wrap; word-break:break-word;
+}
+.cm.me .bubble{
+  background:linear-gradient(135deg, var(--brand), var(--brand2));
+  color:#fff; border-color:transparent; box-shadow:0 6px 16px rgba(124,92,255,.22);
+}
+.cm .meta{font-size:11px; color:var(--txt3); margin-top:5px; padding:0 4px}
+.cm.me .meta{text-align:right}
+.cm .trans{margin-top:8px; padding-top:8px; border-top:1px dashed var(--line-strong); font-size:12px; opacity:.72}
+.badge-greet{
+  display:inline-block; margin-right:6px; padding:1px 7px; border-radius:999px;
+  font-size:11px; background:var(--brand-soft); color:var(--brand); vertical-align:1px;
+}
+.cm.me .badge-greet{background:rgba(255,255,255,.22); color:#fff}
+.chatlog-empty{padding:52px 10px; text-align:center; color:var(--txt2); font-size:13.5px}
+.chatlog-empty .ce-ico{font-size:30px; margin-bottom:8px; opacity:.85}
+.chatlog-empty .ce-sub{margin-top:6px; font-size:12.5px; color:var(--txt3)}
+.chatlog-tip{margin-top:10px; font-size:12px; color:var(--txt3)}
 .card h2{margin:0 0 3px; font-size:13.5px; letter-spacing:.4px; text-transform:uppercase; color:var(--txt3)}
 .card .cd{margin:0 0 12px; font-size:12.5px; color:var(--txt2)}
 .row{
@@ -544,6 +599,11 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
           ],
         },
       ],
+    },
+    {
+      id: "history", label: "聊天记录", title: "聊天记录",
+      desc: "按天回看最近 30 天的对话，只读本地文件，不上传",
+      cards: [{ title: "聊天记录", desc: "", type: "chatlog" }],
     },
     {
       id: "persona", label: "人设", title: "人设 · 它是谁",
@@ -1178,6 +1238,196 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   }
 
   /** 对话记录 */
+  /**
+   * 聊天记录：日期选择框 + 大号只读视图。
+   *
+   * 数据直接来自本地 chat-history.json（经 /api/chatlog 只读转发），
+   * 按每条的 ts 字段分到自然日。升级前的旧消息没有 ts，单独归到「更早」。
+   */
+  function chatLogCard() {
+    const card = el("div", "card wide");
+    card.appendChild(el("h2", null, "聊天记录"));
+    card.appendChild(el("p", "cd", "按天回看最近 30 天的对话。只读本地 chat-history.json，不上传、不改动。"));
+
+    const pad2 = (n) => String(n).padStart(2, "0");
+    const dayKey = (ts) => {
+      const d = new Date(ts);
+      return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    };
+    const todayKey = dayKey(Date.now());
+    const minKey = dayKey(Date.now() - 29 * 86400000);
+
+    // ---- 工具栏 ----
+    const bar = el("div", "chatlog-bar");
+    const dateInput = document.createElement("input");
+    dateInput.type = "date";
+    dateInput.className = "chatlog-date";
+    dateInput.min = minKey;
+    dateInput.max = todayKey;
+    dateInput.value = todayKey;
+    const label = el("span", "chatlog-label", "选择日期");
+
+    const todayBtn = el("button", "btn btn-sm", "今天");
+    const yestBtn = el("button", "btn btn-sm", "昨天");
+    const oldBtn = el("button", "btn btn-sm", "更早的记录");
+    oldBtn.hidden = true;
+    const refreshBtn = el("button", "btn btn-sm", "刷新");
+    const count = el("span", "chatlog-count", "读取中…");
+
+    bar.append(label, dateInput, todayBtn, yestBtn, oldBtn, refreshBtn, count);
+
+    // ---- 有记录的日期（快选） ----
+    const chips = el("div", "chatlog-chips");
+    // ---- 正文 ----
+    const viewer = el("div", "chatlog-view");
+    const tip = el("div", "chatlog-tip");
+    card.append(bar, chips, viewer, tip);
+
+    const cache = { messages: null };
+    let current = todayKey;
+
+    const stripReminder = (text) =>
+      String(text || "")
+        .split(/\n/)
+        .filter((line) => !/^\[系统提醒/.test(line.trim()))
+        .join("\n")
+        .trim();
+
+    const splitTrans = (raw) => {
+      const m = /-{3,}\n?/.exec(raw);
+      if (!m) return { main: raw, trans: "" };
+      return { main: raw.slice(0, m.index).trim(), trans: raw.slice(m.index + m[0].length).trim() };
+    };
+
+    const WEEK = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    const weekOf = (key) => {
+      const d = new Date(key + "T00:00:00");
+      return Number.isFinite(d.getTime()) ? WEEK[d.getDay()] : "";
+    };
+    const timeText = (ts) => {
+      if (!ts) return "";
+      const d = new Date(ts);
+      return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    };
+
+    function bubbleFor(m) {
+      const me = m.role === "user";
+      const row = el("div", "cm" + (me ? " me" : ""));
+      const avatar = el("div", "avatar", me ? "🧑" : "🐾");
+      const wrap = el("div", "cw");
+      const raw = stripReminder(m.content);
+      const { main, trans } = splitTrans(raw);
+      const greet = !me && main.startsWith("【问候】");
+      const body = el("div", "bubble", greet ? main.replace(/^【问候】\s*/, "") : main);
+      if (greet) {
+        const b = el("span", "badge-greet", "主动问候");
+        body.prepend(b);
+      }
+      if (trans) body.appendChild(el("div", "trans", trans));
+      const meta = el("div", "meta", `${me ? "你" : "Petra"}${timeText(m.ts) ? " · " + timeText(m.ts) : ""}`);
+      wrap.append(body, meta);
+      row.append(avatar, wrap);
+      return row;
+    }
+
+    function render() {
+      const all = cache.messages || [];
+      const usable = all.filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim());
+      const byDay = new Map();
+      let undated = 0;
+      for (const m of usable) {
+        // 30 天以前的和没有时间戳的都归到「更早」，否则它们会从界面上消失
+        if (!m.ts || dayKey(m.ts) < minKey) { undated++; continue; }
+        const k = dayKey(m.ts);
+        if (!byDay.has(k)) byDay.set(k, []);
+        byDay.get(k).push(m);
+      }
+
+      // 快选 chips：只列真有记录的日子（近 30 天，新到旧）
+      chips.innerHTML = "";
+      const days = [...byDay.keys()].filter((k) => k >= minKey && k <= todayKey).sort().reverse();
+      if (days.length > 1) {
+        days.forEach((k) => {
+          const c = el("button", "chatlog-chip" + (k === current ? " on" : ""), `${k.slice(5)} · ${byDay.get(k).length}`);
+          c.onclick = () => { current = k; dateInput.value = k; render(); };
+          chips.appendChild(c);
+        });
+      }
+
+      const list = byDay.get(current) || [];
+      viewer.innerHTML = "";
+      if (!list.length) {
+        const empty = el("div", "chatlog-empty");
+        empty.appendChild(el("div", "ce-ico", "🗒️"));
+        empty.appendChild(el("div", null, current === todayKey ? "今天还没有聊天记录" : `${current} 没有聊天记录`));
+        empty.appendChild(el("div", "ce-sub", days.length ? "换一个日期，或点上面的日期标签试试" : "聊两句之后这里就会有内容"));
+        viewer.appendChild(empty);
+      } else {
+        list.forEach((m) => viewer.appendChild(bubbleFor(m)));
+        viewer.scrollTop = viewer.scrollHeight;
+      }
+      count.textContent = `${current} ${weekOf(current)} · ${list.length} 条`;
+
+      oldBtn.hidden = undated === 0;
+      tip.textContent = undated
+        ? `另有 ${undated} 条更早的记录（30 天以前，或升级前没有时间戳），点「更早的记录」查看。`
+        : "记录按消息时间归到自然日，最多显示最近 30 天；清空对话后这里也会一起清空。";
+    }
+
+    function showUndated() {
+      // 「更早」= 升级前没有时间戳的 + 30 天以前的（日期框只覆盖近 30 天，别让老记录消失）
+      const all = (cache.messages || []).filter(
+        (m) =>
+          (m.role === "user" || m.role === "assistant") &&
+          typeof m.content === "string" &&
+          m.content.trim() &&
+          (!m.ts || dayKey(m.ts) < minKey),
+      );
+      current = "undated";
+      dateInput.value = "";
+      chips.innerHTML = "";
+      viewer.innerHTML = "";
+      if (!all.length) {
+        viewer.appendChild(el("div", "chatlog-empty", "没有更早的记录"));
+      } else {
+        all.forEach((m) => viewer.appendChild(bubbleFor(m)));
+        viewer.scrollTop = viewer.scrollHeight;
+      }
+      count.textContent = `更早 · ${all.length} 条`;
+    }
+
+    async function load() {
+      try {
+        if (!cache.messages) {
+          const res = await api("/api/chatlog");
+          cache.messages = Array.isArray(res && res.messages) ? res.messages : [];
+        }
+        if (current !== "undated") render();
+      } catch (e) {
+        viewer.innerHTML = "";
+        viewer.appendChild(el("div", "chatlog-empty", "读取失败：" + (e && e.message ? e.message : e)));
+        count.textContent = "";
+      }
+    }
+
+    dateInput.onchange = () => {
+      if (!dateInput.value) return;
+      current = dateInput.value;
+      render();
+    };
+    todayBtn.onclick = () => { current = todayKey; dateInput.value = todayKey; render(); };
+    yestBtn.onclick = () => { current = dayKey(Date.now() - 86400000); dateInput.value = current; render(); };
+    oldBtn.onclick = () => showUndated();
+    refreshBtn.onclick = () => {
+      cache.messages = null;
+      count.textContent = "读取中…";
+      load();
+    };
+
+    load();
+    return card;
+  }
+
   function chatCard() {
     const card = el("div", "card");
     card.appendChild(el("h2", null, "对话记录"));
@@ -1782,6 +2032,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (cardSpec.type === "model") return grid.appendChild(modelCard());
       if (cardSpec.type === "presets") return grid.appendChild(presetsCard());
       if (cardSpec.type === "chat") return grid.appendChild(chatCard());
+      if (cardSpec.type === "chatlog") return grid.appendChild(chatLogCard());
       if (cardSpec.type === "card") return grid.appendChild(cardCard());
       if (cardSpec.type === "diary") return grid.appendChild(diaryCard());
       if (cardSpec.type === "actionplay") return grid.appendChild(actionPlayCard());
