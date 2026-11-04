@@ -24,6 +24,10 @@ use tauri::{AppHandle, Emitter, Manager};
 
 /// 面板页面（单文件，随二进制一起内嵌；改完页面要重新编译 Rust）
 const PANEL_HTML: &str = include_str!("../panel/index.html");
+/// 聊天记录页的纯逻辑（浏览器与 node 测试共用，见 tests/chatlog-core.test.js）
+const CHATLOG_CORE: &str = include_str!("../panel/chatlog-core.cjs");
+/// 本次编译时间（build.rs 注入），页脚显示 —— 用来确认"跑的是不是新构建"
+const PANEL_BUILD: &str = env!("PANEL_BUILD_STAMP");
 
 /// 首选端口：固定好记，用户还能收藏；被占用时退回系统分配
 const PREFERRED_PORT: u16 = 47188;
@@ -473,7 +477,11 @@ fn handle_conn(mut stream: TcpStream, panel: &Panel) -> std::io::Result<()> {
 
     // 首页不校验 token（浏览器导航没法带自定义头）；它本身不含任何数据
     if path == "/" || path == "/index.html" {
-        return respond(&mut stream, 200, "text/html; charset=utf-8", PANEL_HTML.as_bytes(), true);
+        let html = PANEL_HTML.replace("__PANEL_BUILD__", PANEL_BUILD);
+        return respond(&mut stream, 200, "text/html; charset=utf-8", html.as_bytes(), true);
+    }
+    if path == "/chatlog-core.cjs" {
+        return respond(&mut stream, 200, "text/javascript; charset=utf-8", CHATLOG_CORE.as_bytes(), true);
     }
     if path == "/favicon.ico" {
         return respond(&mut stream, 204, "text/plain", b"", false);
@@ -508,6 +516,22 @@ fn handle_conn(mut stream: TcpStream, panel: &Panel) -> std::io::Result<()> {
                 200,
                 json!({"ok": true, "seq": seq, "settings": settings, "meta": meta}),
             )
+        }
+        // 聊天记录：直接读本地 chat-history.json 给控制面板的「聊天记录」页用。
+        // 只读、只走本机 127.0.0.1 + token，不外传；内容由前端按日期分组渲染。
+        ("GET", "/api/chatlog") => {
+            let app = match APP.get() {
+                Some(a) => a,
+                None => {
+                    return json_resp(&mut stream, 500, json!({"ok": false, "error": "应用未就绪"}))
+                }
+            };
+            // 按天分片的历史由 lib.rs 统一合并（含旧单文件的自动迁移）
+            let messages: Value = match crate::read_chat_history_all(app) {
+                Ok(list) => Value::Array(list),
+                Err(e) => return json_resp(&mut stream, 500, json!({"ok": false, "error": e})),
+            };
+            json_resp(&mut stream, 200, json!({"ok": true, "messages": messages}))
         }
         ("POST", "/api/settings") => {
             let parsed: Value = match serde_json::from_str(&body) {

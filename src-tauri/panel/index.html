@@ -89,7 +89,19 @@ body::after{
 .theme-btn:hover{background:var(--brand-soft)}
 
 /* ===================== 灵动岛导航 ===================== */
-.navbar{position:sticky; top:61px; z-index:29; padding:14px 0 10px; display:flex; justify-content:center; min-width:0}
+/* 导航条压在内容之上：必须**整块不透明**。
+   之前只给内部胶囊加了底色，容器是透明的，页面一滚动聊天气泡就从按钮周围的缝里透出来
+   （用户截图里"消息被切一半"就是这个）；渐隐到透明的做法也会在底部留一条透光带。 */
+.navbar{
+  position:sticky; top:61px; z-index:29; padding:14px 0 10px;
+  display:flex; justify-content:center; min-width:0;
+  background:#f4f1ff;
+  box-shadow:0 10px 14px -12px rgba(24,20,48,.35);
+}
+html[data-theme="dark"] .navbar{
+  background:#14121f;
+  box-shadow:0 10px 14px -12px rgba(0,0,0,.9);
+}
 .island{
   position:relative; display:flex; align-items:center; gap:2px; padding:5px; border-radius:999px;
   border:1px solid var(--line); background:color-mix(in srgb, var(--card-strong) 84%, transparent);
@@ -138,6 +150,89 @@ body::after{
   backdrop-filter:blur(14px); box-shadow:var(--shadow); padding:16px 18px; min-width:0;
 }
 .card.wide{grid-column:1/-1}
+/* ===================== 聊天记录 ===================== */
+.chatlog-bar{display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; margin:4px 0 12px}
+.chatlog-label{font-size:12.5px; color:var(--txt3)}
+.chatlog-date{
+  padding:7px 10px; border-radius:10px; border:1px solid var(--line-strong);
+  background:var(--card-strong); color:var(--txt); font:inherit; font-size:13px;
+}
+.chatlog-date:focus{outline:none; border-color:var(--brand); box-shadow:0 0 0 3px var(--brand-soft)}
+.chatlog-count{margin-left:auto; font-size:12.5px; color:var(--txt3); font-variant-numeric:tabular-nums}
+.chatlog-chips{display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px}
+.chatlog-chip{
+  padding:4px 11px; border-radius:999px; border:1px solid var(--line);
+  background:var(--card-strong); color:var(--txt2); font:inherit; font-size:12px; cursor:pointer;
+  transition:border-color .15s, color .15s, background .15s;
+}
+.chatlog-chip:hover{border-color:var(--line-strong); color:var(--txt)}
+.chatlog-chip.on{border-color:var(--brand); color:var(--brand); background:var(--brand-soft)}
+.chatlog-view{
+  /* 一屏放得下：顶栏+导航+标题+工具条+提示条大约占 400px，剩下的全给消息区。
+     以前固定 68vh，窗口一矮整页就得滚，聊天内容会滑到导航条底下（被截一半很难看）。 */
+  /* 尽量吃满剩余视口：用户明确要求"显示框做大一点"。
+     整页允许滚动（导航条已是不透明实底，不会再出现内容透出的问题），
+     但消息区至少 380px，宽屏能到 900px。 */
+  height:clamp(380px, calc(100vh - 300px), 900px);
+  overflow-y:auto; padding:20px 22px;
+  border-radius:14px; border:1px solid var(--line);
+  background:linear-gradient(180deg, var(--card-strong), var(--card));
+  display:flex; flex-direction:column; gap:14px;
+  scroll-behavior:smooth;
+}
+.chatlog-view::-webkit-scrollbar{width:10px}
+.chatlog-view::-webkit-scrollbar-thumb{background:var(--line-strong); border-radius:99px}
+.cm{display:flex; gap:10px; max-width:min(780px, 88%); align-items:flex-start}
+.cm.me{align-self:flex-end; flex-direction:row-reverse}
+.cm .avatar{
+  width:30px; height:30px; border-radius:50%; flex:0 0 auto;
+  display:grid; place-items:center; font-size:15px;
+  background:var(--brand-soft); border:1px solid var(--line);
+}
+.cm .cw{min-width:0}
+.cm .bubble{
+  padding:10px 14px; border-radius:16px; border:1px solid var(--line);
+  background:var(--card-strong); font-size:13.5px; line-height:1.65;
+  white-space:pre-wrap; word-break:break-word;
+}
+.cm.me .bubble{
+  background:linear-gradient(135deg, var(--brand), var(--brand2));
+  color:#fff; border-color:transparent; box-shadow:0 6px 16px rgba(124,92,255,.22);
+}
+.cm .meta{font-size:11px; color:var(--txt3); margin-top:5px; padding:0 4px}
+.cm.me .meta{text-align:right}
+.cm .trans{margin-top:8px; padding-top:8px; border-top:1px dashed var(--line-strong); font-size:12px; opacity:.72}
+.badge-greet{
+  display:inline-block; margin-right:6px; padding:1px 7px; border-radius:999px;
+  font-size:11px; background:var(--brand-soft); color:var(--brand); vertical-align:1px;
+}
+.cm.me .badge-greet{background:rgba(255,255,255,.22); color:#fff}
+.chatlog-empty{padding:52px 10px; text-align:center; color:var(--txt2); font-size:13.5px}
+.chatlog-empty .ce-ico{font-size:30px; margin-bottom:8px; opacity:.85}
+.chatlog-empty .ce-sub{margin-top:6px; font-size:12.5px; color:var(--txt3)}
+.chatlog-tip{margin:0 0 10px; font-size:12px; color:var(--txt3)}
+.chatlog-chip-old{border-style:dashed}
+.chatlog-tools{display:flex; align-items:center; gap:10px; margin-bottom:10px}
+.chatlog-search{
+  flex:1 1 320px; max-width:520px; padding:8px 12px; border-radius:10px;
+  border:1px solid var(--line-strong); background:var(--card-strong); color:var(--txt);
+  font:inherit; font-size:13px;
+}
+.chatlog-search:focus{outline:none; border-color:var(--brand); box-shadow:0 0 0 3px var(--brand-soft)}
+.chatlog-searchinfo{font-size:12px; color:var(--txt3)}
+.chatlog-view mark{background:rgba(255,200,60,.45); color:inherit; border-radius:3px; padding:0 1px}
+html[data-theme="dark"] .chatlog-view mark{background:rgba(255,200,60,.35)}
+.cm-tool{align-self:stretch; margin:2px 0}
+.cm-tool summary{
+  cursor:pointer; font-size:12px; color:var(--txt3); padding:3px 8px;
+  border-radius:8px; display:inline-block; user-select:none;
+}
+.cm-tool summary:hover{background:var(--brand-soft); color:var(--brand)}
+.cm-tool-body{
+  margin:6px 8px 2px; padding:8px 12px; border-left:2px solid var(--line-strong);
+  font-size:12px; color:var(--txt2); white-space:pre-wrap; word-break:break-word;
+  background:var(--card); border-radius:0 8px 8px 0; max-height:220px; overflow:auto;
+}
 .card h2{margin:0 0 3px; font-size:13.5px; letter-spacing:.4px; text-transform:uppercase; color:var(--txt3)}
 .card .cd{margin:0 0 12px; font-size:12.5px; color:var(--txt2)}
 .row{
@@ -282,6 +377,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   .navbar::-webkit-scrollbar{display:none}
   .island{flex:0 0 auto}
 }
+@media (max-height: 780px){
+  .chatlog-view{height:clamp(300px, calc(100vh - 280px), 560px)}
+}
 @media (max-width: 640px){
   .wrap{padding:0 14px 100px}
   .tbin{padding:10px 14px}
@@ -341,6 +439,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   <footer class="foot">
     <span>改动后立刻生效，无需手动保存和重启</span>
     <span id="footStat"></span>
+    <span id="buildStamp" style="margin-left:auto;opacity:.75">面板构建 __PANEL_BUILD__</span>
   </footer>
 </div>
 
@@ -350,9 +449,14 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
 </div>
 <div class="toasts" id="toasts"></div>
 
+<script src="/chatlog-core.cjs"></script>
 <script>
 (() => {
   "use strict";
+
+  // 聊天记录页的纯逻辑（日期归属 / 清洗 / 搜索分段 / 导出）抽在 chatlog-core.cjs 里，
+  // 由 Rust 用 include_str! 内嵌并通过 /chatlog-core.cjs 提供，node 测试加载同一份。
+  const CL = window.PetraChatLog || null;
 
   // ---------- 鉴权 ----------
   // token 由 Rust 拼在 URL 片段里（#t=…）。片段不会发给服务端，也不会进浏览历史里的查询串。
@@ -544,6 +648,11 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
           ],
         },
       ],
+    },
+    {
+      id: "history", label: "聊天记录", title: "聊天记录",
+      desc: "按天回看最近 30 天的对话，只读本地文件，不上传",
+      cards: [{ title: "聊天记录", desc: "", type: "chatlog" }],
     },
     {
       id: "persona", label: "人设", title: "人设 · 它是谁",
@@ -1178,27 +1287,255 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   }
 
   /** 对话记录 */
+  /**
+   * 聊天记录：日期选择框 + 大号只读视图。
+   *
+   * 数据来自本地 chat-history/YYYY-MM-DD.json（经 /api/chatlog 合并转发），
+   * 日期归属、消息清洗、搜索分段、导出这些纯逻辑都在 chatlog-core.cjs 里（有单测）。
+   */
+  function chatLogCard() {
+    const card = el("div", "card wide");
+    card.appendChild(el("h2", null, "聊天记录"));
+    card.appendChild(el("p", "cd", "按天回看最近 30 天的对话。只读本地文件，不上传、不改动。"));
+
+    const todayKey = CL.dayKey(Date.now());
+    const minKey = CL.dayKey(Date.now() - 29 * 86400000);
+
+    // ---- 工具栏 ----
+    const bar = el("div", "chatlog-bar");
+    const label = el("span", "chatlog-label", "选择日期");
+    const dateInput = document.createElement("input");
+    dateInput.type = "date";
+    dateInput.className = "chatlog-date";
+    dateInput.min = minKey;
+    dateInput.max = todayKey;
+    dateInput.value = todayKey;
+
+    const todayBtn = el("button", "btn btn-sm", "今天");
+    const yestBtn = el("button", "btn btn-sm", "昨天");
+    const oldBtn = el("button", "btn btn-sm", "更早的记录");
+    oldBtn.hidden = true;
+    const exportBtn = el("button", "btn btn-sm", "导出 MD");
+    const refreshBtn = el("button", "btn btn-sm", "刷新");
+    const count = el("span", "chatlog-count", "读取中…");
+    bar.append(label, dateInput, todayBtn, yestBtn, oldBtn, exportBtn, refreshBtn, count);
+
+    // ---- 搜索 ----
+    const tools = el("div", "chatlog-tools");
+    const searchInput = document.createElement("input");
+    searchInput.type = "search";
+    searchInput.className = "chatlog-search";
+    searchInput.placeholder = "在这一天里搜索：关键词 / 句子片段";
+    const searchInfo = el("span", "chatlog-searchinfo", "");
+    tools.append(searchInput, searchInfo);
+
+    const chips = el("div", "chatlog-chips");
+    const viewer = el("div", "chatlog-view");
+    const tip = el("div", "chatlog-tip");
+    // 提示条放在消息区上方：它解释「为什么会有一条更早的记录」，藏在最下面等于没有
+    card.append(bar, tools, chips, tip, viewer);
+
+    const cache = { messages: null };
+    let current = todayKey;
+    let query = "";
+
+    /** 命中片段包成 <mark>；全程 textContent，不拼 HTML */
+    function appendHighlighted(node, text, q) {
+      const segs = CL.highlightSegments(text, q);
+      for (const seg of segs) {
+        if (seg.hit) {
+          const mark = document.createElement("mark");
+          mark.textContent = seg.text;
+          node.appendChild(mark);
+        } else {
+          node.appendChild(document.createTextNode(seg.text));
+        }
+      }
+    }
+
+    function bubbleFor(m) {
+      const me = m.role === "user";
+      const row = el("div", "cm" + (me ? " me" : ""));
+      const avatar = el("div", "avatar", me ? "🧑" : "🐾");
+      const wrap = el("div", "cw");
+      const raw = CL.stripReminder(m.content);
+      const { main, trans } = CL.splitTranslation(raw);
+      const greet = !me && CL.isGreeting(m);
+      const body = el("div", "bubble");
+      if (greet) body.appendChild(el("span", "badge-greet", "主动问候"));
+      appendHighlighted(body, main.replace(/^【问候】\s*/, ""), query);
+      if (trans) {
+        const t = el("div", "trans");
+        appendHighlighted(t, trans, query);
+        body.appendChild(t);
+      }
+      const t0 = CL.timeText(m.ts);
+      const meta = el("div", "meta", `${me ? "你" : "Petra"}${t0 ? " · " + t0 : ""}`);
+      wrap.append(body, meta);
+      row.append(avatar, wrap);
+      return row;
+    }
+
+    /** 工具调用收成一行灰字，点开看详情（原来直接不显示，等于没有痕迹） */
+    function toolRow(m) {
+      const box = document.createElement("details");
+      box.className = "cm-tool";
+      const sum = document.createElement("summary");
+      const t0 = CL.timeText(m.ts);
+      sum.textContent = `工具调用${t0 ? " · " + t0 : ""}`;
+      box.appendChild(sum);
+      const pre = el("div", "cm-tool-body");
+      appendHighlighted(pre, String(m.content), query);
+      box.appendChild(pre);
+      return box;
+    }
+
+    function renderRows(list) {
+      viewer.innerHTML = "";
+      if (!list.length) {
+        const empty = el("div", "chatlog-empty");
+        empty.appendChild(el("div", "ce-ico", query ? "🔍" : "🗒️"));
+        empty.appendChild(el("div", null, query
+          ? `没有匹配「${query}」的消息`
+          : (current === todayKey ? "今天还没有聊天记录" : `${current} 没有聊天记录`)));
+        empty.appendChild(el("div", "ce-sub", query ? "换个关键词，或清空搜索框" : "换一个日期，或点上面的日期标签试试"));
+        viewer.appendChild(empty);
+        return;
+      }
+      list.forEach((m) => viewer.appendChild(CL.isTool(m) ? toolRow(m) : bubbleFor(m)));
+      viewer.scrollTop = viewer.scrollHeight;
+    }
+
+    function render() {
+      const { byDay, undated } = CL.groupByDay(cache.messages || [], minKey, todayKey);
+
+      // 日期标签：每个有记录的日子一个，最后一个「更早」兜住 30 天前的老数据
+      chips.innerHTML = "";
+      const days = [...byDay.keys()].sort().reverse();
+      days.forEach((k) => {
+        const n = byDay.get(k).filter(CL.isChat).length;
+        const c = el("button", "chatlog-chip" + (k === current ? " on" : ""), `${k.slice(5)} · ${n}`);
+        c.onclick = () => { current = k; dateInput.value = k; render(); };
+        chips.appendChild(c);
+      });
+      if (undated > 0) {
+        const c = el("button", "chatlog-chip chatlog-chip-old" + (current === "undated" ? " on" : ""), `更早 · ${undated}`);
+        c.onclick = () => showUndated();
+        chips.appendChild(c);
+      }
+
+      oldBtn.hidden = undated === 0;
+      tip.textContent = undated
+        ? `另有 ${undated} 条更早的记录（30 天以前，或升级前没有时间戳），点「更早 · ${undated}」查看。`
+        : "记录按消息时间归到自然日，最多显示最近 30 天；清空对话后这里也会一起清空。";
+
+      if (current === "undated") {
+        const all = (cache.messages || []).filter(
+          (m) => (CL.isChat(m) || CL.isTool(m)) && (!m.ts || CL.dayKey(m.ts) < minKey),
+        );
+        const list = CL.filterByQuery(all, query);
+        renderRows(list);
+        count.textContent = `更早 · ${CL.dayStats(list).chats} 条${query ? "（已筛选）" : ""}`;
+        searchInfo.textContent = query ? `命中 ${list.length} 条` : "";
+        return;
+      }
+
+      const list = CL.filterByQuery(byDay.get(current) || [], query);
+      renderRows(list);
+      const stats = CL.dayStats(list);
+      count.textContent = `${current} ${CL.weekOf(current)} · ${stats.chats} 条${query ? "（已筛选）" : ""}`;
+      searchInfo.textContent = query ? `命中 ${list.length} 条` : "";
+    }
+
+    function showUndated() {
+      current = "undated";
+      dateInput.value = "";
+      render();
+    }
+
+    function exportDay() {
+      if (current === "undated") {
+        panelToast("「更早」没有具体日期，先选一天再导出");
+        return;
+      }
+      const { byDay } = CL.groupByDay(cache.messages || [], minKey, todayKey);
+      const list = byDay.get(current) || [];
+      if (!CL.dayStats(list).chats) {
+        panelToast("这一天没有对话可以导出");
+        return;
+      }
+      const md = CL.buildMarkdown(list, `${current} ${CL.weekOf(current)}`);
+      const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `petra-chat-${current}.md`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+
+    /** 面板自己的 toast（找不到就退回 alert） */
+    function panelToast(msg) {
+      try {
+        if (typeof toast === "function") return toast(msg);
+      } catch (_) {}
+      alert(msg);
+    }
+
+    async function load() {
+      try {
+        if (!cache.messages) {
+          const res = await api("/api/chatlog");
+          cache.messages = Array.isArray(res && res.messages) ? res.messages : [];
+        }
+        render();
+      } catch (e) {
+        viewer.innerHTML = "";
+        viewer.appendChild(el("div", "chatlog-empty", "读取失败：" + (e && e.message ? e.message : e)));
+        count.textContent = "";
+      }
+    }
+
+    dateInput.onchange = () => {
+      if (!dateInput.value) return;
+      current = dateInput.value;
+      render();
+    };
+    searchInput.oninput = () => {
+      query = searchInput.value.trim();
+      render();
+    };
+    todayBtn.onclick = () => { current = todayKey; dateInput.value = todayKey; render(); };
+    yestBtn.onclick = () => { current = CL.dayKey(Date.now() - 86400000); dateInput.value = current; render(); };
+    oldBtn.onclick = () => showUndated();
+    exportBtn.onclick = () => exportDay();
+    refreshBtn.onclick = () => {
+      cache.messages = null;
+      count.textContent = "读取中…";
+      load();
+    };
+
+    load();
+    return card;
+  }
+
+  /** 对话记录：具体内容已经搬到独立的「聊天记录」页，这里只留指路和清空 */
   function chatCard() {
     const card = el("div", "card");
     card.appendChild(el("h2", null, "对话记录"));
-    card.appendChild(el("p", "cd", "只读最近 30 条，主动问候和学习已过滤"));
+    card.appendChild(el("p", "cd", "按天回看、搜索、导出请到「聊天记录」页；这里只保留清空。"));
     const btns = el("div", "btn-row");
-    const load = el("button", "btn btn-sm btn-primary", "读取记录");
-    load.onclick = () => runAction("__data:chat-load", "读取对话");
-    const clr = el("button", "btn btn-sm btn-danger", "清空");
+    const go = el("button", "btn btn-sm btn-primary", "去聊天记录页");
+    go.onclick = () => {
+      state.section = "history";
+      renderNav();
+      renderSection();
+    };
+    const clr = el("button", "btn btn-sm btn-danger", "清空对话");
     clr.onclick = () => { if (confirm("清空全部对话记录？不可恢复。")) runAction("__data:chat-clear", "清空对话"); };
-    btns.append(load, clr);
+    btns.append(go, clr);
     card.appendChild(btns);
-    const list = (state.meta.data && state.meta.data.chat) || [];
-    if (!list.length) { card.appendChild(el("div", "empty", "还没读取，点上面的「读取记录」")); return card; }
-    const box = el("div", "chatlist");
-    list.forEach((m) => {
-      const it = el("div", "chatitem " + (m.role === "user" ? "me" : "ai"));
-      it.appendChild(el("b", null, m.role === "user" ? "你" : "Petra"));
-      it.appendChild(el("div", null, m.content));
-      box.appendChild(it);
-    });
-    card.appendChild(box);
     return card;
   }
 
@@ -1771,10 +2108,13 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     const sec = SECTIONS.find((s) => s.id === state.section) || SECTIONS[0];
     const page = $("#page");
     page.innerHTML = "";
-    const head = el("div", "section-head");
-    head.appendChild(el("h1", null, sec.title));
-    head.appendChild(el("p", null, sec.desc));
-    page.appendChild(head);
+    // 聊天记录页的卡片自带标题和说明，再顶一个大标题纯属浪费垂直空间 —— 消息区才是主角
+    if (sec.id !== "history") {
+      const head = el("div", "section-head");
+      head.appendChild(el("h1", null, sec.title));
+      head.appendChild(el("p", null, sec.desc));
+      page.appendChild(head);
+    }
 
     const grid = el("div", "grid");
     sec.cards.forEach((cardSpec) => {
@@ -1782,6 +2122,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (cardSpec.type === "model") return grid.appendChild(modelCard());
       if (cardSpec.type === "presets") return grid.appendChild(presetsCard());
       if (cardSpec.type === "chat") return grid.appendChild(chatCard());
+      if (cardSpec.type === "chatlog") return grid.appendChild(chatLogCard());
       if (cardSpec.type === "card") return grid.appendChild(cardCard());
       if (cardSpec.type === "diary") return grid.appendChild(diaryCard());
       if (cardSpec.type === "actionplay") return grid.appendChild(actionPlayCard());

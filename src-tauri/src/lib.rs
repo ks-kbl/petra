@@ -1267,30 +1267,150 @@ fn read_psd(app: AppHandle, name: String) -> Result<Vec<u8>, String> {
     std::fs::read(dir.join(&file_name)).map_err(|e| e.to_string())
 }
 
-/// 聊天历史文件路径：app_data_dir/chat-history.json
-/// 放在用户数据目录（而非软件安装目录），卸载/重装后仍保留。
-fn chat_history_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+/// 旧版单文件聊天历史：app_data_dir/chat-history.json
+/// 现在只用于「迁移来源」，读写都走 chat_history_dir 里的按天分片。
+pub(crate) fn chat_history_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("chat-history.json"))
 }
 
-/// 保存聊天历史（前端传入 JSON 字符串，整体覆盖写）。
-#[tauri::command]
-fn save_chat_history(app: AppHandle, content: String) -> Result<(), String> {
-    let p = chat_history_path(&app)?;
-    std::fs::write(&p, content).map_err(|e| e.to_string())?;
+/// 聊天历史目录：app_data_dir/chat-history/，一天一个文件（YYYY-MM-DD.json）。
+///
+/// 为什么按天分片：以前是**一个文件装全部历史、每发一条消息整份重写**，
+/// 聊得越久文件越大、每次保存越慢，控制面板也要整份读进来才能显示一天。
+/// 分片之后每轮只重写当天那份（几十 KB），老文件不再被触碰。
+pub(crate) fn chat_history_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let dir = dir.join("chat-history");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// 一条消息归属哪一天：优先用 ts（毫秒），没有 ts 的旧消息统一进 "legacy"。
+///
+/// 注意：分片只是**存储**用的边界（按 UTC 日切），界面上的"哪一天"由前端按本地时区
+/// 用 ts 自己算 —— 所以分片日期和界面上的日期不必严格一致，绝不影响显示。
+fn chat_day_key(msg: &serde_json::Value) -> String {
+    let ts = msg.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    if ts <= 0 {
+        return "legacy".to_string();
+    }
+    let days_since_epoch = (ts / 1000) / 86_400;
+    let (y, m, d) = civil_from_days(days_since_epoch);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 从"1970-01-01 起的天数"换算成公历年月日（Howard Hinnant 的算法，纯算术不引依赖）
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 把旧版单文件历史迁移成按天分片（只在旧文件存在时做一次）
+fn migrate_legacy_chat_history(app: &AppHandle) -> Result<(), String> {
+    let legacy = chat_history_path(app)?;
+    if !legacy.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&legacy).unwrap_or_default();
+    let msgs: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let dir = chat_history_dir(app)?;
+    let mut buckets: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for m in msgs {
+        buckets.entry(chat_day_key(&m)).or_default().push(m);
+    }
+    for (day, list) in buckets {
+        let path = dir.join(format!("{day}.json"));
+        // 目标已存在就合并（极少数情况下迁移跑了两遍）
+        let mut merged: Vec<serde_json::Value> = if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        merged.extend(list);
+        let text = serde_json::to_string(&merged).map_err(|e| e.to_string())?;
+        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    }
+    // 迁移完改名留档，避免下次又迁一遍；出问题也能人工找回
+    let backup = legacy.with_extension("json.bak");
+    std::fs::rename(&legacy, &backup).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// 读取聊天历史；文件不存在时返回空字符串（首次运行）。
+/// 读取全部聊天历史（按日期升序拼接）。面板和前端都用它。
+pub(crate) fn read_chat_history_all(app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    migrate_legacy_chat_history(app)?;
+    let dir = chat_history_dir(app)?;
+    let mut days: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        .collect();
+    days.sort();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for p in days {
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+                out.extend(list);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 保存聊天历史（前端传入整份 JSON）：按 ts 拆成每天一个文件写回。
+#[tauri::command]
+fn save_chat_history(app: AppHandle, content: String) -> Result<(), String> {
+    migrate_legacy_chat_history(&app)?;
+    let msgs: Vec<serde_json::Value> = serde_json::from_str(&content).unwrap_or_default();
+    let dir = chat_history_dir(&app)?;
+    let mut buckets: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for m in msgs {
+        buckets.entry(chat_day_key(&m)).or_default().push(m);
+    }
+    // 历史被清空：把旧分片都删掉（否则清空之后又会被读回来）
+    if buckets.is_empty() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == "json").unwrap_or(false) {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        return Ok(());
+    }
+    // 逐个写；本次没涉及的老日子文件保持原样（它们不会再变）
+    for (day, list) in buckets {
+        let path = dir.join(format!("{day}.json"));
+        let text = serde_json::to_string(&list).map_err(|e| e.to_string())?;
+        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 读取聊天历史；没有任何记录时返回空字符串（首次运行）。
 #[tauri::command]
 fn load_chat_history(app: AppHandle) -> Result<String, String> {
-    let p = chat_history_path(&app)?;
-    if !p.exists() {
+    let all = read_chat_history_all(&app)?;
+    if all.is_empty() {
         return Ok(String::new());
     }
-    std::fs::read_to_string(&p).map_err(|e| e.to_string())
+    serde_json::to_string(&all).map_err(|e| e.to_string())
 }
 
 /// 读取内置模型 manifest.json（多路径尝试，适配便携版和安装版）

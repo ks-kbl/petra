@@ -23,6 +23,52 @@ import {
   type GreetingRecord,
 } from "./greetingMemory";
 import { markGreetingForHistory } from "./greetingHistory";
+import {
+  emptyProfile,
+  normalizeProfile,
+  profileBlock,
+  shouldSynthesize,
+  buildProfileMessages,
+  parseProfileResponse,
+  type UserProfile,
+} from "./userProfile";
+import { applyMemoryOps, parseMemoryOps, formatMemoryForExtractor } from "./memoryOps";
+import { rankMemories } from "./memoryRank";
+import {
+  recordMoodSample,
+  summarizeMood,
+  moodBlock,
+  normalizeMoodSamples,
+  type MoodSample,
+} from "./moodTrend";
+import { detectCorrection } from "./correction";
+import {
+  contentHash,
+  needsEmbedding,
+  normalizeEmbeddingCache,
+  mergeSemanticDuplicates,
+  type EmbeddingCache,
+} from "./semanticMerge";
+import {
+  emptyNudgeState,
+  normalizeNudgeState,
+  shouldNudge,
+  markNudged,
+  pickNudgeCandidate,
+  pickOpenLoop,
+  nudgeBlock,
+  type NudgeState,
+} from "./memoryNudge";
+import {
+  emptyChatSummary,
+  normalizeChatSummary,
+  summaryBlock,
+  shouldSummarize,
+  collectSummarizable,
+  buildSummaryMessages,
+  parseSummaryResponse,
+  type ChatSummary,
+} from "./chatSummary";
 import { ToolLoopBudget, formatToolError, toolNames, truncateToolResult, validateToolArgs } from "./toolRuntime";
 import { ttsPlayer } from "../tts/TTSPlayer";
 import { getVisibleRect } from "../ui/visible";
@@ -42,6 +88,20 @@ function idleHideMs(): number {
 }
 const HIST_KEY = "live2d-pet-assistant-history";
 const MEM_KEY = "live2d-pet-assistant-memory";
+/** 用户画像：只喂模型看，不在界面展示（用户要求"从对话过程侧面体现"） */
+const PROFILE_KEY = "live2d-pet-assistant-profile";
+/** 长期记忆条数上限。原来是 80，聊一个月就停止学习；画像层接管 prompt 后素材可以多存 */
+const MEM_LIMIT = 200;
+/** 更早对话的滚动摘要：补窗口截断后的上下文，长聊不失忆 */
+const SUMMARY_KEY = "live2d-pet-assistant-chat-summary";
+/** 情绪趋势采样：每天一个点，最近 14 天（只进 prompt，不露界面） */
+const MOOD_SAMPLES_KEY = "petra-mood-samples";
+/** 主动提起旧事的节流状态（3 小时冷却 / 每天最多 2 次） */
+const NUDGE_KEY = "petra-memory-nudge";
+/** 记忆向量缓存（语义查重用；端点不支持就整条链路静默跳过） */
+const EMB_KEY = "petra-memory-embeddings";
+/** 端点不支持 embedding 的标记（记日期，24 小时内不再试，避免每条消息都撞一次 404） */
+const EMB_UNSUPPORTED_KEY = "petra-embedding-unsupported";
 /** 主动问候话题记录：最近几次问候的 summary / 是否被回复，用于避免一天内重复话题 */
 const GREETING_LOG_KEY = "petra-greeting-log";
 
@@ -51,6 +111,16 @@ let input: HTMLTextAreaElement;
 let allowAllShell: HTMLInputElement;
 let history: ChatMessage[] = [];
 let memory: MemoryStore = [];
+let userProfile: UserProfile = emptyProfile();
+let chatSummary: ChatSummary = emptyChatSummary();
+/** 上次后台提取记忆时的 history 长度：按"新增了多少条"触发，而不是按长度取余 */
+let lastExtractedAt = 0;
+/** 这一轮用户是不是在纠正我（"记错了/我没说过/别记这个"）→ 立刻跑一次提取 */
+let pendingCorrection = false;
+let moodSamples: MoodSample[] = [];
+let nudgeState: NudgeState = emptyNudgeState();
+let memoryEmbeddings: EmbeddingCache = {};
+let embeddingUnsupportedDay = "";
 let timer: number | null = null;
 let busy = false;
 /** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant / triggerProactive） */
@@ -221,7 +291,243 @@ function loadMemory() {
 }
 function saveMemory() {
   try {
-    localStorage.setItem(MEM_KEY, JSON.stringify(memory.slice(-80)));
+    localStorage.setItem(MEM_KEY, JSON.stringify(memory.slice(-MEM_LIMIT)));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 记忆超上限时的淘汰：先扔最琐碎的（importance 数字越大越琐碎），
+ * 同档次再扔最久没被引用的。之前是 `slice(-80)` 硬切最旧的，
+ * 会把"用户叫小明"这种核心记忆切掉、留下昨天的碎事。
+ */
+function pruneMemory() {
+  while (memory.length > MEM_LIMIT) {
+    let victim = 0;
+    for (let i = 1; i < memory.length; i++) {
+      const a = memory[i], b = memory[victim];
+      if (a.importance > b.importance || (a.importance === b.importance && a.lastUsedAt < b.lastUsedAt)) victim = i;
+    }
+    memory.splice(victim, 1);
+  }
+}
+
+function loadUserProfile() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PROFILE_KEY) || "null");
+    userProfile = normalizeProfile(raw);
+  } catch {
+    userProfile = emptyProfile();
+  }
+}
+
+function saveUserProfile() {
+  try {
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(userProfile));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+function loadMemoryEmbeddings() {
+  try {
+    memoryEmbeddings = normalizeEmbeddingCache(JSON.parse(localStorage.getItem(EMB_KEY) || "null"));
+  } catch {
+    memoryEmbeddings = {};
+  }
+  try {
+    embeddingUnsupportedDay = localStorage.getItem(EMB_UNSUPPORTED_KEY) || "";
+  } catch {
+    embeddingUnsupportedDay = "";
+  }
+}
+
+function saveMemoryEmbeddings() {
+  try {
+    // 只留还活着的记忆，别让缓存无限膨胀
+    const alive = new Set(memory.map((m) => m.id));
+    const trimmed: EmbeddingCache = {};
+    for (const [id, v] of Object.entries(memoryEmbeddings)) {
+      if (alive.has(id)) trimmed[id] = v;
+    }
+    memoryEmbeddings = trimmed;
+    localStorage.setItem(EMB_KEY, JSON.stringify(trimmed));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+function embeddingBlockedToday(): boolean {
+  const today = new Date();
+  const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  return embeddingUnsupportedDay === key;
+}
+
+function markEmbeddingUnsupported() {
+  const today = new Date();
+  embeddingUnsupportedDay = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  try {
+    localStorage.setItem(EMB_UNSUPPORTED_KEY, embeddingUnsupportedDay);
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 语义查重：给记忆算 embedding，把"换了说法其实是同一件事"的条目合并掉。
+ *
+ * 只在后台跑，不参与聊天召回打分 —— 所以不会给回复加任何延迟。
+ * 端点不支持 /embeddings（DeepSeek、不少中转站）或没网时，标记当天不再尝试，
+ * 记忆照旧按 2-gram 去重，功能退化但不报错。
+ */
+let embeddingRunning = false;
+async function refreshMemoryEmbeddings(s: any, apiKey: string) {
+  if (embeddingRunning) return;
+  if (embeddingBlockedToday()) return;
+  const ep = backgroundEndpoint(s);
+  if (!ep) return;
+  const need = needsEmbedding(memoryEmbeddings, memory).slice(0, 32);
+  if (!need.length) return;
+  embeddingRunning = true;
+  try {
+    const model = String(s?.assistant?.embeddingModel || "text-embedding-3-small");
+    const res = await fetch(`${ep.base}/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, input: need.map((m) => m.content) }),
+    });
+    if (!res.ok) {
+      // 404/400 基本都是端点压根没有 /embeddings：今天不再试
+      markEmbeddingUnsupported();
+      return;
+    }
+    const json = await res.json();
+    const data = Array.isArray(json?.data) ? json.data : [];
+    if (!data.length) {
+      markEmbeddingUnsupported();
+      return;
+    }
+    need.forEach((m, i) => {
+      const v = data[i]?.embedding;
+      if (Array.isArray(v) && v.length >= 8) {
+        memoryEmbeddings[m.id] = { h: contentHash(m.content), v: v.map((x: unknown) => Number(x)) };
+      }
+    });
+    saveMemoryEmbeddings();
+
+    const result = mergeSemanticDuplicates(memory, memoryEmbeddings, 0.9);
+    if (result.merged > 0) {
+      memory = result.memory;
+      for (const id of result.removedIds) delete memoryEmbeddings[id];
+      saveMemoryEmbeddings();
+      saveMemory();
+      // 记忆发生了变化，画像跟着重算
+      void synthesizeUserProfile(s, apiKey, true);
+    }
+  } catch {
+    markEmbeddingUnsupported();
+  } finally {
+    embeddingRunning = false;
+  }
+}
+
+function loadNudgeState() {
+  try {
+    nudgeState = normalizeNudgeState(JSON.parse(localStorage.getItem(NUDGE_KEY) || "null"));
+  } catch {
+    nudgeState = emptyNudgeState();
+  }
+}
+
+function saveNudgeState() {
+  try {
+    localStorage.setItem(NUDGE_KEY, JSON.stringify(nudgeState));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 这一轮要不要"顺口问一句"。
+ * 频率受控（3 小时冷却、每天 2 次），命中就把它标记成刚用过，避免下一轮又提同一件事。
+ */
+function takeTurnNudge(): string {
+  try {
+    if (!shouldNudge(nudgeState)) return "";
+    // 先看"这次的对话留下的线头"，再退回"很久没提的旧事实"
+    const loop = pickOpenLoop(nudgeState, chatSummary.openLoops);
+    if (loop) {
+      nudgeState = markNudged(nudgeState, Date.now(), loop);
+      saveNudgeState();
+      return nudgeBlock({ content: loop });
+    }
+    const cand = pickNudgeCandidate(memory);
+    if (!cand) return "";
+    nudgeState = markNudged(nudgeState);
+    saveNudgeState();
+    // 记一次"用过了"：不然同一件事会被反复挑中
+    const orig = memory.find((m) => m.id === cand.id);
+    if (orig) {
+      orig.lastUsedAt = Date.now();
+      saveMemory();
+    }
+    return nudgeBlock(cand);
+  } catch {
+    return "";
+  }
+}
+
+function loadMoodSamples() {
+  try {
+    moodSamples = normalizeMoodSamples(JSON.parse(localStorage.getItem(MOOD_SAMPLES_KEY) || "[]"));
+  } catch {
+    moodSamples = [];
+  }
+}
+
+function saveMoodSamples() {
+  try {
+    localStorage.setItem(MOOD_SAMPLES_KEY, JSON.stringify(moodSamples.slice(-14)));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 每轮记一个情绪采样点（同一天取平均），供 moodBlock 判断"他这几天怎么样" */
+function sampleMoodNow() {
+  try {
+    moodSamples = recordMoodSample(moodSamples, getMood().happiness);
+    saveMoodSamples();
+  } catch { /* 忽略 */ }
+}
+
+/** 注入用的"关于主人"上下文：画像 + 最近情绪状态（都只进 system prompt） */
+function personaContextBlock(): string {
+  return [profileBlock(userProfile), moodBlock(summarizeMood(moodSamples))].filter(Boolean).join("\n\n");
+}
+
+function loadChatSummary() {
+  try {
+    chatSummary = normalizeChatSummary(JSON.parse(localStorage.getItem(SUMMARY_KEY) || "null"));
+  } catch {
+    chatSummary = emptyChatSummary();
+  }
+}
+
+function saveChatSummary() {
+  try {
+    localStorage.setItem(SUMMARY_KEY, JSON.stringify(chatSummary));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 历史被清空/重置时，摘要的下标基准也失效了，必须一起清 */
+function resetChatSummary() {
+  chatSummary = emptyChatSummary();
+  try {
+    localStorage.removeItem(SUMMARY_KEY);
   } catch {
     /* 忽略 */
   }
@@ -279,6 +585,15 @@ async function loadHistory() {
   // 不再在这里重置"历史所属语言" —— 那会把「改语言就清历史」也一起关掉。
   // 历史语言改为持久化在 settings.assistant.historyLang，见 send()。
 }
+/**
+ * 统一的"写进历史"入口：补齐 ts 时间戳。
+ * 控制面板的「聊天记录」按 ts 分天，散落各处的 history.push 很容易漏，所以收口到这里。
+ */
+function pushHistory(msg: ChatMessage) {
+  if (!msg.ts) msg.ts = Date.now();
+  history.push(msg);
+}
+
 function saveHistory() {
   // 整体覆盖写到 app_data_dir/chat-history.json；fire-and-forget，失败不阻塞对话
   void invoke("save_chat_history", { content: JSON.stringify(history) }).catch(() => {});
@@ -985,6 +1300,23 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   ensureInput();
   ensureBubbles();
   loadMemory();
+  loadUserProfile();
+  loadChatSummary();
+  loadMoodSamples();
+  loadNudgeState();
+  loadMemoryEmbeddings();
+  // 打开对话面板也是一次"见到用户"，顺手采一个情绪点（比以前只在聊天/问候后采样更连续）
+  sampleMoodNow();
+  // 素材够了就在后台重算一份画像（不阻塞打开面板；没配 Key 就跳过）
+  void (async () => {
+    try {
+      const key = await ensureApiKey();
+      if (key) {
+        void synthesizeUserProfile(loadSettings(), key);
+        void refreshMemoryEmbeddings(loadSettings(), key);
+      }
+    } catch { /* 没有 Key / 后端未就绪：等下次打开再说 */ }
+  })();
   // 历史只在**本次启动第一次打开**时从磁盘加载一次：
   //  · 以前每次打开都无条件重载 —— 工具执行/确认中会把内存里尚未落盘的 assistant+tool
   //    序列覆盖掉，配对丢失后每轮请求 400；
@@ -1102,6 +1434,8 @@ export function repositionAssistantBubbles(): void {
 /** 清空对话历史（保留长期记忆 memory） */
 export function clearHistory() {
   history = [];
+  resetChatSummary();
+  lastExtractedAt = 0;
   try {
     void invoke("save_chat_history", { content: "[]" }).catch(() => {});
   } catch {
@@ -1112,6 +1446,8 @@ export function clearHistory() {
 
 export function resetHistory() {
   history = [];
+  resetChatSummary();
+  lastExtractedAt = 0;
   saveHistory();
   if (bubbles) bubbles.innerHTML = "";
 }
@@ -1264,6 +1600,8 @@ async function send(text: string) {
     scheduleFade(b, 5000);
     return;
   }
+  // 本轮要不要顺口提起一件旧事（有频率上限，提过就冷却）
+  const turnNudge = takeTurnNudge();
   const outLang = s.assistant.outputLanguage;
   // 换语言时清空对话历史。
   // 以前用内存变量 lastChatLang 作基准，重启后初值为空 → 第一次发送就误清历史；
@@ -1285,9 +1623,12 @@ async function send(text: string) {
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑
   const langReminder = buildLanguageReminder(outLang ?? "");
   const userContent = langReminder ? `${text}\n${langReminder}` : text;
+  // 用户在纠正我（"记错了/我没说过/别记这个"）：记下来，这轮回复完立刻跑一次记忆提取，
+  // 不等攒够 6 条 —— 否则 AI 会带着错的记忆再聊好几轮。
+  if (detectCorrection(text)) pendingCorrection = true;
   // 消息真正发出去才算"回应了主动问候"（没回应则下一轮问候要换话题）
   markGreetingRepliedByUser();
-  history.push({ role: "user", content: userContent });
+  pushHistory({ role: "user", content: userContent, ts: Date.now() });
   saveHistory();
   // 记下"确实发出去了"的原文：语音收尾迟到时 onFinal 靠它去重
   lastSentText = text.trim();
@@ -1340,6 +1681,11 @@ async function send(text: string) {
         {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
           extraTools: pluginRuntime.getOpenAITools(),
+          // 画像 + 最近情绪只走 system prompt：模型知道"这是什么样的人、最近过得怎样"，
+          // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
+          profileText: [personaContextBlock(), turnNudge].filter(Boolean).join("\n\n"),
+          // 长聊之后补上被窗口切掉的旧对话，避免"聊到一半突然不认识你"
+          historySummary: summaryBlock(chatSummary),
         },
       );
       if (colorHook.lastEmotion() !== "neutral") streamEmo = colorHook.lastEmotion();
@@ -1363,9 +1709,17 @@ async function send(text: string) {
       const assistantEntry: ChatMessage = {
         role: "assistant",
         content: transText ? `${mainText}\n---\n${transText}` : mainText,
+        ts: Date.now(),
       };
-      history.push(assistantEntry);
-      saveHistory();      // 情感反馈
+      pushHistory(assistantEntry);
+      saveHistory();
+      // 历史够长了就在后台往前推一段摘要（不阻塞这轮回复）
+      void (async () => {
+        try {
+          const key = await ensureApiKey();
+          if (key) void updateChatSummary(s, key);
+        } catch { /* 忽略 */ }
+      })();      // 情感反馈
       const finalEmo = classifyAssistantEmotion(mainText);
       const aiEmo = finalEmo !== "neutral" ? finalEmo : streamEmo;
       setBubbleText(loading, "");
@@ -1446,10 +1800,17 @@ async function send(text: string) {
     saveHistory();
     ttsPlayer.flush();
 
-    // P3 主动学习：每 5 条对话自动提取新记忆（后台运行，不阻塞 UI）
-    if (history.length % 5 === 0) {
-      void extractMemoriesFromChat(s, apiKey);
+    // P3 主动学习：每攒够 6 条新消息提取一次（后台运行，不阻塞 UI）。
+    // 以前用 `history.length % 5 === 0`：tool 调用会让长度跳着涨，同一余数在长会话里反复命中，
+    // 提取次数不可控；改成按"自上次以来新增条数"触发。
+    const correcting = pendingCorrection;
+    pendingCorrection = false;
+    if (history.length - lastExtractedAt >= 6 || correcting) {
+      lastExtractedAt = history.length;
+      void extractMemoriesFromChat(s, apiKey, correcting);
     }
+    // 每轮记一个情绪采样（判断"他这几天状态怎么样"用）
+    sampleMoodNow();
     if (!getBubbleText(loading).trim()) setBubbleText(loading, "(空回复)");
     // 回复说完就淡出（用户要求：「两段话说完了气泡也没有消失」）。
     // 以前这里刻意不淡出，气泡就一直挂到下一轮、把桌宠挡个正着。
@@ -1504,7 +1865,7 @@ function withHint(text: string, hint: string): string {
 /** 处理工具调用：先 push assistant tool_calls 消息，再逐个执行并 push tool 消息 */
 async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: ToolLoopBudget, screenshot: { image: string | undefined }) {
   // assistant 消息带 tool_calls（content 为 null 规范格式；DeepSeek 要求 tool 消息紧跟它）
-  history.push({
+  pushHistory({
     role: "assistant",
     content: null,
     tool_calls: calls.map((tc) => ({
@@ -1528,9 +1889,9 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       // tool 消息的 content 必须是字符串：数字/对象类返回值（如空闲秒数）统一转成文本
       let text = typeof result === "string" ? result : JSON.stringify(result);
       if (shape) text = shape(text);
-      history.push({ role: "tool", tool_call_id: tcItem.id, content: text });
+      pushHistory({ role: "tool", tool_call_id: tcItem.id, content: text });
     } catch (e) {
-      history.push({ role: "tool", tool_call_id: tcItem.id, content: `失败：${e}` });
+      pushHistory({ role: "tool", tool_call_id: tcItem.id, content: `失败：${e}` });
     }
   };
 
@@ -1538,7 +1899,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     // 次数预算用尽：不再执行，但**仍然**回一条明确结果 ——
     // 留下一条悬空的 tool_calls 会让下一轮请求直接 400。
     if (!budget.canCall()) {
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: formatToolError(
@@ -1552,7 +1913,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     const repeatHint = budget.noteCall(tc.name, tc.argsError ? { __raw: tc.args } : tc.args);
     // 参数不是合法 JSON：让模型知道要重发（静默丢弃会让它以为调过了）
     if (tc.argsError) {
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: withHint(
@@ -1565,7 +1926,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     // 未知工具 / 缺必填参数：不开 IPC，直接回可执行的提示
     const check = validateToolArgs(tc.name, tc.args);
     if (!check.ok) {
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: withHint(formatToolError(tc.name, check.message), repeatHint),
@@ -1575,7 +1936,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     // 插件工具：交给 PluginRuntime 的 Worker 执行。插件内部可以再调 pet.say 等白名单能力。
     if (pluginRuntime.isPluginTool(tc.name)) {
       const result = await pluginRuntime.executeTool(tc.name, tc.args);
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: withHint(truncateToolResult(tc.name, result), repeatHint),
@@ -1587,50 +1948,45 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       const category = String(tc.args.category ?? "other") as MemoryEntry["category"];
       const importance = Math.min(3, Math.max(1, Number(tc.args.importance) || 2)) as MemoryEntry["importance"];
       if (content) {
-        // 去重：检查已有记忆是否包含相同内容
-        const existing = memory.find(m => m.content === content || (m.keywords.length > 0 && m.keywords.some(k => content.includes(k))));
-        if (existing) {
-          existing.lastUsedAt = Date.now();
-          existing.importance = Math.min(existing.importance, importance) as MemoryEntry["importance"];
-          history.push({ role: "tool", tool_call_id: tc.id, content: "已更新记忆" });
-        } else {
-          // 提取关键词（简单分词）
-          const keywords = extractKeywords(content);
-          memory.push({
-            id: `mem_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            category,
-            content,
-            keywords,
-            source: "user_said",
-            createdAt: Date.now(),
-            lastUsedAt: Date.now(),
-            importance,
-          });
-          history.push({ role: "tool", tool_call_id: tc.id, content: "已记住" });
-        }
+        // 走统一的增删改层：同一件事换个说法不会存成两条，超上限按重要度淘汰
+        const res = applyMemoryOps(
+          memory,
+          [{ op: "add", content, category, importance }],
+          { keywordsOf: extractKeywords, maxCount: MEM_LIMIT, source: "user_said" },
+        );
+        memory = res.memory;
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: res.added ? "已记住" : "已更新记忆" });
         saveMemory();
+        // handleToolCalls 没有 apiKey：Key 缓存在 ensureApiKey 里，这里异步取一次
+        void (async () => {
+          try {
+            const key = await ensureApiKey();
+            // importance=1 是用户亲口给的核心信息，立刻重算画像，不等攒满 6 条
+            if (key) void synthesizeUserProfile(loadSettings(), key, importance === 1);
+          } catch { /* 忽略 */ }
+        })();
       } else {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "内容为空" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "内容为空" });
       }
       continue;
     }
     if (tc.name === "delete_wrong_history") {
       const keywords = String(tc.args.keywords ?? "").trim().split(/\s+/).filter(Boolean);
       if (keywords.length === 0) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "没有提供关键词" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "没有提供关键词" });
         continue;
       }
       // 按完整旧轮次删除，避免留下孤立 tool 消息；当前纠正和正在执行的工具保留。
       const beforeDelete = history.length;
       history = deleteWrongHistory(history, keywords);
       const deleted = beforeDelete - history.length;
-      history.push({ role: "tool", tool_call_id: tc.id, content: `已删除旧对话中的${deleted}条消息，保留了本轮纠正。` });
+      pushHistory({ role: "tool", tool_call_id: tc.id, content: `已删除旧对话中的${deleted}条消息，保留了本轮纠正。` });
       continue;
     }
     if (tc.name === "launch_application") {
       const app = String(tc.args.application ?? "").trim();
       if (!app) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "应用名称为空" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "应用名称为空" });
         continue;
       }
       setBubbleText(loading, "启动中…");
@@ -1645,13 +2001,13 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       } catch (e) {
         result = JSON.stringify({ success: false, message: `执行失败：${e}`, resolved: null });
       }
-      history.push({ role: "tool", tool_call_id: tc.id, content: result });
+      pushHistory({ role: "tool", tool_call_id: tc.id, content: result });
     }
     if (tc.name === "run_shell") {
       const cmd = String(tc.args.command ?? "").trim();
       if (!cmd) {
         // 空命令也必回传 tool 消息，保证 tool_calls 序列完整（否则 DeepSeek 报 400）
-        history.push({ role: "tool", tool_call_id: tc.id, content: "命令为空" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "命令为空" });
         continue;
       }
       const doRun = allowAllShell.checked
@@ -1691,7 +2047,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           result = `执行失败：${e}`;
         }
       }
-      history.push({ role: "tool", tool_call_id: tc.id, content: result });
+      pushHistory({ role: "tool", tool_call_id: tc.id, content: result });
     }
     if (tc.name === "set_volume") {
       await invokeTool(tc, "set_volume", { level: tc.args.level, mute: tc.args.mute });
@@ -1704,7 +2060,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         boostMood("reminder_done");
         toast(`提醒：${message}`, "info");
       }, ms);
-      history.push({ role: "tool", tool_call_id: tc.id, content: `已设定 ${minutes} 分钟后提醒：${message}` });
+      pushHistory({ role: "tool", tool_call_id: tc.id, content: `已设定 ${minutes} 分钟后提醒：${message}` });
     }
     if (tc.name === "get_weather") {
       await invokeTool(tc, "get_weather");
@@ -1718,24 +2074,27 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     if (tc.name === "search_web") {
       const query = String(tc.args.query || "").trim();
       if (!query) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "搜索词是空的，请带上 query 再调用一次。" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "搜索词是空的，请带上 query 再调用一次。" });
       } else {
         try {
-          const hits = await invoke<{ title: string; url: string; snippet: string }[]>("web_search", {
+          const hits = await invoke<{ title: string; url: string; snippet: string; engine?: string }[]>("web_search", {
             query,
             limit: 5,
           });
           const text = (hits || [])
             .map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}\n   ${h.snippet}`)
             .join("\n");
-          history.push({
+          // 带上引擎名：既让用户知道信息从哪来，也能一眼看出多引擎兜底有没有生效
+          const engine = (hits || []).find((h) => h.engine)?.engine;
+          const from = engine ? `（来源：${engine}）` : "";
+          pushHistory({
             role: "tool",
             tool_call_id: tc.id,
-            content: text ? `搜索「${query}」的结果：\n${text}` : `搜索「${query}」没有结果`,
+            content: text ? `搜索「${query}」的结果${from}：\n${text}` : `搜索「${query}」没有结果`,
           });
         } catch (e) {
           // 搜索失败要让模型知道，它可以换个关键词再试或直接说查不到，别让用户等成"卡住"
-          history.push({ role: "tool", tool_call_id: tc.id, content: `搜索失败：${e}` });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `搜索失败：${e}` });
         }
       }
     }
@@ -1771,7 +2130,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       const isDir = tc.args.is_dir === true;
       const ok = await confirmFileWrite(`小助手想新建${isDir ? "文件夹" : "文件"}：${path}`);
       if (!ok) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次新建操作" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次新建操作" });
       } else {
         await invokeTool(tc, "create_entry", {
           path,
@@ -1791,7 +2150,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         `小助手想改文件：${path}\n把「${brief(oldStr)}」换成「${newStr === "" ? "（删除）" : brief(newStr)}」`,
       );
       if (!ok) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次修改" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次修改" });
       } else {
         await invokeTool(tc, "edit_text_file", {
           path,
@@ -1810,7 +2169,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         `小助手想${mode === "append" ? "追加内容到" : "整个写入"}：${path}（${body.length} 字，覆盖会先备份）`,
       );
       if (!ok) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次写入" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次写入" });
       } else {
         await invokeTool(tc, "write_text_file", {
           path,
@@ -1831,9 +2190,9 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       try {
         const b64 = await invoke<string>("capture_screen");
         screenshot.image = `data:image/png;base64,${b64}`;
-        history.push({ role: "tool", tool_call_id: tc.id, content: "截图成功。屏幕画面已作为图片附加在后续请求中，请根据你看到的屏幕内容回答用户的问题。" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "截图成功。屏幕画面已作为图片附加在后续请求中，请根据你看到的屏幕内容回答用户的问题。" });
       } catch (e) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: `截图失败：${e}` });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: `截图失败：${e}` });
       }
     }
     if (tc.name === "get_idle_seconds") {
@@ -1861,9 +2220,9 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         ];
         if (result.aiText !== result.card.baseText) lines.push(`AI文案：${result.aiText}`);
         lines.push(`图鉴：${collected}/${total}`, "", "请用你的人设风格重新演绎上面的文案，加入自己的点评或吐槽，不要原样复述。直接对用户说话。");
-        history.push({ role: "tool", tool_call_id: tc.id, content: lines.join("\n") });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: lines.join("\n") });
       } catch (e) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: `抽卡失败：${e}` });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: `抽卡失败：${e}` });
       }
     }
     if (tc.name === "view_diary") {
@@ -1871,17 +2230,17 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       if (date) {
         const entry = getDiary(date);
         if (entry) {
-          history.push({ role: "tool", tool_call_id: tc.id, content: `📖 ${date} 的日记：\n${entry.content}` });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `📖 ${date} 的日记：\n${entry.content}` });
         } else {
-          history.push({ role: "tool", tool_call_id: tc.id, content: `${date} 没有日记哦~` });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `${date} 没有日记哦~` });
         }
       } else {
         const diaries = loadDiaries().slice(0, 3);
         if (diaries.length === 0) {
-          history.push({ role: "tool", tool_call_id: tc.id, content: "还没有日记呢~跟我互动就会自动生成啦！" });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: "还没有日记呢~跟我互动就会自动生成啦！" });
         } else {
           const summary = diaries.map(d => `📖 ${d.date}: ${d.content.slice(0, 30)}...`).join("\n");
-          history.push({ role: "tool", tool_call_id: tc.id, content: `最近的日记：\n${summary}` });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `最近的日记：\n${summary}` });
         }
       }
     }
@@ -1895,7 +2254,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     const lastMsg = history[history.length - 1];
     const answered = lastMsg?.role === "tool" && lastMsg.tool_call_id === tc.id;
     if (!answered) {
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: formatToolError(
@@ -1951,7 +2310,12 @@ function extractKeywords(text: string): string[] {
   return [...new Set(keywords)].slice(0, 20);
 }
 
-/** 根据当前场景召回相关记忆（返回最重要的几条） */
+/**
+ * 根据当前场景召回相关记忆。
+ *
+ * 具体打分逻辑搬到了 memoryRank.ts（纯函数 + 单测）：BM25 + 近义扩展 + 2-gram 相似度，
+ * 解决"用户说加班到三点、 памяти里有熬夜却召不回"的问题。
+ */
 function recallRelevantMemories(context: {
   timeOfDay?: string;
   currentApp?: string;
@@ -1960,66 +2324,62 @@ function recallRelevantMemories(context: {
   userText?: string;
 }): MemoryEntry[] {
   if (memory.length === 0) return [];
-  
-  const now = Date.now();
-  const scored = memory.map(m => {
-    let score = 0;
-    // 重要度权重
-    score += (4 - m.importance) * 3;
-    // 最近使用过的加分
-    const daysSinceUsed = (now - m.lastUsedAt) / 86400000;
-    score += Math.max(0, 3 - daysSinceUsed * 0.1);
-    
-    // 场景相关性加分
-    const ctx = `${context.currentApp ?? ""} ${context.currentTitle ?? ""} ${context.timeOfDay ?? ""}`;
-    for (const kw of m.keywords) {
-      if (ctx.toLowerCase().includes(kw.toLowerCase())) {
-        score += 5;
-      }
-    }
-    // 与用户当前消息相关的记忆显著加分
-    const ut = (context.userText ?? "").toLowerCase();
-    if (ut) {
-      for (const kw of m.keywords) {
-        if (ut.includes(kw.toLowerCase())) {
-          score += 6;
-        }
-      }
-    }
-    // 时间相关记忆加分
-    if (m.category === "schedule" || m.category === "habit") {
-      if (context.timeOfDay) score += 2;
-    }
-    if (m.category === "identity") score += 1; // 身份记忆总是重要
-    
-    return { entry: m, score };
-  });
-  
-  scored.sort((a, b) => b.score - a.score);
-  // 只召回高分且相关的记忆，最多2条，避免AI提起无关旧事
-  return scored.filter(s => s.score >= 5).slice(0, 2).map(s => s.entry);
+  return rankMemories(memory, context, { limit: 4, minScore: 5 }).map((r) => r.entry);
 }
 
+/**
+ * 后台轻量调用（记忆提取 / 画像提炼）共用的端点解析。
+ * 自定义端点没有默认模型时返回 null —— 不要拿 deepseek-chat 去撞中转站（必然 404）。
+ */
+function backgroundEndpoint(s: any): { base: string; model: string } | null {
+  const provider = s?.assistant?.provider;
+  const base = provider === "custom"
+    ? normalizeOpenAIBase(s.assistant.customBaseUrl)
+    : PROVIDERS[provider as AssistantProvider]?.base ?? "https://api.deepseek.com";
+  const model = s?.assistant?.model || PROVIDERS[provider as AssistantProvider]?.defaultModel || "";
+  if (!base || !model) return null;
+  return { base, model };
+}
 
 /** P3 主动学习：从最近对话中提取用户信息，后台轻量调用 */
-async function extractMemoriesFromChat(s: any, apiKey: string) {
-  if (memory.length > 80) return; // 记忆已满，不再提取
-  const recentMsgs = history.slice(-10).filter(m => m.role === "user" || m.role === "assistant");
+async function extractMemoriesFromChat(s: any, apiKey: string, correcting = false) {
+  // 满了先按"最琐碎 + 最久没用"淘汰，而不是从此停止学习（长期使用必然会撞上限）
+  pruneMemory();
+  const recentMsgs = history.slice(-12).filter(m => m.role === "user" || m.role === "assistant");
   if (recentMsgs.length < 3) return;
   const transcript = recentMsgs.map(m => `${m.role}: ${m.content}`).join("\n");
+  // 提取器能看到已有记忆的 id，才能判断"这是新信息 / 该改旧的 / 旧的已经不作数了"。
+  // 只输出 add 的话，事实一变新旧会同时留着，模型看到互相矛盾的记忆只能瞎猜。
   const extractPrompt = [
-    { role: "system", content: "你是记忆提取器。从对话中提取用户透露的个人信息、偏好、习惯、情绪、计划。输出JSON数组，每条 {content, category, importance}。category: identity/preference/habit/schedule/relationship/event/other。importance: 1-3。如果没有值得记住的信息，输出空数组 []。只输出JSON，不要其他文字。" },
-    { role: "user", content: transcript },
+    {
+      role: "system",
+      content:
+        "你是记忆整理器。看过这位用户的已有记忆和最近对话，决定要怎么更新记忆库，只输出 JSON：\n" +
+        '{"ops":[{"op":"add","content":"…","category":"…","importance":2}]}\n' +
+        "三种操作：\n" +
+        "- add：新出现的信息（偏好/习惯/作息/关系/计划/情绪倾向）。\n" +
+        "- update：已有记忆需要修正、补充、或事实变了 —— 必须带 id，content 写新的完整说法。\n" +
+        "- delete：用户否认了某条，或那件事已经不成立 —— 必须带 id。\n" +
+        "规则：\n" +
+        "1. 同一件事只留一条，不要换个说法再 add 一遍；用户纠正你时 update 对应那条。\n" +
+        "2. 事实发生变化（换工作、搬家、宠物送人、项目结束）用 update 覆盖旧结论，不要两条并存。\n" +
+        "3. category: identity/preference/habit/schedule/relationship/event/other；importance: 1=核心(称呼/身份/长期偏好) 2=重要 3=琐碎。\n" +
+        "4. 只记用户本人的信息，不要把助理自己说的话当事实，也不要记这次的临时任务细节。\n" +
+        "5. 没有值得记的就输出 {\"ops\":[]}。只输出 JSON，不要解释。\n" +
+        (correcting
+          ? "6. 用户这一轮明确在纠正你或否认某件事：优先 update 或 delete 相关旧记忆，绝对不要新增一条与旧结论并存的记忆。"
+          : ""),
+    },
+    {
+      role: "user",
+      content: `已有记忆（id 可用于 update/delete）：\n${formatMemoryForExtractor(memory)}\n\n最近对话：\n${transcript}`,
+    },
   ];
   try {
-    // 修复：按实际 provider 解析端点（此前非 custom 一律硬编码 DeepSeek，其他厂商记忆提取静默失败）
-    const base = s.assistant.provider === "custom"
-      ? normalizeOpenAIBase(s.assistant.customBaseUrl)
-      : PROVIDERS[s.assistant.provider as AssistantProvider]?.base ?? "https://api.deepseek.com";
-    // 自定义端点没有默认模型；空模型名时不要拿 deepseek-chat 去撞中转站（必然 404），
-    // 直接跳过这次后台记忆提取，等用户配好模型再说。
-    const model = s.assistant.model || PROVIDERS[s.assistant.provider as AssistantProvider]?.defaultModel;
-    if (!base || !model) return;
+    // 端点解析见 backgroundEndpoint：非 custom 也按实际 provider 走（曾因硬编码 DeepSeek 静默失败）
+    const ep = backgroundEndpoint(s);
+    if (!ep) return;
+    const { base, model } = ep;
     const res = await fetch(`${base}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
@@ -2028,29 +2388,101 @@ async function extractMemoriesFromChat(s: any, apiKey: string) {
     if (!res.ok) return;
     const json = await res.json();
     const text = json.choices?.[0]?.message?.content ?? "";
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) return;
-    const items = JSON.parse(match[0]);
-    if (!Array.isArray(items)) return;
-    let added = 0;
-    for (const item of items) {
-      if (!item.content || typeof item.content !== "string") continue;
-      const content = item.content.trim();
-      if (memory.some(m => m.content === content)) continue; // 去重
-      memory.push({
-        id: `auto_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        category: item.category || "other",
-        content,
-        keywords: extractKeywords(content),
-        source: "ai_inferred",
-        createdAt: Date.now(),
-        lastUsedAt: Date.now(),
-        importance: Math.min(3, Math.max(1, Number(item.importance) || 2)) as MemoryEntry["importance"],
-      });
-      added++;
-    }
-    if (added > 0) saveMemory();
+    const ops = parseMemoryOps(text);
+    if (!ops.length) return;
+    const applied = applyMemoryOps(memory, ops, {
+      keywordsOf: extractKeywords,
+      maxCount: MEM_LIMIT,
+      source: "ai_inferred",
+    });
+    if (!applied.changed) return;
+    memory = applied.memory;
+    saveMemory();
+    // 有新素材就（按阈值）重算画像：这一步才是"越聊越懂他"的来源。
+    // 用户刚纠正过就直接重算，别让画像带着旧结论再撑半天。
+    void synthesizeUserProfile(s, apiKey, correcting);
+    // 顺带补算向量做语义查重（后台，端点不支持就当天停手）
+    void refreshMemoryEmbeddings(s, apiKey);
   } catch { /* 静默失败，不影响用户体验 */ }
+}
+
+/**
+ * 用户画像提炼：把零散记忆重写成"这是个什么样的人"，后台跑，不阻塞对话、不弹任何提示。
+ *
+ * 用户明确要求画像**不在软件里直接查看**，所以这里没有任何 UI 出口 —— 画像只进 system prompt，
+ * 由模型在聊天里自然地"侧面体现"。失败一律静默：画像只是锦上添花，坏掉不能影响正常聊天。
+ */
+let profileSynthesizing = false;
+async function synthesizeUserProfile(s: any, apiKey: string, force = false) {
+  if (profileSynthesizing) return;
+  // force：用户刚亲口给了核心信息（称呼/身份这类），别等攒够 6 条，立刻重算一次
+  if (force) {
+    if (memory.length < 3) return;
+  } else if (!shouldSynthesize(userProfile, memory.length)) {
+    return;
+  }
+  const ep = backgroundEndpoint(s);
+  if (!ep) return;
+  profileSynthesizing = true;
+  try {
+    const res = await fetch(`${ep.base}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: ep.model,
+        messages: buildProfileMessages(memory, userProfile),
+        temperature: 0.3,
+      }),
+    });
+    if (!res.ok) return;
+    const json = await res.json();
+    const text = json.choices?.[0]?.message?.content ?? "";
+    const next = parseProfileResponse(text, userProfile, memory.length);
+    if (next) {
+      userProfile = next;
+      saveUserProfile();
+    }
+  } catch { /* 静默失败 */ } finally {
+    profileSynthesizing = false;
+  }
+}
+
+/**
+ * 更早对话的滚动摘要：把即将被窗口切掉的旧聊天压成一段，随 system prompt 带上。
+ *
+ * 只影响"模型记得多少"，不改 ui、不改 history：原文仍在 chat-history 里，
+ * 用户翻记录还是完整对话。失败静默，摘要丢了顶多回到以前"聊久了失忆"的状态。
+ */
+let summaryRunning = false;
+async function updateChatSummary(s: any, apiKey: string) {
+  if (summaryRunning) return;
+  if (!shouldSummarize(history.length, chatSummary)) return;
+  const { picked, nextCoveredCount } = collectSummarizable(history, chatSummary.coveredCount);
+  if (picked.length < 5) return;
+  const ep = backgroundEndpoint(s);
+  if (!ep) return;
+  summaryRunning = true;
+  try {
+    const res = await fetch(`${ep.base}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: ep.model,
+        messages: buildSummaryMessages(picked, chatSummary.text),
+        temperature: 0.2,
+      }),
+    });
+    if (!res.ok) return;
+    const json = await res.json();
+    const text = json.choices?.[0]?.message?.content ?? "";
+    const next = parseSummaryResponse(text, chatSummary.text, nextCoveredCount);
+    if (next) {
+      chatSummary = next;
+      saveChatSummary();
+    }
+  } catch { /* 静默失败 */ } finally {
+    summaryRunning = false;
+  }
 }
 
 /** 主动问候：收集丰富上下文 + 召回相关记忆，让 AI 有温度地关心用户 */
@@ -2161,10 +2593,15 @@ export async function triggerProactive(): Promise<boolean> {
     const greetingHistory: ChatMessage[] = [...history, { role: "user", content: prompt }];
     await chatStream(
       s.assistant.provider, apiKey, s.assistant.model, greetingHistory, s.assistant.persona,
-      memory, s.assistant.customBaseUrl,
+      // 和主聊天用同一套召回：以前这里传的是全量 memory（system prompt 里 top 20），
+      // 结果问候时反而比聊天时更像"背档案"
+      relevantMemories, s.assistant.customBaseUrl,
       (d) => { streamed += d; },
       false, langInstruction, "",
-      screenshot ? { screenImage: screenshot } : {},
+      {
+        ...(screenshot ? { screenImage: screenshot } : {}),
+        profileText: personaContextBlock(),
+      },
     );
 
     const parsed = parseGreetingResult(streamed);
@@ -2185,6 +2622,8 @@ export async function triggerProactive(): Promise<boolean> {
     }
     saveMemory();
     boostMood("greeting_sent");
+    // 问候也是观察用户状态的机会：顺便记一个情绪采样点
+    sampleMoodNow();
 
     setBubbleText(bubble, "");
     bubbleBody(bubble).append(document.createTextNode(mainText));
@@ -2204,7 +2643,7 @@ export async function triggerProactive(): Promise<boolean> {
 
     // 关键：主动问候也是正常对话，必须写进主历史并标【问候】，
     // 这样用户下一句回复时，模型知道"自己刚刚主动说过什么"。
-    history.push({ role: "assistant", content: markGreetingForHistory(greeting) });
+    pushHistory({ role: "assistant", content: markGreetingForHistory(greeting), ts: Date.now() });
     saveHistory();
     recordGreeting(parsed.summary || mainText.slice(0, 80), mainText);
 
@@ -2282,6 +2721,10 @@ export async function triggerCardCommentary(card: { rarity: string; theme: strin
 }
 // 记忆初始化
 loadMemory();
+loadUserProfile();
+loadChatSummary();
+loadMoodSamples();
+loadNudgeState();
 
 
 
