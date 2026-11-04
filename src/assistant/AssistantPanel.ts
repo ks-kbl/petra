@@ -43,6 +43,13 @@ import {
 } from "./moodTrend";
 import { detectCorrection } from "./correction";
 import {
+  contentHash,
+  needsEmbedding,
+  normalizeEmbeddingCache,
+  mergeSemanticDuplicates,
+  type EmbeddingCache,
+} from "./semanticMerge";
+import {
   emptyNudgeState,
   normalizeNudgeState,
   shouldNudge,
@@ -91,6 +98,10 @@ const SUMMARY_KEY = "live2d-pet-assistant-chat-summary";
 const MOOD_SAMPLES_KEY = "petra-mood-samples";
 /** 主动提起旧事的节流状态（3 小时冷却 / 每天最多 2 次） */
 const NUDGE_KEY = "petra-memory-nudge";
+/** 记忆向量缓存（语义查重用；端点不支持就整条链路静默跳过） */
+const EMB_KEY = "petra-memory-embeddings";
+/** 端点不支持 embedding 的标记（记日期，24 小时内不再试，避免每条消息都撞一次 404） */
+const EMB_UNSUPPORTED_KEY = "petra-embedding-unsupported";
 /** 主动问候话题记录：最近几次问候的 summary / 是否被回复，用于避免一天内重复话题 */
 const GREETING_LOG_KEY = "petra-greeting-log";
 
@@ -108,6 +119,8 @@ let lastExtractedAt = 0;
 let pendingCorrection = false;
 let moodSamples: MoodSample[] = [];
 let nudgeState: NudgeState = emptyNudgeState();
+let memoryEmbeddings: EmbeddingCache = {};
+let embeddingUnsupportedDay = "";
 let timer: number | null = null;
 let busy = false;
 /** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant / triggerProactive） */
@@ -314,6 +327,108 @@ function saveUserProfile() {
     localStorage.setItem(PROFILE_KEY, JSON.stringify(userProfile));
   } catch {
     /* 忽略 */
+  }
+}
+
+function loadMemoryEmbeddings() {
+  try {
+    memoryEmbeddings = normalizeEmbeddingCache(JSON.parse(localStorage.getItem(EMB_KEY) || "null"));
+  } catch {
+    memoryEmbeddings = {};
+  }
+  try {
+    embeddingUnsupportedDay = localStorage.getItem(EMB_UNSUPPORTED_KEY) || "";
+  } catch {
+    embeddingUnsupportedDay = "";
+  }
+}
+
+function saveMemoryEmbeddings() {
+  try {
+    // 只留还活着的记忆，别让缓存无限膨胀
+    const alive = new Set(memory.map((m) => m.id));
+    const trimmed: EmbeddingCache = {};
+    for (const [id, v] of Object.entries(memoryEmbeddings)) {
+      if (alive.has(id)) trimmed[id] = v;
+    }
+    memoryEmbeddings = trimmed;
+    localStorage.setItem(EMB_KEY, JSON.stringify(trimmed));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+function embeddingBlockedToday(): boolean {
+  const today = new Date();
+  const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  return embeddingUnsupportedDay === key;
+}
+
+function markEmbeddingUnsupported() {
+  const today = new Date();
+  embeddingUnsupportedDay = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  try {
+    localStorage.setItem(EMB_UNSUPPORTED_KEY, embeddingUnsupportedDay);
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 语义查重：给记忆算 embedding，把"换了说法其实是同一件事"的条目合并掉。
+ *
+ * 只在后台跑，不参与聊天召回打分 —— 所以不会给回复加任何延迟。
+ * 端点不支持 /embeddings（DeepSeek、不少中转站）或没网时，标记当天不再尝试，
+ * 记忆照旧按 2-gram 去重，功能退化但不报错。
+ */
+let embeddingRunning = false;
+async function refreshMemoryEmbeddings(s: any, apiKey: string) {
+  if (embeddingRunning) return;
+  if (embeddingBlockedToday()) return;
+  const ep = backgroundEndpoint(s);
+  if (!ep) return;
+  const need = needsEmbedding(memoryEmbeddings, memory).slice(0, 32);
+  if (!need.length) return;
+  embeddingRunning = true;
+  try {
+    const model = String(s?.assistant?.embeddingModel || "text-embedding-3-small");
+    const res = await fetch(`${ep.base}/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, input: need.map((m) => m.content) }),
+    });
+    if (!res.ok) {
+      // 404/400 基本都是端点压根没有 /embeddings：今天不再试
+      markEmbeddingUnsupported();
+      return;
+    }
+    const json = await res.json();
+    const data = Array.isArray(json?.data) ? json.data : [];
+    if (!data.length) {
+      markEmbeddingUnsupported();
+      return;
+    }
+    need.forEach((m, i) => {
+      const v = data[i]?.embedding;
+      if (Array.isArray(v) && v.length >= 8) {
+        memoryEmbeddings[m.id] = { h: contentHash(m.content), v: v.map((x: unknown) => Number(x)) };
+      }
+    });
+    saveMemoryEmbeddings();
+
+    const result = mergeSemanticDuplicates(memory, memoryEmbeddings, 0.9);
+    if (result.merged > 0) {
+      memory = result.memory;
+      for (const id of result.removedIds) delete memoryEmbeddings[id];
+      saveMemoryEmbeddings();
+      saveMemory();
+      // 记忆发生了变化，画像跟着重算
+      void synthesizeUserProfile(s, apiKey, true);
+    }
+  } catch {
+    markEmbeddingUnsupported();
+  } finally {
+    embeddingRunning = false;
   }
 }
 
@@ -1189,13 +1304,17 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   loadChatSummary();
   loadMoodSamples();
   loadNudgeState();
+  loadMemoryEmbeddings();
   // 打开对话面板也是一次"见到用户"，顺手采一个情绪点（比以前只在聊天/问候后采样更连续）
   sampleMoodNow();
   // 素材够了就在后台重算一份画像（不阻塞打开面板；没配 Key 就跳过）
   void (async () => {
     try {
       const key = await ensureApiKey();
-      if (key) void synthesizeUserProfile(loadSettings(), key);
+      if (key) {
+        void synthesizeUserProfile(loadSettings(), key);
+        void refreshMemoryEmbeddings(loadSettings(), key);
+      }
     } catch { /* 没有 Key / 后端未就绪：等下次打开再说 */ }
   })();
   // 历史只在**本次启动第一次打开**时从磁盘加载一次：
@@ -2279,6 +2398,8 @@ async function extractMemoriesFromChat(s: any, apiKey: string, correcting = fals
     // 有新素材就（按阈值）重算画像：这一步才是"越聊越懂他"的来源。
     // 用户刚纠正过就直接重算，别让画像带着旧结论再撑半天。
     void synthesizeUserProfile(s, apiKey, correcting);
+    // 顺带补算向量做语义查重（后台，端点不支持就当天停手）
+    void refreshMemoryEmbeddings(s, apiKey);
   } catch { /* 静默失败，不影响用户体验 */ }
 }
 
