@@ -170,7 +170,10 @@ html[data-theme="dark"] .navbar{
 .chatlog-view{
   /* 一屏放得下：顶栏+导航+标题+工具条+提示条大约占 400px，剩下的全给消息区。
      以前固定 68vh，窗口一矮整页就得滚，聊天内容会滑到导航条底下（被截一半很难看）。 */
-  height:clamp(280px, calc(100vh - 450px), 740px);
+  /* 尽量吃满剩余视口：用户明确要求"显示框做大一点"。
+     整页允许滚动（导航条已是不透明实底，不会再出现内容透出的问题），
+     但消息区至少 380px，宽屏能到 900px。 */
+  height:clamp(380px, calc(100vh - 300px), 900px);
   overflow-y:auto; padding:20px 22px;
   border-radius:14px; border:1px solid var(--line);
   background:linear-gradient(180deg, var(--card-strong), var(--card));
@@ -375,7 +378,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   .island{flex:0 0 auto}
 }
 @media (max-height: 780px){
-  .chatlog-view{height:clamp(260px, calc(100vh - 380px), 520px)}
+  .chatlog-view{height:clamp(300px, calc(100vh - 280px), 560px)}
 }
 @media (max-width: 640px){
   .wrap{padding:0 14px 100px}
@@ -2105,10 +2108,13 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     const sec = SECTIONS.find((s) => s.id === state.section) || SECTIONS[0];
     const page = $("#page");
     page.innerHTML = "";
-    const head = el("div", "section-head");
-    head.appendChild(el("h1", null, sec.title));
-    head.appendChild(el("p", null, sec.desc));
-    page.appendChild(head);
+    // 聊天记录页的卡片自带标题和说明，再顶一个大标题纯属浪费垂直空间 —— 消息区才是主角
+    if (sec.id !== "history") {
+      const head = el("div", "section-head");
+      head.appendChild(el("h1", null, sec.title));
+      head.appendChild(el("p", null, sec.desc));
+      page.appendChild(head);
+    }
 
     const grid = el("div", "grid");
     sec.cards.forEach((cardSpec) => {

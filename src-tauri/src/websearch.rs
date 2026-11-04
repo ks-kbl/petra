@@ -93,28 +93,24 @@ fn search_blocking(query: &str, limit: Option<usize>) -> Result<Vec<SearchHit>, 
     //
     // 为什么不串行：实测这台机器上 DuckDuckGo 是连不上的（8 秒超时），串行的话每次搜索
     // 都要先白等 8 秒再用 Bing，用户体感就是"点了没反应"。并发之后最慢也就等最慢的那个。
-    let engines: [(&'static str, fn(&str) -> Result<String, String>, fn(&str, usize) -> Vec<SearchHit>); 3] = [
-        ("DuckDuckGo", fetch_ddg, parse_ddg),
+    // Bing 的 RSS 输出（?format=rss）是**干净的 XML**，比抓 HTML 稳得多：
+    // 体积小、结构固定、不会被前端改版或"要不要改用新版界面"的实验打乱。
+    let engines: [(&'static str, fn(&str) -> Result<String, String>, fn(&str, usize) -> Vec<SearchHit>); 4] = [
+        ("Bing RSS", fetch_bing_rss, parse_rss),
         ("Bing", fetch_bing, parse_bing),
         ("百度", fetch_baidu, parse_baidu),
+        ("DuckDuckGo", fetch_ddg, parse_ddg),
     ];
 
-    let (tx, rx) = mpsc::channel::<( &'static str, Result<Vec<SearchHit>, String>)>();
+    let (tx, rx) = mpsc::channel::<(&'static str, Result<Vec<SearchHit>, String>)>();
     for (name, fetch, parse) in engines {
         let tx = tx.clone();
         let q = q.to_string();
         thread::spawn(move || {
-            let res = match fetch(&q) {
-                Ok(html) => {
-                    let hits = parse(&html, limit);
-                    if hits.is_empty() {
-                        Err("返回了页面但没解析到结果（可能被限流或人机校验）".to_string())
-                    } else {
-                        Ok(hits)
-                    }
-                }
-                Err(e) => Err(e),
-            };
+            // 解析 HTML 的代码很容易在某个字符边界上 panic（上面 safe_slice 已经修了主要几处），
+            // 但保险起见还是接住：一个引擎崩了只算它失败，不能让线程静默消失、也不影响其它引擎。
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_engine(fetch, parse, &q, limit)))
+                .unwrap_or_else(|_| Err("解析时崩溃（已捕获）".to_string()));
             let _ = tx.send((name, res));
         });
     }
@@ -165,6 +161,21 @@ fn build_client() -> Result<reqwest::blocking::Client, String> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))
+}
+
+fn run_engine(
+    fetch: fn(&str) -> Result<String, String>,
+    parse: fn(&str, usize) -> Vec<SearchHit>,
+    q: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let body = fetch(q)?;
+    let hits = parse(&body, limit);
+    if hits.is_empty() {
+        Err(format!("返回了页面但没解析到结果（{} 字节，可能被限流或人机校验）", body.len()))
+    } else {
+        Ok(hits)
+    }
 }
 
 fn fetch_ddg(q: &str) -> Result<String, String> {
@@ -270,13 +281,13 @@ fn parse_ddg(html: &str, limit: usize) -> Vec<SearchHit> {
             break;
         };
         let tag_end = pos + gt;
-        let tag = &html[tag_start..=tag_end];
+        let tag = safe_slice(html, tag_start, tag_end + 1);
         let href = attr_value(tag, "href").unwrap_or_default();
         let title_end = html[tag_end + 1..]
             .find("</a>")
             .map(|i| tag_end + 1 + i)
             .unwrap_or(html.len());
-        let title = clean_text(&html[tag_end + 1..title_end]);
+        let title = clean_text(safe_slice(html, tag_end + 1, title_end));
         cursor = title_end.min(html.len());
 
         let mut snippet = String::new();
@@ -288,7 +299,7 @@ fn parse_ddg(html: &str, limit: usize) -> Vec<SearchHit> {
                 .map(|i| s_tag_end + i)
                 .or_else(|| html[s_tag_end..].find("</div>").map(|i| s_tag_end + i))
                 .unwrap_or(html.len());
-            snippet = clean_text(&html[s_tag_end + 1..s_end]);
+            snippet = clean_text(safe_slice(html, s_tag_end + 1, s_end));
             cursor = s_end.min(html.len());
         }
 
@@ -333,7 +344,7 @@ fn parse_bing(html: &str, limit: usize) -> Vec<SearchHit> {
             .find("class=\"b_algo\"")
             .map(|i| block_start + 1 + i)
             .unwrap_or(html.len());
-        let block = &html[block_start..block_end];
+        let block = safe_slice(html, block_start, block_end);
         cursor = block_end;
 
         let Some(a_pos) = block.find("<h2") else { continue };
@@ -341,19 +352,19 @@ fn parse_bing(html: &str, limit: usize) -> Vec<SearchHit> {
         let a_start = a_pos + a_open;
         let Some(a_gt) = block[a_start..].find('>') else { continue };
         let tag_end = a_start + a_gt;
-        let tag = &block[a_start..=tag_end];
+        let tag = safe_slice(block, a_start, tag_end + 1);
         let href = attr_value(tag, "href").unwrap_or_default();
         let title_end = block[tag_end + 1..]
             .find("</a>")
             .map(|i| tag_end + 1 + i)
             .unwrap_or(block.len());
-        let title = clean_text(&block[tag_end + 1..title_end]);
+        let title = clean_text(safe_slice(block, tag_end + 1, title_end));
         let mut snippet = String::new();
         if let Some(p) = block.find("<p") {
             if let Some(gt2) = block[p..].find('>') {
                 let s = p + gt2 + 1;
                 let e = block[s..].find("</p>").map(|i| s + i).unwrap_or(block.len());
-                snippet = clean_text(&block[s..e]);
+                snippet = clean_text(safe_slice(block, s, e));
             }
         }
         if !title.is_empty() && href.starts_with("http") {
@@ -361,6 +372,56 @@ fn parse_bing(html: &str, limit: usize) -> Vec<SearchHit> {
         }
     }
     hits
+}
+
+fn fetch_bing_rss(q: &str) -> Result<String, String> {
+    let url = format!("https://www.bing.com/search?q={}&format=rss", percent_encode(q));
+    let client = build_client()?;
+    let res = client
+        .get(&url)
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Accept", "application/rss+xml,application/xml,text/xml")
+        .send()
+        .map_err(|e| describe_req_error(&e))?;
+    if !res.status().is_success() {
+        return Err(format!("HTTP {}", res.status().as_u16()));
+    }
+    res.text().map_err(|e| format!("读取响应失败：{e}"))
+}
+
+/// RSS：<item><title>…</title><link>…</link><description>…</description></item>
+fn parse_rss(xml: &str, limit: usize) -> Vec<SearchHit> {
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut cursor = 0usize;
+    while hits.len() < limit {
+        let Some(rel) = xml[cursor..].find("<item>") else { break };
+        let start = cursor + rel + "<item>".len();
+        let end = xml[start..].find("</item>").map(|i| start + i).unwrap_or(xml.len());
+        let block = safe_slice(xml, start, end);
+        cursor = end;
+        let title = tag_text(block, "title");
+        let link = tag_text(block, "link");
+        let desc = tag_text(block, "description");
+        if !title.is_empty() && link.starts_with("http") {
+            hits.push(SearchHit {
+                title: clean_text(&title),
+                url: link,
+                snippet: clean_text(&desc),
+                engine: String::new(),
+            });
+        }
+    }
+    hits
+}
+
+/// 取 <tag>…</tag> 之间的原文（不解码、不去标签，交给 clean_text）
+fn tag_text(block: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(a) = block.find(&open) else { return String::new() };
+    let start = a + open.len();
+    let Some(b) = block[start..].find(&close) else { return String::new() };
+    safe_slice(block, start, start + b).trim().to_string()
 }
 
 // ===================== 百度 =====================
@@ -383,13 +444,13 @@ fn parse_baidu(html: &str, limit: usize) -> Vec<SearchHit> {
             .find("</a>")
             .map(|i| tag_end + 1 + i)
             .unwrap_or(html.len());
-        let title = clean_text(&html[tag_end + 1..title_end]);
+        let title = clean_text(safe_slice(html, tag_end + 1, title_end));
         cursor = title_end.min(html.len());
 
         // 摘要：跟在标题后面的第一个带 content-right / c-abstract 的块
         let mut snippet = String::new();
-        let window_end = (cursor + 2000).min(html.len());
-        let window = &html[cursor..window_end];
+        // 同样是字节偏移，必须回退到字符边界
+        let window = safe_slice(html, cursor, cursor + 2000);
         let sp = window
             .find("c-abstract")
             .or_else(|| window.find("content-right"));
@@ -401,7 +462,7 @@ fn parse_baidu(html: &str, limit: usize) -> Vec<SearchHit> {
                     .find("</div>")
                     .map(|i| text_start + i)
                     .unwrap_or(text_start);
-                snippet = clean_text(&html[text_start..text_end]);
+                snippet = clean_text(safe_slice(html, text_start, text_end));
             }
         }
         if !title.is_empty() && href.starts_with("http") {
@@ -412,6 +473,26 @@ fn parse_baidu(html: &str, limit: usize) -> Vec<SearchHit> {
 }
 
 // ===================== 工具函数 =====================
+
+/// 按字节下标切片，但**回退到字符边界**。
+///
+/// 这是这一版最重要的修复：原来直接 `&html[a..b]`，而 b 常常是"找到的某个字节位置 + 一个固定偏移"，
+/// 一旦落进 UTF-8 多字节字符中间（中文页面到处都是），Rust 会 panic —— 线程静默死掉、
+/// 引擎没有任何回音，用户看到的就是"搜不到"。所有切片统一走这里。
+fn safe_slice(s: &str, start: usize, end: usize) -> &str {
+    let mut a = start.min(s.len());
+    while a > 0 && !s.is_char_boundary(a) {
+        a -= 1;
+    }
+    let mut b = end.min(s.len());
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    if b < a {
+        b = a;
+    }
+    &s[a..b]
+}
 
 /// 取属性值，单双引号都认
 fn attr_value(tag: &str, name: &str) -> Option<String> {
@@ -497,8 +578,9 @@ fn unescape_entities(input: &str) -> String {
     while let Some(pos) = rest.find('&') {
         out.push_str(&rest[..pos]);
         let tail = &rest[pos..];
-        // 实体最长也就 `&#x1F600;` 这种，超过 12 个字符还没 ';' 就当普通字符
-        let semi = tail[..tail.len().min(12)].find(';');
+        // 实体最长也就 `&#x1F600;` 这种；超过 12 个**字节**还没 ';' 就当普通字符。
+        // 这里必须 safe_slice：12 很可能落在中文字符中间（原来就是这样 panic 的）。
+        let semi = safe_slice(tail, 0, 12).find(';');
         match semi {
             Some(end) => {
                 let ent = &tail[1..end];
