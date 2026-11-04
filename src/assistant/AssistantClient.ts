@@ -630,7 +630,10 @@ function buildVersionInfo(): string {
 }
 
 /** 组装 system prompt。导出是为了让测试能锁住"语言指令必须在最后"这条顺序（见 tests/assistant-tools.test.js）。 */
-export function systemPrompt(persona: string, memory: MemoryStore, extraContext = ""): string {
+export function systemPrompt(persona: string, memory: MemoryStore, extraContext = "", profileText = ""): string {
+  // 画像放 BASE_PROMPT 之后、记忆清单之前：
+  // 先让模型知道"这是谁"，再看到具体条目；extraContext（语言指令）仍压在最尾部。
+  const prof = profileText.trim() ? "\n\n" + profileText.trim() : "";
   let mem = "";
   if (memory.length > 0) {
     // 按重要度排序，核心记忆在前，超限截断
@@ -646,7 +649,7 @@ export function systemPrompt(persona: string, memory: MemoryStore, extraContext 
   // extraContext 放**最后**：它里面压着语言指令（"必须全程用日语回复"）。
   // 之前它排在 BASE_PROMPT 和记忆前面，后面紧跟着一大段中文，模型就顺着中文继续说中文
   // （"设置日语却回中文"的根因）。指令要放尾部，模型对末尾最敏感。
-  return `${persona ? persona + "\n\n" : ""}${BASE_PROMPT}${mem}${extraContext ? "\n\n" + extraContext : ""}`;
+  return `${persona ? persona + "\n\n" : ""}${BASE_PROMPT}${prof}${mem}${extraContext ? "\n\n" + extraContext : ""}`;
 }
 
 /**
@@ -697,6 +700,7 @@ function buildMessages(
   memory: MemoryStore,
   extraContext = "",
   systemOverride = "",
+  profileText = "",
 ): ChatMessage[] {
   const MAX_MSGS = 120;
   const MAX_CHARS = 30000;
@@ -716,7 +720,7 @@ function buildMessages(
   // 字符裁剪同样可能裁出孤立 tool（比如裁掉 assistant 那一轮）
   msgs = sanitizeToolHistory(msgs);
   // systemOverride：轻量调用（如麻将实时点评）用它替代完整系统提示，省掉 BASE_PROMPT 与记忆
-  const system = systemOverride || systemPrompt(persona, memory, extraContext);
+  const system = systemOverride || systemPrompt(persona, memory, extraContext, profileText);
   return [{ role: "system", content: system }, ...msgs];
 }
 
@@ -865,7 +869,7 @@ export async function chatStream(
   const base = resolveBase(provider, customBaseUrl);
   const m = await resolveModelForRequest(provider, model, apiKey, base, customBaseUrl);
   if (!m) throw new Error("未设置模型名");
-  const baseMessages = buildMessages(history, persona, memory, extraContext, systemOverride);
+  const baseMessages = buildMessages(history, persona, memory, extraContext, systemOverride, requestOptions.profileText ?? "");
   // 插件工具是运行时注册的：每次请求都重新拼一份，不能缓存在模块级常量里。
   const toolDefs = enableTools ? [...TOOLS, ...(requestOptions.extraTools ?? [])] : [];
   // 支持流式 usage 回传的提供商白名单（其余端点可能拒绝未知字段）
@@ -1396,4 +1400,12 @@ export interface ChatRequestOptions {
    * 这里只放插件注册的工具，避免和内置表重复。
    */
   extraTools?: unknown[];
+  /**
+   * 用户画像块（由 userProfile.profileBlock 生成）。
+   *
+   * 放在 requestOptions 里而不是多加一个位置参数：chatStream 的参数已经很长，
+   * 且现有调用方都在尾部传 options 对象，加在这里不会破坏任何老调用。
+   * 画像只进 system prompt，不进对话历史、不落盘。
+   */
+  profileText?: string;
 }

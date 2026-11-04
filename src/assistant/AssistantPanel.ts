@@ -23,6 +23,15 @@ import {
   type GreetingRecord,
 } from "./greetingMemory";
 import { markGreetingForHistory } from "./greetingHistory";
+import {
+  emptyProfile,
+  normalizeProfile,
+  profileBlock,
+  shouldSynthesize,
+  buildProfileMessages,
+  parseProfileResponse,
+  type UserProfile,
+} from "./userProfile";
 import { ToolLoopBudget, formatToolError, toolNames, truncateToolResult, validateToolArgs } from "./toolRuntime";
 import { ttsPlayer } from "../tts/TTSPlayer";
 import { getVisibleRect } from "../ui/visible";
@@ -42,6 +51,10 @@ function idleHideMs(): number {
 }
 const HIST_KEY = "live2d-pet-assistant-history";
 const MEM_KEY = "live2d-pet-assistant-memory";
+/** 用户画像：只喂模型看，不在界面展示（用户要求"从对话过程侧面体现"） */
+const PROFILE_KEY = "live2d-pet-assistant-profile";
+/** 长期记忆条数上限。原来是 80，聊一个月就停止学习；画像层接管 prompt 后素材可以多存 */
+const MEM_LIMIT = 200;
 /** 主动问候话题记录：最近几次问候的 summary / 是否被回复，用于避免一天内重复话题 */
 const GREETING_LOG_KEY = "petra-greeting-log";
 
@@ -51,6 +64,7 @@ let input: HTMLTextAreaElement;
 let allowAllShell: HTMLInputElement;
 let history: ChatMessage[] = [];
 let memory: MemoryStore = [];
+let userProfile: UserProfile = emptyProfile();
 let timer: number | null = null;
 let busy = false;
 /** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant / triggerProactive） */
@@ -221,7 +235,40 @@ function loadMemory() {
 }
 function saveMemory() {
   try {
-    localStorage.setItem(MEM_KEY, JSON.stringify(memory.slice(-80)));
+    localStorage.setItem(MEM_KEY, JSON.stringify(memory.slice(-MEM_LIMIT)));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 记忆超上限时的淘汰：先扔最琐碎的（importance 数字越大越琐碎），
+ * 同档次再扔最久没被引用的。之前是 `slice(-80)` 硬切最旧的，
+ * 会把"用户叫小明"这种核心记忆切掉、留下昨天的碎事。
+ */
+function pruneMemory() {
+  while (memory.length > MEM_LIMIT) {
+    let victim = 0;
+    for (let i = 1; i < memory.length; i++) {
+      const a = memory[i], b = memory[victim];
+      if (a.importance > b.importance || (a.importance === b.importance && a.lastUsedAt < b.lastUsedAt)) victim = i;
+    }
+    memory.splice(victim, 1);
+  }
+}
+
+function loadUserProfile() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PROFILE_KEY) || "null");
+    userProfile = normalizeProfile(raw);
+  } catch {
+    userProfile = emptyProfile();
+  }
+}
+
+function saveUserProfile() {
+  try {
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(userProfile));
   } catch {
     /* 忽略 */
   }
@@ -985,6 +1032,14 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   ensureInput();
   ensureBubbles();
   loadMemory();
+  loadUserProfile();
+  // 素材够了就在后台重算一份画像（不阻塞打开面板；没配 Key 就跳过）
+  void (async () => {
+    try {
+      const key = await ensureApiKey();
+      if (key) void synthesizeUserProfile(loadSettings(), key);
+    } catch { /* 没有 Key / 后端未就绪：等下次打开再说 */ }
+  })();
   // 历史只在**本次启动第一次打开**时从磁盘加载一次：
   //  · 以前每次打开都无条件重载 —— 工具执行/确认中会把内存里尚未落盘的 assistant+tool
   //    序列覆盖掉，配对丢失后每轮请求 400；
@@ -1340,6 +1395,8 @@ async function send(text: string) {
         {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
           extraTools: pluginRuntime.getOpenAITools(),
+          // 画像只走 system prompt：模型知道"这是什么样的人"，但不会被告知"有一份档案"
+          profileText: profileBlock(userProfile),
         },
       );
       if (colorHook.lastEmotion() !== "neutral") streamEmo = colorHook.lastEmotion();
@@ -1609,6 +1666,14 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           history.push({ role: "tool", tool_call_id: tc.id, content: "已记住" });
         }
         saveMemory();
+        // handleToolCalls 没有 apiKey：Key 缓存在 ensureApiKey 里，这里异步取一次
+        void (async () => {
+          try {
+            const key = await ensureApiKey();
+            // importance=1 是用户亲口给的核心信息，立刻重算画像，不等攒满 6 条
+            if (key) void synthesizeUserProfile(loadSettings(), key, importance === 1);
+          } catch { /* 忽略 */ }
+        })();
       } else {
         history.push({ role: "tool", tool_call_id: tc.id, content: "内容为空" });
       }
@@ -2001,9 +2066,24 @@ function recallRelevantMemories(context: {
 }
 
 
+/**
+ * 后台轻量调用（记忆提取 / 画像提炼）共用的端点解析。
+ * 自定义端点没有默认模型时返回 null —— 不要拿 deepseek-chat 去撞中转站（必然 404）。
+ */
+function backgroundEndpoint(s: any): { base: string; model: string } | null {
+  const provider = s?.assistant?.provider;
+  const base = provider === "custom"
+    ? normalizeOpenAIBase(s.assistant.customBaseUrl)
+    : PROVIDERS[provider as AssistantProvider]?.base ?? "https://api.deepseek.com";
+  const model = s?.assistant?.model || PROVIDERS[provider as AssistantProvider]?.defaultModel || "";
+  if (!base || !model) return null;
+  return { base, model };
+}
+
 /** P3 主动学习：从最近对话中提取用户信息，后台轻量调用 */
 async function extractMemoriesFromChat(s: any, apiKey: string) {
-  if (memory.length > 80) return; // 记忆已满，不再提取
+  // 满了先按"最琐碎 + 最久没用"淘汰，而不是从此停止学习（长期使用必然会撞上限）
+  pruneMemory();
   const recentMsgs = history.slice(-10).filter(m => m.role === "user" || m.role === "assistant");
   if (recentMsgs.length < 3) return;
   const transcript = recentMsgs.map(m => `${m.role}: ${m.content}`).join("\n");
@@ -2012,14 +2092,10 @@ async function extractMemoriesFromChat(s: any, apiKey: string) {
     { role: "user", content: transcript },
   ];
   try {
-    // 修复：按实际 provider 解析端点（此前非 custom 一律硬编码 DeepSeek，其他厂商记忆提取静默失败）
-    const base = s.assistant.provider === "custom"
-      ? normalizeOpenAIBase(s.assistant.customBaseUrl)
-      : PROVIDERS[s.assistant.provider as AssistantProvider]?.base ?? "https://api.deepseek.com";
-    // 自定义端点没有默认模型；空模型名时不要拿 deepseek-chat 去撞中转站（必然 404），
-    // 直接跳过这次后台记忆提取，等用户配好模型再说。
-    const model = s.assistant.model || PROVIDERS[s.assistant.provider as AssistantProvider]?.defaultModel;
-    if (!base || !model) return;
+    // 端点解析见 backgroundEndpoint：非 custom 也按实际 provider 走（曾因硬编码 DeepSeek 静默失败）
+    const ep = backgroundEndpoint(s);
+    if (!ep) return;
+    const { base, model } = ep;
     const res = await fetch(`${base}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
@@ -2049,8 +2125,53 @@ async function extractMemoriesFromChat(s: any, apiKey: string) {
       });
       added++;
     }
-    if (added > 0) saveMemory();
+    if (added > 0) {
+      saveMemory();
+      // 有新素材就（按阈值）重算画像：这一步才是"越聊越懂他"的来源
+      void synthesizeUserProfile(s, apiKey);
+    }
   } catch { /* 静默失败，不影响用户体验 */ }
+}
+
+/**
+ * 用户画像提炼：把零散记忆重写成"这是个什么样的人"，后台跑，不阻塞对话、不弹任何提示。
+ *
+ * 用户明确要求画像**不在软件里直接查看**，所以这里没有任何 UI 出口 —— 画像只进 system prompt，
+ * 由模型在聊天里自然地"侧面体现"。失败一律静默：画像只是锦上添花，坏掉不能影响正常聊天。
+ */
+let profileSynthesizing = false;
+async function synthesizeUserProfile(s: any, apiKey: string, force = false) {
+  if (profileSynthesizing) return;
+  // force：用户刚亲口给了核心信息（称呼/身份这类），别等攒够 6 条，立刻重算一次
+  if (force) {
+    if (memory.length < 3) return;
+  } else if (!shouldSynthesize(userProfile, memory.length)) {
+    return;
+  }
+  const ep = backgroundEndpoint(s);
+  if (!ep) return;
+  profileSynthesizing = true;
+  try {
+    const res = await fetch(`${ep.base}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: ep.model,
+        messages: buildProfileMessages(memory, userProfile),
+        temperature: 0.3,
+      }),
+    });
+    if (!res.ok) return;
+    const json = await res.json();
+    const text = json.choices?.[0]?.message?.content ?? "";
+    const next = parseProfileResponse(text, userProfile, memory.length);
+    if (next) {
+      userProfile = next;
+      saveUserProfile();
+    }
+  } catch { /* 静默失败 */ } finally {
+    profileSynthesizing = false;
+  }
 }
 
 /** 主动问候：收集丰富上下文 + 召回相关记忆，让 AI 有温度地关心用户 */
@@ -2164,7 +2285,10 @@ export async function triggerProactive(): Promise<boolean> {
       memory, s.assistant.customBaseUrl,
       (d) => { streamed += d; },
       false, langInstruction, "",
-      screenshot ? { screenImage: screenshot } : {},
+      {
+        ...(screenshot ? { screenImage: screenshot } : {}),
+        profileText: profileBlock(userProfile),
+      },
     );
 
     const parsed = parseGreetingResult(streamed);
@@ -2282,6 +2406,7 @@ export async function triggerCardCommentary(card: { rarity: string; theme: strin
 }
 // 记忆初始化
 loadMemory();
+loadUserProfile();
 
 
 
