@@ -32,6 +32,17 @@ import {
   parseProfileResponse,
   type UserProfile,
 } from "./userProfile";
+import { applyMemoryOps, parseMemoryOps, formatMemoryForExtractor, textSimilarity, type MemoryOp } from "./memoryOps";
+import {
+  emptyChatSummary,
+  normalizeChatSummary,
+  summaryBlock,
+  shouldSummarize,
+  collectSummarizable,
+  buildSummaryMessages,
+  parseSummaryResponse,
+  type ChatSummary,
+} from "./chatSummary";
 import { ToolLoopBudget, formatToolError, toolNames, truncateToolResult, validateToolArgs } from "./toolRuntime";
 import { ttsPlayer } from "../tts/TTSPlayer";
 import { getVisibleRect } from "../ui/visible";
@@ -55,6 +66,8 @@ const MEM_KEY = "live2d-pet-assistant-memory";
 const PROFILE_KEY = "live2d-pet-assistant-profile";
 /** 长期记忆条数上限。原来是 80，聊一个月就停止学习；画像层接管 prompt 后素材可以多存 */
 const MEM_LIMIT = 200;
+/** 更早对话的滚动摘要：补窗口截断后的上下文，长聊不失忆 */
+const SUMMARY_KEY = "live2d-pet-assistant-chat-summary";
 /** 主动问候话题记录：最近几次问候的 summary / 是否被回复，用于避免一天内重复话题 */
 const GREETING_LOG_KEY = "petra-greeting-log";
 
@@ -65,6 +78,9 @@ let allowAllShell: HTMLInputElement;
 let history: ChatMessage[] = [];
 let memory: MemoryStore = [];
 let userProfile: UserProfile = emptyProfile();
+let chatSummary: ChatSummary = emptyChatSummary();
+/** 上次后台提取记忆时的 history 长度：按"新增了多少条"触发，而不是按长度取余 */
+let lastExtractedAt = 0;
 let timer: number | null = null;
 let busy = false;
 /** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant / triggerProactive） */
@@ -269,6 +285,32 @@ function loadUserProfile() {
 function saveUserProfile() {
   try {
     localStorage.setItem(PROFILE_KEY, JSON.stringify(userProfile));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+function loadChatSummary() {
+  try {
+    chatSummary = normalizeChatSummary(JSON.parse(localStorage.getItem(SUMMARY_KEY) || "null"));
+  } catch {
+    chatSummary = emptyChatSummary();
+  }
+}
+
+function saveChatSummary() {
+  try {
+    localStorage.setItem(SUMMARY_KEY, JSON.stringify(chatSummary));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 历史被清空/重置时，摘要的下标基准也失效了，必须一起清 */
+function resetChatSummary() {
+  chatSummary = emptyChatSummary();
+  try {
+    localStorage.removeItem(SUMMARY_KEY);
   } catch {
     /* 忽略 */
   }
@@ -1033,6 +1075,7 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   ensureBubbles();
   loadMemory();
   loadUserProfile();
+  loadChatSummary();
   // 素材够了就在后台重算一份画像（不阻塞打开面板；没配 Key 就跳过）
   void (async () => {
     try {
@@ -1157,6 +1200,8 @@ export function repositionAssistantBubbles(): void {
 /** 清空对话历史（保留长期记忆 memory） */
 export function clearHistory() {
   history = [];
+  resetChatSummary();
+  lastExtractedAt = 0;
   try {
     void invoke("save_chat_history", { content: "[]" }).catch(() => {});
   } catch {
@@ -1167,6 +1212,8 @@ export function clearHistory() {
 
 export function resetHistory() {
   history = [];
+  resetChatSummary();
+  lastExtractedAt = 0;
   saveHistory();
   if (bubbles) bubbles.innerHTML = "";
 }
@@ -1397,6 +1444,8 @@ async function send(text: string) {
           extraTools: pluginRuntime.getOpenAITools(),
           // 画像只走 system prompt：模型知道"这是什么样的人"，但不会被告知"有一份档案"
           profileText: profileBlock(userProfile),
+          // 长聊之后补上被窗口切掉的旧对话，避免"聊到一半突然不认识你"
+          historySummary: summaryBlock(chatSummary),
         },
       );
       if (colorHook.lastEmotion() !== "neutral") streamEmo = colorHook.lastEmotion();
@@ -1422,7 +1471,14 @@ async function send(text: string) {
         content: transText ? `${mainText}\n---\n${transText}` : mainText,
       };
       history.push(assistantEntry);
-      saveHistory();      // 情感反馈
+      saveHistory();
+      // 历史够长了就在后台往前推一段摘要（不阻塞这轮回复）
+      void (async () => {
+        try {
+          const key = await ensureApiKey();
+          if (key) void updateChatSummary(s, key);
+        } catch { /* 忽略 */ }
+      })();      // 情感反馈
       const finalEmo = classifyAssistantEmotion(mainText);
       const aiEmo = finalEmo !== "neutral" ? finalEmo : streamEmo;
       setBubbleText(loading, "");
@@ -1503,8 +1559,11 @@ async function send(text: string) {
     saveHistory();
     ttsPlayer.flush();
 
-    // P3 主动学习：每 5 条对话自动提取新记忆（后台运行，不阻塞 UI）
-    if (history.length % 5 === 0) {
+    // P3 主动学习：每攒够 6 条新消息提取一次（后台运行，不阻塞 UI）。
+    // 以前用 `history.length % 5 === 0`：tool 调用会让长度跳着涨，同一余数在长会话里反复命中，
+    // 提取次数不可控；改成按"自上次以来新增条数"触发。
+    if (history.length - lastExtractedAt >= 6) {
+      lastExtractedAt = history.length;
       void extractMemoriesFromChat(s, apiKey);
     }
     if (!getBubbleText(loading).trim()) setBubbleText(loading, "(空回复)");
@@ -1644,27 +1703,14 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       const category = String(tc.args.category ?? "other") as MemoryEntry["category"];
       const importance = Math.min(3, Math.max(1, Number(tc.args.importance) || 2)) as MemoryEntry["importance"];
       if (content) {
-        // 去重：检查已有记忆是否包含相同内容
-        const existing = memory.find(m => m.content === content || (m.keywords.length > 0 && m.keywords.some(k => content.includes(k))));
-        if (existing) {
-          existing.lastUsedAt = Date.now();
-          existing.importance = Math.min(existing.importance, importance) as MemoryEntry["importance"];
-          history.push({ role: "tool", tool_call_id: tc.id, content: "已更新记忆" });
-        } else {
-          // 提取关键词（简单分词）
-          const keywords = extractKeywords(content);
-          memory.push({
-            id: `mem_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            category,
-            content,
-            keywords,
-            source: "user_said",
-            createdAt: Date.now(),
-            lastUsedAt: Date.now(),
-            importance,
-          });
-          history.push({ role: "tool", tool_call_id: tc.id, content: "已记住" });
-        }
+        // 走统一的增删改层：同一件事换个说法不会存成两条，超上限按重要度淘汰
+        const res = applyMemoryOps(
+          memory,
+          [{ op: "add", content, category, importance }],
+          { keywordsOf: extractKeywords, maxCount: MEM_LIMIT, source: "user_said" },
+        );
+        memory = res.memory;
+        history.push({ role: "tool", tool_call_id: tc.id, content: res.added ? "已记住" : "已更新记忆" });
         saveMemory();
         // handleToolCalls 没有 apiKey：Key 缓存在 ensureApiKey 里，这里异步取一次
         void (async () => {
@@ -2056,13 +2102,21 @@ function recallRelevantMemories(context: {
       if (context.timeOfDay) score += 2;
     }
     if (m.category === "identity") score += 1; // 身份记忆总是重要
-    
+
+    // 换个说法也能命中：关键词是子串匹配，用户说"加班到三点"命中不了"熬夜"，
+    // 这里用 2-gram 相似度补一手（比关键词宽松，比全量注入收敛）
+    if (ut) {
+      const sim = textSimilarity(m.content, context.userText ?? "");
+      if (sim >= 0.3) score += 6 * Math.min(1, sim / 0.6);
+    }
+
     return { entry: m, score };
   });
   
   scored.sort((a, b) => b.score - a.score);
-  // 只召回高分且相关的记忆，最多2条，避免AI提起无关旧事
-  return scored.filter(s => s.score >= 5).slice(0, 2).map(s => s.entry);
+  // 召回上限从 2 提到 4：2 条经常连"称呼 + 当前话题"都不够用；
+  // 仍卡分数阈值，宁缺毋滥，避免把无关旧事翻出来。
+  return scored.filter(s => s.score >= 5).slice(0, 4).map(s => s.entry);
 }
 
 
@@ -2084,12 +2138,32 @@ function backgroundEndpoint(s: any): { base: string; model: string } | null {
 async function extractMemoriesFromChat(s: any, apiKey: string) {
   // 满了先按"最琐碎 + 最久没用"淘汰，而不是从此停止学习（长期使用必然会撞上限）
   pruneMemory();
-  const recentMsgs = history.slice(-10).filter(m => m.role === "user" || m.role === "assistant");
+  const recentMsgs = history.slice(-12).filter(m => m.role === "user" || m.role === "assistant");
   if (recentMsgs.length < 3) return;
   const transcript = recentMsgs.map(m => `${m.role}: ${m.content}`).join("\n");
+  // 提取器能看到已有记忆的 id，才能判断"这是新信息 / 该改旧的 / 旧的已经不作数了"。
+  // 只输出 add 的话，事实一变新旧会同时留着，模型看到互相矛盾的记忆只能瞎猜。
   const extractPrompt = [
-    { role: "system", content: "你是记忆提取器。从对话中提取用户透露的个人信息、偏好、习惯、情绪、计划。输出JSON数组，每条 {content, category, importance}。category: identity/preference/habit/schedule/relationship/event/other。importance: 1-3。如果没有值得记住的信息，输出空数组 []。只输出JSON，不要其他文字。" },
-    { role: "user", content: transcript },
+    {
+      role: "system",
+      content:
+        "你是记忆整理器。看过这位用户的已有记忆和最近对话，决定要怎么更新记忆库，只输出 JSON：\n" +
+        '{"ops":[{"op":"add","content":"…","category":"…","importance":2}]}\n' +
+        "三种操作：\n" +
+        "- add：新出现的信息（偏好/习惯/作息/关系/计划/情绪倾向）。\n" +
+        "- update：已有记忆需要修正、补充、或事实变了 —— 必须带 id，content 写新的完整说法。\n" +
+        "- delete：用户否认了某条，或那件事已经不成立 —— 必须带 id。\n" +
+        "规则：\n" +
+        "1. 同一件事只留一条，不要换个说法再 add 一遍；用户纠正你时 update 对应那条。\n" +
+        "2. 事实发生变化（换工作、搬家、宠物送人、项目结束）用 update 覆盖旧结论，不要两条并存。\n" +
+        "3. category: identity/preference/habit/schedule/relationship/event/other；importance: 1=核心(称呼/身份/长期偏好) 2=重要 3=琐碎。\n" +
+        "4. 只记用户本人的信息，不要把助理自己说的话当事实，也不要记这次的临时任务细节。\n" +
+        "5. 没有值得记的就输出 {\"ops\":[]}。只输出 JSON，不要解释。",
+    },
+    {
+      role: "user",
+      content: `已有记忆（id 可用于 update/delete）：\n${formatMemoryForExtractor(memory)}\n\n最近对话：\n${transcript}`,
+    },
   ];
   try {
     // 端点解析见 backgroundEndpoint：非 custom 也按实际 provider 走（曾因硬编码 DeepSeek 静默失败）
@@ -2104,32 +2178,18 @@ async function extractMemoriesFromChat(s: any, apiKey: string) {
     if (!res.ok) return;
     const json = await res.json();
     const text = json.choices?.[0]?.message?.content ?? "";
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) return;
-    const items = JSON.parse(match[0]);
-    if (!Array.isArray(items)) return;
-    let added = 0;
-    for (const item of items) {
-      if (!item.content || typeof item.content !== "string") continue;
-      const content = item.content.trim();
-      if (memory.some(m => m.content === content)) continue; // 去重
-      memory.push({
-        id: `auto_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        category: item.category || "other",
-        content,
-        keywords: extractKeywords(content),
-        source: "ai_inferred",
-        createdAt: Date.now(),
-        lastUsedAt: Date.now(),
-        importance: Math.min(3, Math.max(1, Number(item.importance) || 2)) as MemoryEntry["importance"],
-      });
-      added++;
-    }
-    if (added > 0) {
-      saveMemory();
-      // 有新素材就（按阈值）重算画像：这一步才是"越聊越懂他"的来源
-      void synthesizeUserProfile(s, apiKey);
-    }
+    const ops = parseMemoryOps(text);
+    if (!ops.length) return;
+    const applied = applyMemoryOps(memory, ops, {
+      keywordsOf: extractKeywords,
+      maxCount: MEM_LIMIT,
+      source: "ai_inferred",
+    });
+    if (!applied.changed) return;
+    memory = applied.memory;
+    saveMemory();
+    // 有新素材就（按阈值）重算画像：这一步才是"越聊越懂他"的来源
+    void synthesizeUserProfile(s, apiKey);
   } catch { /* 静默失败，不影响用户体验 */ }
 }
 
@@ -2171,6 +2231,44 @@ async function synthesizeUserProfile(s: any, apiKey: string, force = false) {
     }
   } catch { /* 静默失败 */ } finally {
     profileSynthesizing = false;
+  }
+}
+
+/**
+ * 更早对话的滚动摘要：把即将被窗口切掉的旧聊天压成一段，随 system prompt 带上。
+ *
+ * 只影响"模型记得多少"，不改 ui、不改 history：原文仍在 chat-history 里，
+ * 用户翻记录还是完整对话。失败静默，摘要丢了顶多回到以前"聊久了失忆"的状态。
+ */
+let summaryRunning = false;
+async function updateChatSummary(s: any, apiKey: string) {
+  if (summaryRunning) return;
+  if (!shouldSummarize(history.length, chatSummary)) return;
+  const { picked, nextCoveredCount } = collectSummarizable(history, chatSummary.coveredCount);
+  if (picked.length < 5) return;
+  const ep = backgroundEndpoint(s);
+  if (!ep) return;
+  summaryRunning = true;
+  try {
+    const res = await fetch(`${ep.base}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: ep.model,
+        messages: buildSummaryMessages(picked, chatSummary.text),
+        temperature: 0.2,
+      }),
+    });
+    if (!res.ok) return;
+    const json = await res.json();
+    const text = json.choices?.[0]?.message?.content ?? "";
+    const next = parseSummaryResponse(text, chatSummary.text, nextCoveredCount);
+    if (next) {
+      chatSummary = next;
+      saveChatSummary();
+    }
+  } catch { /* 静默失败 */ } finally {
+    summaryRunning = false;
   }
 }
 
@@ -2407,6 +2505,7 @@ export async function triggerCardCommentary(card: { rarity: string; theme: strin
 // 记忆初始化
 loadMemory();
 loadUserProfile();
+loadChatSummary();
 
 
 
