@@ -43,6 +43,15 @@ import {
 } from "./moodTrend";
 import { detectCorrection } from "./correction";
 import {
+  emptyNudgeState,
+  normalizeNudgeState,
+  shouldNudge,
+  markNudged,
+  pickNudgeCandidate,
+  nudgeBlock,
+  type NudgeState,
+} from "./memoryNudge";
+import {
   emptyChatSummary,
   normalizeChatSummary,
   summaryBlock,
@@ -79,6 +88,8 @@ const MEM_LIMIT = 200;
 const SUMMARY_KEY = "live2d-pet-assistant-chat-summary";
 /** 情绪趋势采样：每天一个点，最近 14 天（只进 prompt，不露界面） */
 const MOOD_SAMPLES_KEY = "petra-mood-samples";
+/** 主动提起旧事的节流状态（3 小时冷却 / 每天最多 2 次） */
+const NUDGE_KEY = "petra-memory-nudge";
 /** 主动问候话题记录：最近几次问候的 summary / 是否被回复，用于避免一天内重复话题 */
 const GREETING_LOG_KEY = "petra-greeting-log";
 
@@ -95,6 +106,7 @@ let lastExtractedAt = 0;
 /** 这一轮用户是不是在纠正我（"记错了/我没说过/别记这个"）→ 立刻跑一次提取 */
 let pendingCorrection = false;
 let moodSamples: MoodSample[] = [];
+let nudgeState: NudgeState = emptyNudgeState();
 let timer: number | null = null;
 let busy = false;
 /** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant / triggerProactive） */
@@ -301,6 +313,45 @@ function saveUserProfile() {
     localStorage.setItem(PROFILE_KEY, JSON.stringify(userProfile));
   } catch {
     /* 忽略 */
+  }
+}
+
+function loadNudgeState() {
+  try {
+    nudgeState = normalizeNudgeState(JSON.parse(localStorage.getItem(NUDGE_KEY) || "null"));
+  } catch {
+    nudgeState = emptyNudgeState();
+  }
+}
+
+function saveNudgeState() {
+  try {
+    localStorage.setItem(NUDGE_KEY, JSON.stringify(nudgeState));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 这一轮要不要"顺口问一句"。
+ * 频率受控（3 小时冷却、每天 2 次），命中就把它标记成刚用过，避免下一轮又提同一件事。
+ */
+function takeTurnNudge(): string {
+  try {
+    if (!shouldNudge(nudgeState)) return "";
+    const cand = pickNudgeCandidate(memory);
+    if (!cand) return "";
+    nudgeState = markNudged(nudgeState);
+    saveNudgeState();
+    // 记一次"用过了"：不然同一件事会被反复挑中
+    const orig = memory.find((m) => m.id === cand.id);
+    if (orig) {
+      orig.lastUsedAt = Date.now();
+      saveMemory();
+    }
+    return nudgeBlock(cand);
+  } catch {
+    return "";
   }
 }
 
@@ -1120,6 +1171,7 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   loadUserProfile();
   loadChatSummary();
   loadMoodSamples();
+  loadNudgeState();
   // 素材够了就在后台重算一份画像（不阻塞打开面板；没配 Key 就跳过）
   void (async () => {
     try {
@@ -1410,6 +1462,8 @@ async function send(text: string) {
     scheduleFade(b, 5000);
     return;
   }
+  // 本轮要不要顺口提起一件旧事（有频率上限，提过就冷却）
+  const turnNudge = takeTurnNudge();
   const outLang = s.assistant.outputLanguage;
   // 换语言时清空对话历史。
   // 以前用内存变量 lastChatLang 作基准，重启后初值为空 → 第一次发送就误清历史；
@@ -1490,8 +1544,8 @@ async function send(text: string) {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
           extraTools: pluginRuntime.getOpenAITools(),
           // 画像 + 最近情绪只走 system prompt：模型知道"这是什么样的人、最近过得怎样"，
-          // 但不会被告知"有一份档案/记录"
-          profileText: personaContextBlock(),
+          // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
+          profileText: [personaContextBlock(), turnNudge].filter(Boolean).join("\n\n"),
           // 长聊之后补上被窗口切掉的旧对话，避免"聊到一半突然不认识你"
           historySummary: summaryBlock(chatSummary),
         },
@@ -2422,6 +2476,8 @@ export async function triggerProactive(): Promise<boolean> {
     }
     saveMemory();
     boostMood("greeting_sent");
+    // 问候也是观察用户状态的机会：顺便记一个情绪采样点
+    sampleMoodNow();
 
     setBubbleText(bubble, "");
     bubbleBody(bubble).append(document.createTextNode(mainText));
@@ -2522,6 +2578,7 @@ loadMemory();
 loadUserProfile();
 loadChatSummary();
 loadMoodSamples();
+loadNudgeState();
 
 
 
