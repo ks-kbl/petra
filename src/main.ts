@@ -5002,7 +5002,7 @@ function toggleBoundsPanel() {
 
     const hint = document.createElement("div");
     hint.className = "mp-hint";
-    hint.textContent = "微调绿框四边松紧，正数放大、负数收紧";
+    hint.textContent = "微调绿框四边松紧，正数放大、负数收紧；圆角只影响点击范围";
     host.appendChild(hint);
 
     const mkSlider = (label: string, key: keyof BoundsPadding) => {
@@ -5041,6 +5041,39 @@ function toggleBoundsPanel() {
     mkSlider("上", "top");
     mkSlider("下", "bottom");
 
+    // ---- 点击区域圆角 ----
+    // 用户要求在桌宠上调、能直接看见效果：这里给一条滑条，绿框会同步变成圆角，
+    // 四角被切掉的部分就是"点不到"的地方。
+    const cornerRow = document.createElement("div");
+    cornerRow.className = "as-set-row";
+    const cornerLabel = document.createElement("span");
+    cornerLabel.className = "as-set-label";
+    cornerLabel.textContent = "圆角";
+    const cornerSlider = document.createElement("input");
+    cornerSlider.type = "range";
+    cornerSlider.min = "0";
+    cornerSlider.max = "200";
+    cornerSlider.step = "2";
+    cornerSlider.value = String(currentBoundsCorner());
+    cornerSlider.className = "as-input";
+    cornerSlider.style.flex = "1";
+    cornerSlider.style.minWidth = "0";
+    const cornerVal = document.createElement("span");
+    cornerVal.className = "as-set-label";
+    cornerVal.style.minWidth = "38px";
+    cornerVal.style.textAlign = "right";
+    cornerVal.textContent = currentBoundsCorner() + "px";
+    cornerSlider.addEventListener("input", () => {
+      const v = parseInt(cornerSlider.value, 10) || 0;
+      cornerVal.textContent = v + "px";
+      setCurrentBoundsCorner(v);
+      // 改完立刻按新圆角重画绿框（updateModelBounds 每帧只更新位置尺寸）
+      updateModelBoundsCornerStyle();
+    });
+    cornerRow.append(cornerLabel, cornerSlider, cornerVal);
+    host.appendChild(cornerRow);
+    updateModelBoundsCornerStyle();
+
     const btns = document.createElement("div");
     btns.className = "as-set-btns";
     const reset = document.createElement("button");
@@ -5048,6 +5081,8 @@ function toggleBoundsPanel() {
     reset.textContent = "重置";
     reset.addEventListener("click", () => {
       setCurrentBoundsPadding({ ...ZERO_PADDING });
+      setCurrentBoundsCorner(0);
+      updateModelBoundsCornerStyle();
       closeBoundsPanel();
     });
     const done = document.createElement("button");
