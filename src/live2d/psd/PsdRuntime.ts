@@ -448,28 +448,31 @@ export class PsdRuntime {
     }
 
     // ---- 自动待机（轻微晃头） ----
-    // 幅度刻意压得很小：这几个参数是直接叠在角度上的，0.1 以上的摆幅在近景模型上
-    // 已经明显到像"一直晃"。0.06/0.03/0.05 才是"呼吸带一点点晃"的量级。
+    // 幅度取中间值：0.13 那版像"一直在摇"，0.06 那版又小到只剩抖动感（幅度太小时，
+    // 同样的位移被分摊到很少的像素上，看起来反而是"卡"）。0.10/0.06/0.05/0.08 是刚好
+    // 能看出在动、又不打扰的量级。
     if (this.autoIdle) {
-      this.tgt.angleX += 0.06 * Math.sin(t * 0.42) + 0.02 * Math.sin(t * 1.13);
-      this.tgt.angleY += 0.04 * Math.sin(t * 0.31 + 1.7);
-      this.tgt.angleZ += 0.03 * Math.sin(t * 0.23 + 0.5);
-      this.tgt.body += 0.05 * Math.sin(t * 0.19 + 2.1);
+      this.tgt.angleX += 0.10 * Math.sin(t * 0.42) + 0.03 * Math.sin(t * 1.13);
+      this.tgt.angleY += 0.06 * Math.sin(t * 0.31 + 1.7);
+      this.tgt.angleZ += 0.05 * Math.sin(t * 0.23 + 0.5);
+      this.tgt.body += 0.08 * Math.sin(t * 0.19 + 2.1);
     }
     // ---- 随机小动作（平滑漂移，避免突变弹跳） ----
     if (this.autoRand) {
       if (now * 1000 > this.nextRnd) {
-        // 换个目标别太勤：1.4~4 秒一次、幅度又大时，观感就是"一直在抽动"。
-        this.nextRnd = now * 1000 + 2600 + Math.random() * 4200;
-        this.rndTarget.ax = (Math.random() * 2 - 1) * 0.15;
-        this.rndTarget.ay = (Math.random() * 2 - 1) * 0.08;
-        this.rndTarget.az = (Math.random() * 2 - 1) * 0.05;
-        this.rndTarget.bd = (Math.random() * 2 - 1) * 0.04;
-        this.rndTarget.ex = (Math.random() * 2 - 1) * 0.22;
-        this.rndTarget.ey = (Math.random() * 2 - 1) * 0.12;
+        // 1.2~2.2 秒换一次目标：收敛时间约 1 秒，这样目标还没完全停住就换下一个，
+        // 动作是连着的；再慢就变成"动一下、定住、再动一下"的顿挫感。
+        this.nextRnd = now * 1000 + 1200 + Math.random() * 1000;
+        this.rndTarget.ax = (Math.random() * 2 - 1) * 0.25;
+        this.rndTarget.ay = (Math.random() * 2 - 1) * 0.13;
+        this.rndTarget.az = (Math.random() * 2 - 1) * 0.08;
+        this.rndTarget.bd = (Math.random() * 2 - 1) * 0.07;
+        this.rndTarget.ex = (Math.random() * 2 - 1) * 0.32;
+        this.rndTarget.ey = (Math.random() * 2 - 1) * 0.18;
       }
-      // 收敛更慢一点，动作才连贯；之前 dt*1.0 大约 1 秒到位，看起来像在抽搐
-      const k = Math.min(1, dt * 0.55);
+      // 收敛系数拉回 1.0：0.55 那版太慢，目标之间是"慢慢挪过去再停住"，
+      // 观感就是一顿一顿的。1.0 大约 1 秒到位，动作连贯。
+      const k = Math.min(1, dt * 1.0);
       this.rnd.ax += (this.rndTarget.ax - this.rnd.ax) * k;
       this.rnd.ay += (this.rndTarget.ay - this.rnd.ay) * k;
       this.rnd.az += (this.rndTarget.az - this.rnd.az) * k;
