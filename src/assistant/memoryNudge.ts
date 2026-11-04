@@ -30,6 +30,8 @@ export interface NudgeState {
   day: string;
   /** 当天已提示次数 */
   countToday: number;
+  /** 上次提的「悬而未决」，避免连着两轮问同一件事 */
+  lastLoop?: string;
 }
 
 export const NUDGE_MIN_IDLE_MS = 3 * 60 * 60 * 1000;   // 两次之间至少 3 小时
@@ -41,6 +43,16 @@ export function emptyNudgeState(): NudgeState {
   return { lastAt: 0, day: "", countToday: 0 };
 }
 
+/**
+ * 从"悬而未决"里挑一条：这类是**这次的对话本身**留下的线头，
+ * 比"很久没提的旧事实"更像熟人之间的关心（"你之前说的接口后来弄完了吗"）。
+ */
+export function pickOpenLoop(state: NudgeState | null | undefined, openLoops: string[] | null | undefined): string {
+  const last = state?.lastLoop ?? "";
+  const list = (openLoops ?? []).map((x) => (x || "").trim()).filter(Boolean);
+  return list.find((x) => x !== last) ?? "";
+}
+
 export function normalizeNudgeState(raw: unknown): NudgeState {
   if (!raw || typeof raw !== "object") return emptyNudgeState();
   const r = raw as Record<string, unknown>;
@@ -48,6 +60,7 @@ export function normalizeNudgeState(raw: unknown): NudgeState {
     lastAt: Number.isFinite(r.lastAt) ? Number(r.lastAt) : 0,
     day: typeof r.day === "string" ? r.day : "",
     countToday: Number.isFinite(r.countToday) ? Math.max(0, Number(r.countToday)) : 0,
+    lastLoop: typeof r.lastLoop === "string" ? r.lastLoop : undefined,
   };
 }
 
@@ -66,13 +79,18 @@ export function shouldNudge(state: NudgeState | null | undefined, now: number = 
 }
 
 /** 记一次提示（在真的把它塞进 prompt 之后调用） */
-export function markNudged(state: NudgeState | null | undefined, now: number = Date.now()): NudgeState {
+export function markNudged(
+  state: NudgeState | null | undefined,
+  now: number = Date.now(),
+  lastLoop?: string,
+): NudgeState {
   const s = state ?? emptyNudgeState();
   const today = nudgeDayKey(now);
   return {
     lastAt: now,
     day: today,
     countToday: (s.day === today ? s.countToday : 0) + 1,
+    lastLoop: lastLoop ?? s.lastLoop,
   };
 }
 
@@ -105,7 +123,7 @@ export function pickNudgeCandidate(
 }
 
 /** 注入 system prompt 的提示块；没有候选时返回空串 */
-export function nudgeBlock(candidate: NudgeMemory | null | undefined): string {
+export function nudgeBlock(candidate: { content: string } | null | undefined): string {
   const c = candidate?.content?.trim();
   if (!c) return "";
   return (

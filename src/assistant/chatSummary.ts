@@ -12,8 +12,13 @@
  */
 
 export interface ChatSummary {
-  /** 合并后的摘要正文 */
+  /** 合并后的摘要正文（不含「悬而未决」那一行） */
   text: string;
+  /**
+   * 悬而未决的事：用户提过但还没收尾的（"接口还没改完""等面试结果"）。
+   * 摘要时顺手抠出来，给「顺口问一句」当素材 —— 这类连续性比复述旧事实更打动人。
+   */
+  openLoops?: string[];
   /** 历史里前多少条已经被摘要覆盖（按 history 的原始下标计） */
   coveredCount: number;
   updatedAt: number;
@@ -31,10 +36,14 @@ export function emptyChatSummary(): ChatSummary {
 export function normalizeChatSummary(raw: unknown): ChatSummary {
   if (!raw || typeof raw !== "object") return emptyChatSummary();
   const r = raw as Record<string, unknown>;
+  const loops = Array.isArray(r.openLoops)
+    ? r.openLoops.map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean).slice(0, 6)
+    : [];
   return {
     text: typeof r.text === "string" ? r.text.trim() : "",
     coveredCount: Number.isFinite(r.coveredCount) ? Math.max(0, Number(r.coveredCount)) : 0,
     updatedAt: Number.isFinite(r.updatedAt) ? Number(r.updatedAt) : 0,
+    openLoops: loops,
   };
 }
 
@@ -89,7 +98,8 @@ export function buildSummaryMessages(
     "2. 去掉寒暄、重复、以及「好的」「嗯」这类没有信息量的对话。\n" +
     "3. 如果给了旧摘要，把旧摘要和这次的新内容合并成**一段**，不要分条、不要写成「旧摘要说…又说了…」。\n" +
     "4. 用中文，250 字以内，第三人称叙述，不要加标题、不要加任何前后缀说明。\n" +
-    "5. 只写聊过的事实，不要评价、不要建议、不要编造没出现的信息。";
+    "5. 只写聊过的事实，不要评价、不要建议、不要编造没出现的信息。\n" +
+    "6. 最后单独加一行，格式必须是「悬而未决：」开头，用「；」分隔列出用户提过但还没有结果的事（谁在等什么、什么没弄完、答应了什么）；没有就写「悬而未决：无」。这一行会被程序单独取走，不要写进上面的摘要正文。";
   const body =
     (prevText ? `已有的旧摘要：\n${prevText}\n\n` : "") +
     "新的对话记录：\n" +
@@ -115,14 +125,31 @@ export function parseSummaryResponse(
     .replace(/```$/m, "")
     .replace(/^(摘要|总结)[：:]\s*/i, "")
     .trim();
+
+  // 把「悬而未决：…」这一行剥出来单独存，正文里不留（否则会被念出来）
+  const openLoops: string[] = [];
+  const lines: string[] = [];
+  for (const line of body.split(/\r?\n/)) {
+    const m = /^\s*(?:悬而未决|未完成|待办)[:：]\s*(.*)$/.exec(line);
+    if (!m) {
+      lines.push(line);
+      continue;
+    }
+    const items = m[1]
+      .split(/[；;]/)
+      .map((x) => x.trim().replace(/^[-·\d.、\s]+/, ""))
+      .filter((x) => x && x !== "无" && x !== "没有");
+    openLoops.push(...items);
+  }
+  body = lines.join("\n").trim();
   if (body.length < 10) return null;
   if (body.length > 600) body = body.slice(0, 600) + "…";
   return {
     text: body,
     coveredCount,
     updatedAt: now,
-    // prevText 只用于 prompt，合并结果由模型给出；这里留着是为了调用方对比
-  } as ChatSummary;
+    openLoops: openLoops.slice(0, 6),
+  };
 }
 
 /** 注入 system prompt 的文本块（无内容时返回空串） */

@@ -48,6 +48,7 @@ import {
   shouldNudge,
   markNudged,
   pickNudgeCandidate,
+  pickOpenLoop,
   nudgeBlock,
   type NudgeState,
 } from "./memoryNudge";
@@ -339,6 +340,13 @@ function saveNudgeState() {
 function takeTurnNudge(): string {
   try {
     if (!shouldNudge(nudgeState)) return "";
+    // 先看"这次的对话留下的线头"，再退回"很久没提的旧事实"
+    const loop = pickOpenLoop(nudgeState, chatSummary.openLoops);
+    if (loop) {
+      nudgeState = markNudged(nudgeState, Date.now(), loop);
+      saveNudgeState();
+      return nudgeBlock({ content: loop });
+    }
     const cand = pickNudgeCandidate(memory);
     if (!cand) return "";
     nudgeState = markNudged(nudgeState);
@@ -462,6 +470,15 @@ async function loadHistory() {
   // 不再在这里重置"历史所属语言" —— 那会把「改语言就清历史」也一起关掉。
   // 历史语言改为持久化在 settings.assistant.historyLang，见 send()。
 }
+/**
+ * 统一的"写进历史"入口：补齐 ts 时间戳。
+ * 控制面板的「聊天记录」按 ts 分天，散落各处的 history.push 很容易漏，所以收口到这里。
+ */
+function pushHistory(msg: ChatMessage) {
+  if (!msg.ts) msg.ts = Date.now();
+  history.push(msg);
+}
+
 function saveHistory() {
   // 整体覆盖写到 app_data_dir/chat-history.json；fire-and-forget，失败不阻塞对话
   void invoke("save_chat_history", { content: JSON.stringify(history) }).catch(() => {});
@@ -1172,6 +1189,8 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   loadChatSummary();
   loadMoodSamples();
   loadNudgeState();
+  // 打开对话面板也是一次"见到用户"，顺手采一个情绪点（比以前只在聊天/问候后采样更连续）
+  sampleMoodNow();
   // 素材够了就在后台重算一份画像（不阻塞打开面板；没配 Key 就跳过）
   void (async () => {
     try {
@@ -1490,7 +1509,7 @@ async function send(text: string) {
   if (detectCorrection(text)) pendingCorrection = true;
   // 消息真正发出去才算"回应了主动问候"（没回应则下一轮问候要换话题）
   markGreetingRepliedByUser();
-  history.push({ role: "user", content: userContent, ts: Date.now() });
+  pushHistory({ role: "user", content: userContent, ts: Date.now() });
   saveHistory();
   // 记下"确实发出去了"的原文：语音收尾迟到时 onFinal 靠它去重
   lastSentText = text.trim();
@@ -1573,7 +1592,7 @@ async function send(text: string) {
         content: transText ? `${mainText}\n---\n${transText}` : mainText,
         ts: Date.now(),
       };
-      history.push(assistantEntry);
+      pushHistory(assistantEntry);
       saveHistory();
       // 历史够长了就在后台往前推一段摘要（不阻塞这轮回复）
       void (async () => {
@@ -1727,7 +1746,7 @@ function withHint(text: string, hint: string): string {
 /** 处理工具调用：先 push assistant tool_calls 消息，再逐个执行并 push tool 消息 */
 async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: ToolLoopBudget, screenshot: { image: string | undefined }) {
   // assistant 消息带 tool_calls（content 为 null 规范格式；DeepSeek 要求 tool 消息紧跟它）
-  history.push({
+  pushHistory({
     role: "assistant",
     content: null,
     tool_calls: calls.map((tc) => ({
@@ -1751,9 +1770,9 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       // tool 消息的 content 必须是字符串：数字/对象类返回值（如空闲秒数）统一转成文本
       let text = typeof result === "string" ? result : JSON.stringify(result);
       if (shape) text = shape(text);
-      history.push({ role: "tool", tool_call_id: tcItem.id, content: text });
+      pushHistory({ role: "tool", tool_call_id: tcItem.id, content: text });
     } catch (e) {
-      history.push({ role: "tool", tool_call_id: tcItem.id, content: `失败：${e}` });
+      pushHistory({ role: "tool", tool_call_id: tcItem.id, content: `失败：${e}` });
     }
   };
 
@@ -1761,7 +1780,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     // 次数预算用尽：不再执行，但**仍然**回一条明确结果 ——
     // 留下一条悬空的 tool_calls 会让下一轮请求直接 400。
     if (!budget.canCall()) {
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: formatToolError(
@@ -1775,7 +1794,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     const repeatHint = budget.noteCall(tc.name, tc.argsError ? { __raw: tc.args } : tc.args);
     // 参数不是合法 JSON：让模型知道要重发（静默丢弃会让它以为调过了）
     if (tc.argsError) {
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: withHint(
@@ -1788,7 +1807,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     // 未知工具 / 缺必填参数：不开 IPC，直接回可执行的提示
     const check = validateToolArgs(tc.name, tc.args);
     if (!check.ok) {
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: withHint(formatToolError(tc.name, check.message), repeatHint),
@@ -1798,7 +1817,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     // 插件工具：交给 PluginRuntime 的 Worker 执行。插件内部可以再调 pet.say 等白名单能力。
     if (pluginRuntime.isPluginTool(tc.name)) {
       const result = await pluginRuntime.executeTool(tc.name, tc.args);
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: withHint(truncateToolResult(tc.name, result), repeatHint),
@@ -1817,7 +1836,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           { keywordsOf: extractKeywords, maxCount: MEM_LIMIT, source: "user_said" },
         );
         memory = res.memory;
-        history.push({ role: "tool", tool_call_id: tc.id, content: res.added ? "已记住" : "已更新记忆" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: res.added ? "已记住" : "已更新记忆" });
         saveMemory();
         // handleToolCalls 没有 apiKey：Key 缓存在 ensureApiKey 里，这里异步取一次
         void (async () => {
@@ -1828,27 +1847,27 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           } catch { /* 忽略 */ }
         })();
       } else {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "内容为空" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "内容为空" });
       }
       continue;
     }
     if (tc.name === "delete_wrong_history") {
       const keywords = String(tc.args.keywords ?? "").trim().split(/\s+/).filter(Boolean);
       if (keywords.length === 0) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "没有提供关键词" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "没有提供关键词" });
         continue;
       }
       // 按完整旧轮次删除，避免留下孤立 tool 消息；当前纠正和正在执行的工具保留。
       const beforeDelete = history.length;
       history = deleteWrongHistory(history, keywords);
       const deleted = beforeDelete - history.length;
-      history.push({ role: "tool", tool_call_id: tc.id, content: `已删除旧对话中的${deleted}条消息，保留了本轮纠正。` });
+      pushHistory({ role: "tool", tool_call_id: tc.id, content: `已删除旧对话中的${deleted}条消息，保留了本轮纠正。` });
       continue;
     }
     if (tc.name === "launch_application") {
       const app = String(tc.args.application ?? "").trim();
       if (!app) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "应用名称为空" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "应用名称为空" });
         continue;
       }
       setBubbleText(loading, "启动中…");
@@ -1863,13 +1882,13 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       } catch (e) {
         result = JSON.stringify({ success: false, message: `执行失败：${e}`, resolved: null });
       }
-      history.push({ role: "tool", tool_call_id: tc.id, content: result });
+      pushHistory({ role: "tool", tool_call_id: tc.id, content: result });
     }
     if (tc.name === "run_shell") {
       const cmd = String(tc.args.command ?? "").trim();
       if (!cmd) {
         // 空命令也必回传 tool 消息，保证 tool_calls 序列完整（否则 DeepSeek 报 400）
-        history.push({ role: "tool", tool_call_id: tc.id, content: "命令为空" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "命令为空" });
         continue;
       }
       const doRun = allowAllShell.checked
@@ -1909,7 +1928,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           result = `执行失败：${e}`;
         }
       }
-      history.push({ role: "tool", tool_call_id: tc.id, content: result });
+      pushHistory({ role: "tool", tool_call_id: tc.id, content: result });
     }
     if (tc.name === "set_volume") {
       await invokeTool(tc, "set_volume", { level: tc.args.level, mute: tc.args.mute });
@@ -1922,7 +1941,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         boostMood("reminder_done");
         toast(`提醒：${message}`, "info");
       }, ms);
-      history.push({ role: "tool", tool_call_id: tc.id, content: `已设定 ${minutes} 分钟后提醒：${message}` });
+      pushHistory({ role: "tool", tool_call_id: tc.id, content: `已设定 ${minutes} 分钟后提醒：${message}` });
     }
     if (tc.name === "get_weather") {
       await invokeTool(tc, "get_weather");
@@ -1936,7 +1955,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     if (tc.name === "search_web") {
       const query = String(tc.args.query || "").trim();
       if (!query) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "搜索词是空的，请带上 query 再调用一次。" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "搜索词是空的，请带上 query 再调用一次。" });
       } else {
         try {
           const hits = await invoke<{ title: string; url: string; snippet: string }[]>("web_search", {
@@ -1946,14 +1965,14 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           const text = (hits || [])
             .map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}\n   ${h.snippet}`)
             .join("\n");
-          history.push({
+          pushHistory({
             role: "tool",
             tool_call_id: tc.id,
             content: text ? `搜索「${query}」的结果：\n${text}` : `搜索「${query}」没有结果`,
           });
         } catch (e) {
           // 搜索失败要让模型知道，它可以换个关键词再试或直接说查不到，别让用户等成"卡住"
-          history.push({ role: "tool", tool_call_id: tc.id, content: `搜索失败：${e}` });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `搜索失败：${e}` });
         }
       }
     }
@@ -1989,7 +2008,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       const isDir = tc.args.is_dir === true;
       const ok = await confirmFileWrite(`小助手想新建${isDir ? "文件夹" : "文件"}：${path}`);
       if (!ok) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次新建操作" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次新建操作" });
       } else {
         await invokeTool(tc, "create_entry", {
           path,
@@ -2009,7 +2028,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         `小助手想改文件：${path}\n把「${brief(oldStr)}」换成「${newStr === "" ? "（删除）" : brief(newStr)}」`,
       );
       if (!ok) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次修改" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次修改" });
       } else {
         await invokeTool(tc, "edit_text_file", {
           path,
@@ -2028,7 +2047,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         `小助手想${mode === "append" ? "追加内容到" : "整个写入"}：${path}（${body.length} 字，覆盖会先备份）`,
       );
       if (!ok) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次写入" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "用户拒绝了这次写入" });
       } else {
         await invokeTool(tc, "write_text_file", {
           path,
@@ -2049,9 +2068,9 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       try {
         const b64 = await invoke<string>("capture_screen");
         screenshot.image = `data:image/png;base64,${b64}`;
-        history.push({ role: "tool", tool_call_id: tc.id, content: "截图成功。屏幕画面已作为图片附加在后续请求中，请根据你看到的屏幕内容回答用户的问题。" });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "截图成功。屏幕画面已作为图片附加在后续请求中，请根据你看到的屏幕内容回答用户的问题。" });
       } catch (e) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: `截图失败：${e}` });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: `截图失败：${e}` });
       }
     }
     if (tc.name === "get_idle_seconds") {
@@ -2079,9 +2098,9 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         ];
         if (result.aiText !== result.card.baseText) lines.push(`AI文案：${result.aiText}`);
         lines.push(`图鉴：${collected}/${total}`, "", "请用你的人设风格重新演绎上面的文案，加入自己的点评或吐槽，不要原样复述。直接对用户说话。");
-        history.push({ role: "tool", tool_call_id: tc.id, content: lines.join("\n") });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: lines.join("\n") });
       } catch (e) {
-        history.push({ role: "tool", tool_call_id: tc.id, content: `抽卡失败：${e}` });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: `抽卡失败：${e}` });
       }
     }
     if (tc.name === "view_diary") {
@@ -2089,17 +2108,17 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       if (date) {
         const entry = getDiary(date);
         if (entry) {
-          history.push({ role: "tool", tool_call_id: tc.id, content: `📖 ${date} 的日记：\n${entry.content}` });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `📖 ${date} 的日记：\n${entry.content}` });
         } else {
-          history.push({ role: "tool", tool_call_id: tc.id, content: `${date} 没有日记哦~` });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `${date} 没有日记哦~` });
         }
       } else {
         const diaries = loadDiaries().slice(0, 3);
         if (diaries.length === 0) {
-          history.push({ role: "tool", tool_call_id: tc.id, content: "还没有日记呢~跟我互动就会自动生成啦！" });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: "还没有日记呢~跟我互动就会自动生成啦！" });
         } else {
           const summary = diaries.map(d => `📖 ${d.date}: ${d.content.slice(0, 30)}...`).join("\n");
-          history.push({ role: "tool", tool_call_id: tc.id, content: `最近的日记：\n${summary}` });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `最近的日记：\n${summary}` });
         }
       }
     }
@@ -2113,7 +2132,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     const lastMsg = history[history.length - 1];
     const answered = lastMsg?.role === "tool" && lastMsg.tool_call_id === tc.id;
     if (!answered) {
-      history.push({
+      pushHistory({
         role: "tool",
         tool_call_id: tc.id,
         content: formatToolError(
@@ -2450,7 +2469,9 @@ export async function triggerProactive(): Promise<boolean> {
     const greetingHistory: ChatMessage[] = [...history, { role: "user", content: prompt }];
     await chatStream(
       s.assistant.provider, apiKey, s.assistant.model, greetingHistory, s.assistant.persona,
-      memory, s.assistant.customBaseUrl,
+      // 和主聊天用同一套召回：以前这里传的是全量 memory（system prompt 里 top 20），
+      // 结果问候时反而比聊天时更像"背档案"
+      relevantMemories, s.assistant.customBaseUrl,
       (d) => { streamed += d; },
       false, langInstruction, "",
       {
@@ -2498,7 +2519,7 @@ export async function triggerProactive(): Promise<boolean> {
 
     // 关键：主动问候也是正常对话，必须写进主历史并标【问候】，
     // 这样用户下一句回复时，模型知道"自己刚刚主动说过什么"。
-    history.push({ role: "assistant", content: markGreetingForHistory(greeting), ts: Date.now() });
+    pushHistory({ role: "assistant", content: markGreetingForHistory(greeting), ts: Date.now() });
     saveHistory();
     recordGreeting(parsed.summary || mainText.slice(0, 80), mainText);
 

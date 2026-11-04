@@ -518,15 +518,10 @@ fn handle_conn(mut stream: TcpStream, panel: &Panel) -> std::io::Result<()> {
                     return json_resp(&mut stream, 500, json!({"ok": false, "error": "应用未就绪"}))
                 }
             };
-            let path = match crate::chat_history_path(app) {
-                Ok(p) => p,
+            // 按天分片的历史由 lib.rs 统一合并（含旧单文件的自动迁移）
+            let messages: Value = match crate::read_chat_history_all(app) {
+                Ok(list) => Value::Array(list),
                 Err(e) => return json_resp(&mut stream, 500, json!({"ok": false, "error": e})),
-            };
-            let messages: Value = if path.exists() {
-                let raw = std::fs::read_to_string(&path).unwrap_or_default();
-                serde_json::from_str(&raw).unwrap_or_else(|_| json!([]))
-            } else {
-                json!([])
             };
             json_resp(&mut stream, 200, json!({"ok": true, "messages": messages}))
         }

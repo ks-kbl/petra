@@ -54,6 +54,14 @@ check("标记一次", st.countToday === 1 && st.lastAt === now && st.day === mn.
 st = mn.markNudged(st, now + 4 * 60 * 60 * 1000);
 check("同一天累加", st.countToday === 2);
 
+// ---------- 悬而未决优先 ----------
+check("能从线头里挑一条", mn.pickOpenLoop(mn.emptyNudgeState(), ["接口没改完", "等面试结果"]) === "接口没改完");
+check("跳过上一轮提过的", mn.pickOpenLoop({ lastAt: 0, day: "", countToday: 0, lastLoop: "接口没改完" }, ["接口没改完", "等面试结果"]) === "等面试结果");
+check("全提过就返回空", mn.pickOpenLoop({ lastAt: 0, day: "", countToday: 0, lastLoop: "a" }, ["a"]) === "");
+check("没有线头返回空", mn.pickOpenLoop(null, []) === "");
+check("记录 lastLoop", mn.markNudged(mn.emptyNudgeState(), now, "接口没改完").lastLoop === "接口没改完");
+check("提示块接受纯文本候选", mn.nudgeBlock({ content: "接口还没改完" }).includes("接口还没改完"));
+
 // ---------- 提示文本 ----------
 check("没有候选不输出", mn.nudgeBlock(null) === "");
 const blk = mn.nudgeBlock(pick);

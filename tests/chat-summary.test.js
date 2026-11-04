@@ -65,6 +65,20 @@ check("解析代码块包裹", !!fenced && !fenced.text.includes("```"));
 const longOut = cs.parseSummaryResponse("啊".repeat(900), "", 10, now);
 check("超长输出被截断", !!longOut && longOut.text.length <= 601);
 
+// ---------- 悬而未决 ----------
+const withLoops = cs.parseSummaryResponse(
+  "他在改一个后端接口，顺便问了下论文的事。\n悬而未决：接口还没改完；等面试结果；答应了周末帮朋友搬家",
+  "",
+  140,
+  now,
+);
+check("抠出悬而未决", !!withLoops && withLoops.openLoops.length === 3);
+check("悬而未决从正文剥离", !!withLoops && !withLoops.text.includes("悬而未决"));
+check("悬而未决内容正确", !!withLoops && withLoops.openLoops[0] === "接口还没改完");
+check("写「无」时为空", cs.parseSummaryResponse("聊了会儿天，没什么特别的。\n悬而未决：无", "", 10, now).openLoops.length === 0);
+check("没有这一行也不炸", cs.parseSummaryResponse("聊了会儿天，没什么特别的。", "", 10, now).openLoops.length === 0);
+check("存档归一保留 openLoops", cs.normalizeChatSummary({ text: "x", openLoops: ["a", "", 3, "b"] }).openLoops.join() === "a,b");
+
 // ---------- 注入块 ----------
 check("空摘要不注入", cs.summaryBlock(cs.emptyChatSummary()) === "");
 check("null 不炸", cs.summaryBlock(null) === "");
