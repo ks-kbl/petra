@@ -426,9 +426,14 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
 </div>
 <div class="toasts" id="toasts"></div>
 
+<script src="/chatlog-core.cjs"></script>
 <script>
 (() => {
   "use strict";
+
+  // 聊天记录页的纯逻辑（日期归属 / 清洗 / 搜索分段 / 导出）抽在 chatlog-core.cjs 里，
+  // 由 Rust 用 include_str! 内嵌并通过 /chatlog-core.cjs 提供，node 测试加载同一份。
+  const CL = window.PetraChatLog || null;
 
   // ---------- 鉴权 ----------
   // token 由 Rust 拼在 URL 片段里（#t=…）。片段不会发给服务端，也不会进浏览历史里的查询串。
@@ -1262,26 +1267,16 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   /**
    * 聊天记录：日期选择框 + 大号只读视图。
    *
-   * 数据直接来自本地 chat-history.json（经 /api/chatlog 只读转发），
-   * 按每条的 ts 字段分到自然日。升级前的旧消息没有 ts，单独归到「更早」。
+   * 数据来自本地 chat-history/YYYY-MM-DD.json（经 /api/chatlog 合并转发），
+   * 日期归属、消息清洗、搜索分段、导出这些纯逻辑都在 chatlog-core.cjs 里（有单测）。
    */
   function chatLogCard() {
     const card = el("div", "card wide");
     card.appendChild(el("h2", null, "聊天记录"));
-    card.appendChild(el("p", "cd", "按天回看最近 30 天的对话。只读本地 chat-history.json，不上传、不改动。"));
+    card.appendChild(el("p", "cd", "按天回看最近 30 天的对话。只读本地文件，不上传、不改动。"));
 
-    const pad2 = (n) => String(n).padStart(2, "0");
-    const dayKey = (ts) => {
-      const d = new Date(ts);
-      return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-    };
-    const todayKey = dayKey(Date.now());
-    const minKey = dayKey(Date.now() - 29 * 86400000);
-    const WEEK = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
-    const weekOf = (key) => {
-      const d = new Date(key + "T00:00:00");
-      return Number.isFinite(d.getTime()) ? WEEK[d.getDay()] : "";
-    };
+    const todayKey = CL.dayKey(Date.now());
+    const minKey = CL.dayKey(Date.now() - 29 * 86400000);
 
     // ---- 工具栏 ----
     const bar = el("div", "chatlog-bar");
@@ -1320,49 +1315,18 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     let current = todayKey;
     let query = "";
 
-    const stripReminder = (text) =>
-      String(text || "")
-        .split(/\n/)
-        .filter((line) => !/^\[系统提醒/.test(line.trim()))
-        .join("\n")
-        .trim();
-
-    const splitTrans = (raw) => {
-      const m = /-{3,}\n?/.exec(raw);
-      if (!m) return { main: raw, trans: "" };
-      return { main: raw.slice(0, m.index).trim(), trans: raw.slice(m.index + m[0].length).trim() };
-    };
-    const timeText = (ts) => {
-      if (!ts) return "";
-      const d = new Date(ts);
-      return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-    };
-    const isChat = (m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim();
-    const isTool = (m) => m.role === "tool" && typeof m.content === "string" && m.content.trim();
-
-    /** 把命中片段包成 <mark>（全程 textContent，不拼 HTML） */
+    /** 命中片段包成 <mark>；全程 textContent，不拼 HTML */
     function appendHighlighted(node, text, q) {
-      if (!q) {
-        node.textContent = text;
-        return;
+      const segs = CL.highlightSegments(text, q);
+      for (const seg of segs) {
+        if (seg.hit) {
+          const mark = document.createElement("mark");
+          mark.textContent = seg.text;
+          node.appendChild(mark);
+        } else {
+          node.appendChild(document.createTextNode(seg.text));
+        }
       }
-      const lower = text.toLowerCase();
-      const needle = q.toLowerCase();
-      let i = 0;
-      let idx = lower.indexOf(needle, i);
-      if (idx < 0) {
-        node.textContent = text;
-        return;
-      }
-      while (idx >= 0) {
-        if (idx > i) node.appendChild(document.createTextNode(text.slice(i, idx)));
-        const mark = document.createElement("mark");
-        mark.textContent = text.slice(idx, idx + needle.length);
-        node.appendChild(mark);
-        i = idx + needle.length;
-        idx = lower.indexOf(needle, i);
-      }
-      if (i < text.length) node.appendChild(document.createTextNode(text.slice(i)));
     }
 
     function bubbleFor(m) {
@@ -1370,18 +1334,19 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       const row = el("div", "cm" + (me ? " me" : ""));
       const avatar = el("div", "avatar", me ? "🧑" : "🐾");
       const wrap = el("div", "cw");
-      const raw = stripReminder(m.content);
-      const { main, trans } = splitTrans(raw);
-      const greet = !me && main.startsWith("【问候】");
+      const raw = CL.stripReminder(m.content);
+      const { main, trans } = CL.splitTranslation(raw);
+      const greet = !me && CL.isGreeting(m);
       const body = el("div", "bubble");
       if (greet) body.appendChild(el("span", "badge-greet", "主动问候"));
-      appendHighlighted(body, greet ? main.replace(/^【问候】\s*/, "") : main, query);
+      appendHighlighted(body, main.replace(/^【问候】\s*/, ""), query);
       if (trans) {
         const t = el("div", "trans");
         appendHighlighted(t, trans, query);
         body.appendChild(t);
       }
-      const meta = el("div", "meta", `${me ? "你" : "Petra"}${timeText(m.ts) ? " · " + timeText(m.ts) : ""}`);
+      const t0 = CL.timeText(m.ts);
+      const meta = el("div", "meta", `${me ? "你" : "Petra"}${t0 ? " · " + t0 : ""}`);
       wrap.append(body, meta);
       row.append(avatar, wrap);
       return row;
@@ -1392,7 +1357,8 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       const box = document.createElement("details");
       box.className = "cm-tool";
       const sum = document.createElement("summary");
-      sum.textContent = `工具调用${timeText(m.ts) ? " · " + timeText(m.ts) : ""}`;
+      const t0 = CL.timeText(m.ts);
+      sum.textContent = `工具调用${t0 ? " · " + t0 : ""}`;
       box.appendChild(sum);
       const pre = el("div", "cm-tool-body");
       appendHighlighted(pre, String(m.content), query);
@@ -1400,54 +1366,40 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       return box;
     }
 
-    function dayMessages() {
-      const all = cache.messages || [];
-      const byDay = new Map();
-      let undated = 0;
-      for (const m of all) {
-        if (!isChat(m) && !isTool(m)) continue;
-        if (!m.ts || dayKey(m.ts) < minKey) {
-          undated++;
-          continue;
-        }
-        const k = dayKey(m.ts);
-        if (!byDay.has(k)) byDay.set(k, []);
-        byDay.get(k).push(m);
+    function renderRows(list) {
+      viewer.innerHTML = "";
+      if (!list.length) {
+        const empty = el("div", "chatlog-empty");
+        empty.appendChild(el("div", "ce-ico", query ? "🔍" : "🗒️"));
+        empty.appendChild(el("div", null, query
+          ? `没有匹配「${query}」的消息`
+          : (current === todayKey ? "今天还没有聊天记录" : `${current} 没有聊天记录`)));
+        empty.appendChild(el("div", "ce-sub", query ? "换个关键词，或清空搜索框" : "换一个日期，或点上面的日期标签试试"));
+        viewer.appendChild(empty);
+        return;
       }
-      return { byDay, undated };
+      list.forEach((m) => viewer.appendChild(CL.isTool(m) ? toolRow(m) : bubbleFor(m)));
+      viewer.scrollTop = viewer.scrollHeight;
     }
 
     function render() {
-      const { byDay, undated } = dayMessages();
+      const { byDay, undated } = CL.groupByDay(cache.messages || [], minKey, todayKey);
 
       chips.innerHTML = "";
-      const days = [...byDay.keys()].filter((k) => k >= minKey && k <= todayKey).sort().reverse();
+      const days = [...byDay.keys()].sort().reverse();
       if (days.length > 1) {
         days.forEach((k) => {
-          const n = byDay.get(k).filter(isChat).length;
+          const n = byDay.get(k).filter(CL.isChat).length;
           const c = el("button", "chatlog-chip" + (k === current ? " on" : ""), `${k.slice(5)} · ${n}`);
           c.onclick = () => { current = k; dateInput.value = k; render(); };
           chips.appendChild(c);
         });
       }
 
-      const all = byDay.get(current) || [];
-      const list = query
-        ? all.filter((m) => String(m.content).toLowerCase().includes(query.toLowerCase()))
-        : all;
-      viewer.innerHTML = "";
-      if (!list.length) {
-        const empty = el("div", "chatlog-empty");
-        empty.appendChild(el("div", "ce-ico", query ? "🔍" : "🗒️"));
-        empty.appendChild(el("div", null, query ? `没有匹配「${query}」的消息` : (current === todayKey ? "今天还没有聊天记录" : `${current} 没有聊天记录`)));
-        empty.appendChild(el("div", "ce-sub", query ? "换个关键词，或清空搜索框" : (days.length ? "换一个日期，或点上面的日期标签试试" : "聊两句之后这里就会有内容")));
-        viewer.appendChild(empty);
-      } else {
-        list.forEach((m) => viewer.appendChild(isTool(m) ? toolRow(m) : bubbleFor(m)));
-        viewer.scrollTop = viewer.scrollHeight;
-      }
-      const chatCount = list.filter(isChat).length;
-      count.textContent = `${current} ${weekOf(current)} · ${chatCount} 条${query ? "（已筛选）" : ""}`;
+      const list = CL.filterByQuery(byDay.get(current) || [], query);
+      renderRows(list);
+      const stats = CL.dayStats(list);
+      count.textContent = `${current} ${CL.weekOf(current)} · ${stats.chats} 条${query ? "（已筛选）" : ""}`;
       searchInfo.textContent = query ? `命中 ${list.length} 条` : "";
 
       oldBtn.hidden = undated === 0;
@@ -1458,42 +1410,29 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
 
     function showUndated() {
       const all = (cache.messages || []).filter(
-        (m) => (isChat(m) || isTool(m)) && (!m.ts || dayKey(m.ts) < minKey),
+        (m) => (CL.isChat(m) || CL.isTool(m)) && (!m.ts || CL.dayKey(m.ts) < minKey),
       );
-      const list = query ? all.filter((m) => String(m.content).toLowerCase().includes(query.toLowerCase())) : all;
+      const list = CL.filterByQuery(all, query);
       current = "undated";
       dateInput.value = "";
       chips.innerHTML = "";
-      viewer.innerHTML = "";
-      if (!list.length) {
-        viewer.appendChild(el("div", "chatlog-empty", query ? `没有匹配「${query}」的消息` : "没有更早的记录"));
-      } else {
-        list.forEach((m) => viewer.appendChild(isTool(m) ? toolRow(m) : bubbleFor(m)));
-        viewer.scrollTop = viewer.scrollHeight;
-      }
-      count.textContent = `更早 · ${list.filter(isChat).length} 条`;
+      renderRows(list);
+      count.textContent = `更早 · ${CL.dayStats(list).chats} 条`;
     }
 
-    /** 导出当天为 Markdown（不含工具调用噪音） */
     function exportDay() {
       if (current === "undated") {
-        showToastSafe("「更早」没有具体日期，先选一天再导出");
+        panelToast("「更早」没有具体日期，先选一天再导出");
         return;
       }
-      const { byDay } = dayMessages();
-      const list = (byDay.get(current) || []).filter(isChat);
-      if (!list.length) {
-        showToastSafe("这一天没有对话可以导出");
+      const { byDay } = CL.groupByDay(cache.messages || [], minKey, todayKey);
+      const list = byDay.get(current) || [];
+      if (!CL.dayStats(list).chats) {
+        panelToast("这一天没有对话可以导出");
         return;
       }
-      const lines = [`# Petra 聊天记录 · ${current} ${weekOf(current)}`, ""];
-      list.forEach((m) => {
-        const who = m.role === "user" ? "你" : "Petra";
-        const t = timeText(m.ts);
-        lines.push(`**${who}**${t ? ` · ${t}` : ""}`, "");
-        lines.push(stripReminder(m.content).replace(/^【问候】\s*/, ""), "");
-      });
-      const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+      const md = CL.buildMarkdown(list, `${current} ${CL.weekOf(current)}`);
+      const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
       a.download = `petra-chat-${current}.md`;
@@ -1503,8 +1442,8 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     }
 
-    function showToastSafe(msg) {
-      // 面板有 toast 就用面板的，没有就退回 alert（不影响主流程）
+    /** 面板自己的 toast（找不到就退回 alert） */
+    function panelToast(msg) {
       try {
         if (typeof toast === "function") return toast(msg);
       } catch (_) {}
@@ -1535,7 +1474,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       render();
     };
     todayBtn.onclick = () => { current = todayKey; dateInput.value = todayKey; render(); };
-    yestBtn.onclick = () => { current = dayKey(Date.now() - 86400000); dateInput.value = current; render(); };
+    yestBtn.onclick = () => { current = CL.dayKey(Date.now() - 86400000); dateInput.value = current; render(); };
     oldBtn.onclick = () => showUndated();
     exportBtn.onclick = () => exportDay();
     refreshBtn.onclick = () => {
