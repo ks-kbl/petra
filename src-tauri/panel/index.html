@@ -89,7 +89,15 @@ body::after{
 .theme-btn:hover{background:var(--brand-soft)}
 
 /* ===================== 灵动岛导航 ===================== */
-.navbar{position:sticky; top:61px; z-index:29; padding:14px 0 10px; display:flex; justify-content:center; min-width:0}
+/* 导航条压在内容之上：必须有不透明底色，否则页面滚动时聊天气泡会从按钮缝隙里透出来 */
+.navbar{
+  position:sticky; top:61px; z-index:29; padding:14px 0 10px;
+  display:flex; justify-content:center; min-width:0;
+  background:linear-gradient(180deg, #f4f1ff 0%, #f4f1ff 78%, rgba(244,241,255,0) 100%);
+}
+html[data-theme="dark"] .navbar{
+  background:linear-gradient(180deg, #14121f 0%, #14121f 78%, rgba(20,18,31,0) 100%);
+}
 .island{
   position:relative; display:flex; align-items:center; gap:2px; padding:5px; border-radius:999px;
   border:1px solid var(--line); background:color-mix(in srgb, var(--card-strong) 84%, transparent);
@@ -156,7 +164,10 @@ body::after{
 .chatlog-chip:hover{border-color:var(--line-strong); color:var(--txt)}
 .chatlog-chip.on{border-color:var(--brand); color:var(--brand); background:var(--brand-soft)}
 .chatlog-view{
-  height:min(68vh, 720px); overflow-y:auto; padding:20px 22px;
+  /* 一屏放得下：顶栏+导航+标题+工具条+提示条大约占 400px，剩下的全给消息区。
+     以前固定 68vh，窗口一矮整页就得滚，聊天内容会滑到导航条底下（被截一半很难看）。 */
+  height:clamp(280px, calc(100vh - 450px), 740px);
+  overflow-y:auto; padding:20px 22px;
   border-radius:14px; border:1px solid var(--line);
   background:linear-gradient(180deg, var(--card-strong), var(--card));
   display:flex; flex-direction:column; gap:14px;
@@ -192,7 +203,8 @@ body::after{
 .chatlog-empty{padding:52px 10px; text-align:center; color:var(--txt2); font-size:13.5px}
 .chatlog-empty .ce-ico{font-size:30px; margin-bottom:8px; opacity:.85}
 .chatlog-empty .ce-sub{margin-top:6px; font-size:12.5px; color:var(--txt3)}
-.chatlog-tip{margin-top:10px; font-size:12px; color:var(--txt3)}
+.chatlog-tip{margin:0 0 10px; font-size:12px; color:var(--txt3)}
+.chatlog-chip-old{border-style:dashed}
 .chatlog-tools{display:flex; align-items:center; gap:10px; margin-bottom:10px}
 .chatlog-search{
   flex:1 1 320px; max-width:520px; padding:8px 12px; border-radius:10px;
@@ -357,6 +369,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   .navbar{justify-content:flex-start; overflow-x:auto; scrollbar-width:none}
   .navbar::-webkit-scrollbar{display:none}
   .island{flex:0 0 auto}
+}
+@media (max-height: 780px){
+  .chatlog-view{height:clamp(260px, calc(100vh - 380px), 520px)}
 }
 @media (max-width: 640px){
   .wrap{padding:0 14px 100px}
@@ -1309,7 +1324,8 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     const chips = el("div", "chatlog-chips");
     const viewer = el("div", "chatlog-view");
     const tip = el("div", "chatlog-tip");
-    card.append(bar, tools, chips, viewer, tip);
+    // 提示条放在消息区上方：它解释「为什么会有一条更早的记录」，藏在最下面等于没有
+    card.append(bar, tools, chips, tip, viewer);
 
     const cache = { messages: null };
     let current = todayKey;
@@ -1385,15 +1401,35 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     function render() {
       const { byDay, undated } = CL.groupByDay(cache.messages || [], minKey, todayKey);
 
+      // 日期标签：每个有记录的日子一个，最后一个「更早」兜住 30 天前的老数据
       chips.innerHTML = "";
       const days = [...byDay.keys()].sort().reverse();
-      if (days.length > 1) {
-        days.forEach((k) => {
-          const n = byDay.get(k).filter(CL.isChat).length;
-          const c = el("button", "chatlog-chip" + (k === current ? " on" : ""), `${k.slice(5)} · ${n}`);
-          c.onclick = () => { current = k; dateInput.value = k; render(); };
-          chips.appendChild(c);
-        });
+      days.forEach((k) => {
+        const n = byDay.get(k).filter(CL.isChat).length;
+        const c = el("button", "chatlog-chip" + (k === current ? " on" : ""), `${k.slice(5)} · ${n}`);
+        c.onclick = () => { current = k; dateInput.value = k; render(); };
+        chips.appendChild(c);
+      });
+      if (undated > 0) {
+        const c = el("button", "chatlog-chip chatlog-chip-old" + (current === "undated" ? " on" : ""), `更早 · ${undated}`);
+        c.onclick = () => showUndated();
+        chips.appendChild(c);
+      }
+
+      oldBtn.hidden = undated === 0;
+      tip.textContent = undated
+        ? `另有 ${undated} 条更早的记录（30 天以前，或升级前没有时间戳），点「更早 · ${undated}」查看。`
+        : "记录按消息时间归到自然日，最多显示最近 30 天；清空对话后这里也会一起清空。";
+
+      if (current === "undated") {
+        const all = (cache.messages || []).filter(
+          (m) => (CL.isChat(m) || CL.isTool(m)) && (!m.ts || CL.dayKey(m.ts) < minKey),
+        );
+        const list = CL.filterByQuery(all, query);
+        renderRows(list);
+        count.textContent = `更早 · ${CL.dayStats(list).chats} 条${query ? "（已筛选）" : ""}`;
+        searchInfo.textContent = query ? `命中 ${list.length} 条` : "";
+        return;
       }
 
       const list = CL.filterByQuery(byDay.get(current) || [], query);
@@ -1401,23 +1437,12 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       const stats = CL.dayStats(list);
       count.textContent = `${current} ${CL.weekOf(current)} · ${stats.chats} 条${query ? "（已筛选）" : ""}`;
       searchInfo.textContent = query ? `命中 ${list.length} 条` : "";
-
-      oldBtn.hidden = undated === 0;
-      tip.textContent = undated
-        ? `另有 ${undated} 条更早的记录（30 天以前，或升级前没有时间戳），点「更早的记录」查看。`
-        : "记录按消息时间归到自然日，最多显示最近 30 天；清空对话后这里也会一起清空。";
     }
 
     function showUndated() {
-      const all = (cache.messages || []).filter(
-        (m) => (CL.isChat(m) || CL.isTool(m)) && (!m.ts || CL.dayKey(m.ts) < minKey),
-      );
-      const list = CL.filterByQuery(all, query);
       current = "undated";
       dateInput.value = "";
-      chips.innerHTML = "";
-      renderRows(list);
-      count.textContent = `更早 · ${CL.dayStats(list).chats} 条`;
+      render();
     }
 
     function exportDay() {
