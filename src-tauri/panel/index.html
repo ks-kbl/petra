@@ -276,6 +276,8 @@ input[type=text],input[type=number],select,textarea{
 input[type=text]{width:min(220px, 46vw)}
 input[type=number]{width:min(96px, 30vw)}
 textarea{width:100%; min-height:120px; resize:vertical; line-height:1.6}
+/* 自动长高的多行框：高度由 JS 按内容算，别让 min-height 把短内容也撑成一大块 */
+textarea.ta-auto{min-height:0; overflow-y:auto}
 input:focus,select:focus,textarea:focus{border-color:var(--brand); box-shadow:0 0 0 3px var(--brand-soft)}
 .unit{font-size:12px; color:var(--txt3)}
 .range{display:flex; align-items:center; gap:10px}
@@ -671,9 +673,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
         {
           title: "它是谁", desc: "它的身份",
           fields: [
-            { path: "assistant.personaFields.name", label: "名字 / 昵称", type: "text", placeholder: "如：小满" },
-            { path: "assistant.personaFields.age", label: "年龄", type: "text", placeholder: "如：看着十七八岁，不报岁数" },
-            { path: "assistant.personaFields.identity", label: "身份 / 职业", type: "text", placeholder: "如：住在你桌面上的小女仆，提醒你喝水、催你早睡" },
+            { path: "assistant.personaFields.name", label: "名字 / 昵称", type: "textarea", rows: 2, placeholder: "如：小满" },
+            { path: "assistant.personaFields.age", label: "年龄", type: "textarea", rows: 2, placeholder: "如：看着十七八岁，不报岁数" },
+            { path: "assistant.personaFields.identity", label: "身份 / 职业", type: "textarea", rows: 2, placeholder: "如：住在你桌面上的小女仆，提醒你喝水、催你早睡" },
             { path: "assistant.personaFields.world", label: "时代 / 世界观", type: "textarea", rows: 4, placeholder: "如：你这台电脑的屏幕，她住右下角的小窗里，窗内是她的房间" },
             { path: "assistant.personaFields.desire", label: "核心欲望", type: "textarea", rows: 3, placeholder: "如：想被你注意到，也想真的帮上忙，不只是卖萌" },
           ],
@@ -683,8 +685,8 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
           fields: [
             { path: "assistant.personaFields.traits", label: "性格关键词", type: "textarea", rows: 4, placeholder: "如：安静、细心、嘴硬心软、偶尔犯困、被夸会装作没听见" },
             { path: "assistant.personaFields.speech", label: "说话方式", type: "textarea", rows: 7, placeholder: "如：短句为主，像打字不像念稿；默认 5~25 字；少用感叹号" },
-            { path: "assistant.personaFields.catchphrase", label: "口头禅", type: "text", placeholder: "如：嗯…我在 / 该喝水了哦 / 又要熬夜？" },
-            { path: "assistant.personaFields.emoji", label: "喜欢用的表情 / 动作", type: "text", placeholder: "如：歪头、揉眼睛（最多一个）" },
+            { path: "assistant.personaFields.catchphrase", label: "口头禅", type: "textarea", rows: 3, placeholder: "如：嗯…我在 / 该喝水了哦 / 又要熬夜？" },
+            { path: "assistant.personaFields.emoji", label: "喜欢用的表情 / 动作", type: "textarea", rows: 3, placeholder: "如：歪头、揉眼睛（最多一个）" },
           ],
         },
         {
@@ -1197,7 +1199,15 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       const ta = document.createElement("textarea");
       ta.rows = spec.rows || 5;
       ta.value = cur ?? ""; ta.placeholder = spec.placeholder || "";
-      ta.oninput = () => commit(spec.path, ta.value, 600);
+      // 自动长高：人设字段经常写很长（比如一串口头禅），固定高度只能看到一两行，
+      // 用户根本没法通读自己写了什么。这里按内容撑开，超过 260px 才内部滚动。
+      ta.classList.add("ta-auto");
+      const grow = () => {
+        ta.style.height = "auto";
+        ta.style.height = `${Math.min(260, Math.max(ta.scrollHeight, (spec.rows || 5) * 22))}px`;
+      };
+      ta.oninput = () => { commit(spec.path, ta.value, 600); grow(); };
+      requestAnimationFrame(grow);
       row.innerHTML = "";
       if (spec.label) row.appendChild(el("div", "rlabel", spec.label)).style.marginBottom = "6px";
       row.style.display = "block";
