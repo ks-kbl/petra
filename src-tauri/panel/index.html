@@ -634,6 +634,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
           ],
         },
         { title: "预设", desc: "", type: "presets" },
+        { title: "主动问候调度", desc: "", type: "greetstat" },
         { title: "对话记录", desc: "", type: "chat" },
         {
           title: "人设与语言", desc: "人设将拼进每轮系统提示",
@@ -1520,6 +1521,41 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     return card;
   }
 
+  /**
+   * 主动问候调度（只读）：下一次什么时候问候、定时器有没有装上。
+   * 排查"设了 1 分钟却一直不来"时，先看这里的数值对不对。
+   */
+  function greetStatNode() {
+    const card = el("div", "card");
+    card.appendChild(el("h2", null, "主动问候调度"));
+    card.appendChild(el("p", "cd", "只读：下一次什么时候问候。排查「设了 N 分钟却一直不来」先看这里。"));
+    const wrap = el("div", "row");
+    const t = el("div", "rtext");
+    t.appendChild(el("div", "rlabel", "下次问候"));
+    const g = (state.meta && state.meta.greeting) || null;
+    let desc = "还没收到运行状态";
+    if (g) {
+      const fmt = (ts) => {
+        const d = new Date(ts);
+        return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+      };
+      const remain = Math.max(0, g.nextAt - Date.now());
+      const mins = Math.floor(remain / 60000);
+      const secs = Math.floor((remain % 60000) / 1000);
+      const parts = [];
+      parts.push(g.enabled ? "小助手已开启" : "小助手已关闭");
+      if (g.idleMode) parts.push("待机模式中（不打扰）");
+      parts.push(`间隔 ${g.intervalMinutes} 分钟`);
+      if (g.lastAt) parts.push(`上次 ${fmt(g.lastAt)}`);
+      parts.push(`定时器${g.timerArmed ? "已装" : "未装"}`);
+      desc = `${fmt(g.nextAt)}（还有 ${mins} 分 ${secs} 秒） · ${parts.join(" · ")}`;
+    }
+    t.appendChild(el("div", "rdesc", desc));
+    wrap.appendChild(t);
+    card.appendChild(wrap);
+    return card;
+  }
+
   /** 对话记录：具体内容已经搬到独立的「聊天记录」页，这里只留指路和清空 */
   function chatCard() {
     const card = el("div", "card");
@@ -2123,6 +2159,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (cardSpec.type === "presets") return grid.appendChild(presetsCard());
       if (cardSpec.type === "chat") return grid.appendChild(chatCard());
       if (cardSpec.type === "chatlog") return grid.appendChild(chatLogCard());
+      if (cardSpec.type === "greetstat") return grid.appendChild(greetStatNode());
       if (cardSpec.type === "card") return grid.appendChild(cardCard());
       if (cardSpec.type === "diary") return grid.appendChild(diaryCard());
       if (cardSpec.type === "actionplay") return grid.appendChild(actionPlayCard());

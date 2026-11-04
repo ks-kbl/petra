@@ -11,11 +11,16 @@
  * - `hasGreetingIntervalElapsed()` 统一判断是否真的到点。
  */
 
-export const GREET_INTERVAL_MIN_MINUTES = 5;
-export const GREET_INTERVAL_MAX_MINUTES = 120;
+/**
+ * 允许 1 分钟起：原来下限是 5，而控制面板的输入框写的是 `min: 1` ——
+ * 用户填 1 实际跑的是 5，界面上却显示 1，看起来就是"设了 1 分钟却一直不来"。
+ * 现在两端对齐：填多少就跑多少（1~1440）。
+ */
+export const GREET_INTERVAL_MIN_MINUTES = 1;
+export const GREET_INTERVAL_MAX_MINUTES = 1440;
 export const GREET_INTERVAL_DEFAULT_MINUTES = 20;
 
-/** 把用户输入的分钟数钳制到产品允许的 5~120 分钟；非法值回落到默认 20 */
+/** 把用户输入的分钟数钳制到允许的 1~1440 分钟；非法值回落到默认 20 */
 export function clampGreetInterval(value: unknown, fallback = GREET_INTERVAL_DEFAULT_MINUTES): number {
   const n = typeof value === "number" ? value : parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(n)) return fallback;

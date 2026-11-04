@@ -1283,16 +1283,27 @@ function scheduleNextGreeting(): void {
 }
 
 /** 到点后的主动问候：待机/离开/关掉小助手时先不打扰，延后一分钟再看 */
+/** 到点但因为"用户正在聊天/待机"等原因没发出去时，隔一会儿再看，而不是重置计时 */
+function retryGreetingLater(dueAt: number, ms = 60 * 1000): void {
+  if (greetTimer !== null) clearTimeout(greetTimer);
+  greetTimer = window.setTimeout(() => {
+    greetTimer = null;
+    void fireScheduledGreeting(dueAt);
+  }, Math.max(5_000, ms));
+}
+
 async function fireScheduledGreeting(dueAt: number): Promise<void> {
-  if (!settings.assistant.enabled || settings.idleMode) {
-    scheduleNextGreeting();
+  if (!settings.assistant.enabled) return;
+  // 待机模式（缩到任务栏睡觉）期间不打扰：隔一分钟再看，别每秒空转
+  if (settings.idleMode) {
+    retryGreetingLater(dueAt);
     return;
   }
   let idleSec = 0;
   try { idleSec = await invoke<number>("get_idle_seconds"); } catch {}
   if (idleSec > 300) {
     // 用户离开了：不打扰，回来之后由 60 秒 tick 的"回归问候"或下一个到期点接手
-    greetTimer = window.setTimeout(() => void fireScheduledGreeting(dueAt), 60 * 1000);
+    retryGreetingLater(dueAt);
     return;
   }
   // 期间可能已经被别的路径问候过（回归问候），到点就别重复
@@ -1301,8 +1312,16 @@ async function fireScheduledGreeting(dueAt: number): Promise<void> {
     return;
   }
   const sent = await triggerProactive();
+  if (!sent) {
+    // **没真的发出去就不要重置锚点**。
+    // 以前这里无条件 markGreeted：用户在聊天（或对话面板开着）时每次都会被取消，
+    // 但锚点照样往前推一整个间隔 —— 表现就是"第一次之后就再也不问候了"。
+    // 现在只延后 60 秒再看，等用户空下来立刻补上。
+    retryGreetingLater(dueAt);
+    return;
+  }
   markGreeted(Date.now());
-  if (sent) trackEvent({ type: "greeting", summary: "主动问候了用户" });
+  trackEvent({ type: "greeting", summary: "主动问候了用户" });
   scheduleNextGreeting();
 }
 
@@ -3453,6 +3472,16 @@ function schedulePanelSync(): void {
 function buildPanelMeta() {
   return {
     version: appVersion,
+    // 问候调度只读快照：控制面板用它显示"下一次什么时候问候"，
+    // 排查"设了 N 分钟却一直不来"时不用再等或翻 localStorage
+    greeting: {
+      enabled: !!settings.assistant.enabled,
+      idleMode: !!settings.idleMode,
+      intervalMinutes: clampGreetInterval(settings.assistant.greetInterval),
+      lastAt: lastGreetAt,
+      nextAt: nextGreetingDueAt(lastGreetAt, settings.assistant.greetInterval, Date.now(), 0),
+      timerArmed: greetTimer !== null,
+    },
     platform: PLATFORM === "win" ? "Windows" : PLATFORM === "mac" ? "macOS" : "Linux",
     model: currentModel.name || currentModel.type,
     providers: Object.entries(PROVIDERS).map(([id, p]) => ({ id, label: p.label, model: p.defaultModel })),
@@ -5768,6 +5797,8 @@ async function toggleAssistantSettings() {
       const previousGreetInterval = settings.assistant.greetInterval;
       const nextGreetInterval = clampGreetInterval(greetInput.value);
       settings.assistant.greetInterval = nextGreetInterval;
+      // 输入框回写钳制后的值：填了超出范围/非法的数字时，让用户看到真正生效的是多少
+      if (greetInput.value.trim() !== String(nextGreetInterval)) greetInput.value = String(nextGreetInterval);
       // 输入框空闲收起（秒，0 = 不自动收起；留空/非法值回落到默认 8）
       const idleVal = parseInt(idleInput.value, 10);
       settings.assistant.inputIdleHideSec = Number.isFinite(idleVal)
