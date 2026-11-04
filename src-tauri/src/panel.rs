@@ -26,6 +26,8 @@ use tauri::{AppHandle, Emitter, Manager};
 const PANEL_HTML: &str = include_str!("../panel/index.html");
 /// 聊天记录页的纯逻辑（浏览器与 node 测试共用，见 tests/chatlog-core.test.js）
 const CHATLOG_CORE: &str = include_str!("../panel/chatlog-core.cjs");
+/// 本次编译时间（build.rs 注入），页脚显示 —— 用来确认"跑的是不是新构建"
+const PANEL_BUILD: &str = env!("PANEL_BUILD_STAMP");
 
 /// 首选端口：固定好记，用户还能收藏；被占用时退回系统分配
 const PREFERRED_PORT: u16 = 47188;
@@ -475,10 +477,11 @@ fn handle_conn(mut stream: TcpStream, panel: &Panel) -> std::io::Result<()> {
 
     // 首页不校验 token（浏览器导航没法带自定义头）；它本身不含任何数据
     if path == "/" || path == "/index.html" {
-        return respond(&mut stream, 200, "text/html; charset=utf-8", PANEL_HTML.as_bytes(), true);
+        let html = PANEL_HTML.replace("__PANEL_BUILD__", PANEL_BUILD);
+        return respond(&mut stream, 200, "text/html; charset=utf-8", html.as_bytes(), true);
     }
     if path == "/chatlog-core.cjs" {
-        return respond(&mut stream, 200, "text/javascript; charset=utf-8", CHATLOG_CORE.as_bytes(), false);
+        return respond(&mut stream, 200, "text/javascript; charset=utf-8", CHATLOG_CORE.as_bytes(), true);
     }
     if path == "/favicon.ico" {
         return respond(&mut stream, 204, "text/plain", b"", false);

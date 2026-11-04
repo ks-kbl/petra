@@ -89,14 +89,18 @@ body::after{
 .theme-btn:hover{background:var(--brand-soft)}
 
 /* ===================== 灵动岛导航 ===================== */
-/* 导航条压在内容之上：必须有不透明底色，否则页面滚动时聊天气泡会从按钮缝隙里透出来 */
+/* 导航条压在内容之上：必须**整块不透明**。
+   之前只给内部胶囊加了底色，容器是透明的，页面一滚动聊天气泡就从按钮周围的缝里透出来
+   （用户截图里"消息被切一半"就是这个）；渐隐到透明的做法也会在底部留一条透光带。 */
 .navbar{
   position:sticky; top:61px; z-index:29; padding:14px 0 10px;
   display:flex; justify-content:center; min-width:0;
-  background:linear-gradient(180deg, #f4f1ff 0%, #f4f1ff 78%, rgba(244,241,255,0) 100%);
+  background:#f4f1ff;
+  box-shadow:0 10px 14px -12px rgba(24,20,48,.35);
 }
 html[data-theme="dark"] .navbar{
-  background:linear-gradient(180deg, #14121f 0%, #14121f 78%, rgba(20,18,31,0) 100%);
+  background:#14121f;
+  box-shadow:0 10px 14px -12px rgba(0,0,0,.9);
 }
 .island{
   position:relative; display:flex; align-items:center; gap:2px; padding:5px; border-radius:999px;
@@ -432,6 +436,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   <footer class="foot">
     <span>改动后立刻生效，无需手动保存和重启</span>
     <span id="footStat"></span>
+    <span id="buildStamp" style="margin-left:auto;opacity:.75">面板构建 __PANEL_BUILD__</span>
   </footer>
 </div>
 

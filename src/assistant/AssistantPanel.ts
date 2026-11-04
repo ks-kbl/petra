@@ -2077,17 +2077,20 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         pushHistory({ role: "tool", tool_call_id: tc.id, content: "搜索词是空的，请带上 query 再调用一次。" });
       } else {
         try {
-          const hits = await invoke<{ title: string; url: string; snippet: string }[]>("web_search", {
+          const hits = await invoke<{ title: string; url: string; snippet: string; engine?: string }[]>("web_search", {
             query,
             limit: 5,
           });
           const text = (hits || [])
             .map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}\n   ${h.snippet}`)
             .join("\n");
+          // 带上引擎名：既让用户知道信息从哪来，也能一眼看出多引擎兜底有没有生效
+          const engine = (hits || []).find((h) => h.engine)?.engine;
+          const from = engine ? `（来源：${engine}）` : "";
           pushHistory({
             role: "tool",
             tool_call_id: tc.id,
-            content: text ? `搜索「${query}」的结果：\n${text}` : `搜索「${query}」没有结果`,
+            content: text ? `搜索「${query}」的结果${from}：\n${text}` : `搜索「${query}」没有结果`,
           });
         } catch (e) {
           // 搜索失败要让模型知道，它可以换个关键词再试或直接说查不到，别让用户等成"卡住"

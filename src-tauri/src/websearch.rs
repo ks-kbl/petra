@@ -20,6 +20,9 @@ pub struct SearchHit {
     pub title: String,
     pub url: String,
     pub snippet: String,
+    /// 这条结果来自哪个引擎（DuckDuckGo / Bing / 百度）。前端会显示给用户看，
+    /// 也方便一眼判断"跑的是不是带多引擎兜底的新构建"。
+    pub engine: String,
 }
 
 const UA: &str =
@@ -126,9 +129,13 @@ fn search_blocking(query: &str, limit: Option<usize>) -> Result<Vec<SearchHit>, 
             _ => break,
         };
         match rx.recv_timeout(left) {
-            Ok((name, Ok(hits))) => {
+            Ok((name, Ok(mut hits))) => {
+                for h in hits.iter_mut() {
+                    if h.engine.is_empty() {
+                        h.engine = name.to_string();
+                    }
+                }
                 first = Some(hits);
-                let _ = name;
                 break;
             }
             Ok((name, Err(e))) => problems.push(format!("{name}：{e}")),
@@ -287,7 +294,7 @@ fn parse_ddg(html: &str, limit: usize) -> Vec<SearchHit> {
 
         let url = decode_ddg_href(&href);
         if !title.is_empty() && !url.is_empty() {
-            hits.push(SearchHit { title, url, snippet });
+            hits.push(SearchHit { title, url, snippet, engine: String::new() });
         }
     }
     hits
@@ -350,7 +357,7 @@ fn parse_bing(html: &str, limit: usize) -> Vec<SearchHit> {
             }
         }
         if !title.is_empty() && href.starts_with("http") {
-            hits.push(SearchHit { title, url: href, snippet });
+            hits.push(SearchHit { title, url: href, snippet, engine: String::new() });
         }
     }
     hits
@@ -398,7 +405,7 @@ fn parse_baidu(html: &str, limit: usize) -> Vec<SearchHit> {
             }
         }
         if !title.is_empty() && href.starts_with("http") {
-            hits.push(SearchHit { title, url: href, snippet });
+            hits.push(SearchHit { title, url: href, snippet, engine: String::new() });
         }
     }
     hits
@@ -648,6 +655,7 @@ mod tests {
             title: "t".into(),
             url: "https://x".into(),
             snippet: "s".into(),
+            engine: "Bing".into(),
         }];
         let key = cache_key(" 测试 ", 5);
         cache_put(key.clone(), &hits);
