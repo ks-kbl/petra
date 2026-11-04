@@ -138,6 +138,7 @@ import { mountHandAxisControls } from "./live2d/psd/HandAxisPicker";
 import { buildHourlyQuietMenuItems } from "./features/hourly/HourlyQuietRows";
 import { listModels, PROVIDERS, getUsageStats, resetUsageStats, chatStream, pickDefaultChatModel, probeChatConnection } from "./assistant/AssistantClient";
 import { clampGreetInterval, greetIntervalMs, greetingAnchorAfterReset, hasGreetingIntervalElapsed, nextGreetingDueAt } from "./assistant/greetingSchedule";
+import { BUILTIN_PERSONAS, findBuiltinPersona } from "./assistant/builtinPersonas";
 import { getApiKey, setApiKey, normalizeOpenAIBase, presetKeyScope, currentKeyScope } from "./assistant/apiKey";
 import { registerEmotionReactor, reactToTouch, getMoodDriverValue, emotionExpression, emotionToAction } from "./assistant/EmotionEngine";
 import { showEmotionPopup } from "./assistant/EmotionPopups";
@@ -3485,6 +3486,8 @@ function buildPanelMeta() {
     platform: PLATFORM === "win" ? "Windows" : PLATFORM === "mac" ? "macOS" : "Linux",
     model: currentModel.name || currentModel.type,
     providers: Object.entries(PROVIDERS).map(([id, p]) => ({ id, label: p.label, model: p.defaultModel })),
+    // 内置人设清单（只给面板渲染卡片用；正文留在 WebView 侧，点"套用"才写进设置）
+    personas: BUILTIN_PERSONAS.map((p) => ({ id: p.id, name: p.name, tagline: p.tagline })),
     languages: OUTPUT_LANGUAGE_OPTIONS,
     actions: flattenMenuActions(),
     ui: {
@@ -4149,6 +4152,31 @@ function runPanelAction(id: string, payload?: unknown): void {
   }
   if (id.startsWith("__data:")) {
     void handlePanelDataAction(id.slice(7), payload);
+    return;
+  }
+  // 一键套用内置人设：直接覆盖 personaFields / personaFree，再用 composePersona 重新拼
+  if (id.startsWith("__persona:")) {
+    const payloadId = (payload && typeof payload === "object" && "id" in payload)
+      ? String((payload as { id?: unknown }).id ?? "")
+      : "";
+    const pid = payloadId || id.slice("__persona:".length);
+    const builtin = findBuiltinPersona(pid);
+    if (!builtin) {
+      toast("没找到这个人设", "warn");
+      return;
+    }
+    settings.assistant.personaFields = { ...builtin.fields };
+    settings.assistant.personaFree = builtin.free;
+    // 称呼只在用户还没设过时才填：不悄悄改掉用户自己的叫法
+    if (!(settings.assistant.nickname ?? "").trim() && builtin.suggestedNickname) {
+      settings.assistant.nickname = builtin.suggestedNickname;
+    }
+    settings.assistant.persona = composePersona(settings.assistant);
+    // 标记"人设已经被用户主动设过"，避免下次启动又自动套默认人设
+    settings.assistant.personaInitialized = true;
+    saveSettings(settings);
+    schedulePanelSync();
+    toast(`已套用内置人设：${builtin.name}`);
     return;
   }
   // 预设（API 配置集合）：与旧设置窗口同一套数据模型，Key 各存 preset:<id> 槽位

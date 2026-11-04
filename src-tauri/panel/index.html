@@ -212,6 +212,14 @@ html[data-theme="dark"] .navbar{
 .chatlog-empty .ce-sub{margin-top:6px; font-size:12.5px; color:var(--txt3)}
 .chatlog-tip{margin:0 0 10px; font-size:12px; color:var(--txt3)}
 .chatlog-chip-old{border-style:dashed}
+.persona-grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(min(260px,100%), 1fr)); gap:12px; margin-top:6px}
+.persona-item{
+  border:1px solid var(--line); border-radius:14px; padding:14px 16px;
+  background:var(--card-strong); display:flex; flex-direction:column; gap:8px; min-width:0;
+}
+.persona-item .pi-name{font-size:14px; font-weight:600}
+.persona-item .pi-tag{font-size:12.5px; color:var(--txt2); line-height:1.6; flex:1}
+.persona-item .btn{align-self:flex-start}
 .chatlog-tools{display:flex; align-items:center; gap:10px; margin-bottom:10px}
 .chatlog-search{
   flex:1 1 320px; max-width:520px; padding:8px 12px; border-radius:10px;
@@ -659,6 +667,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       id: "persona", label: "人设", title: "人设 · 它是谁",
       desc: "决定它的说话发生，填得越具体人设越稳定。改动后立刻生效，右侧为最终提示词预览",
       cards: [
+        { title: "内置人设", desc: "", type: "personas" },
         {
           title: "它是谁", desc: "它的身份",
           fields: [
@@ -1521,6 +1530,33 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     return card;
   }
 
+  /** 内置人设：一键套用（会覆盖当前字段），也可以完全不用、自己在下面写 */
+  function personasCard() {
+    const card = el("div", "card wide");
+    card.appendChild(el("h2", null, "内置人设"));
+    card.appendChild(el("p", "cd", "点「用这个」会覆盖下面的所有人设字段；想自己写就跳过这块，直接在下面填表。"));
+    const list = (state.meta && state.meta.personas) || [];
+    if (!list.length) {
+      card.appendChild(el("div", "empty", "没有拿到内置人设列表"));
+      return card;
+    }
+    const grid = el("div", "persona-grid");
+    list.forEach((p) => {
+      const box = el("div", "persona-item");
+      box.appendChild(el("div", "pi-name", p.name || p.id));
+      box.appendChild(el("div", "pi-tag", p.tagline || ""));
+      const b = el("button", "btn btn-sm btn-primary", p.id === "blank" ? "清空人设" : "用这个");
+      b.onclick = () => {
+        if (p.id !== "blank" && !confirm(`套用「${p.name}」？会覆盖当前人设字段。`)) return;
+        runAction("__persona:" + p.id, { id: p.id }, "套用人设");
+      };
+      box.appendChild(b);
+      grid.appendChild(box);
+    });
+    card.appendChild(grid);
+    return card;
+  }
+
   /**
    * 主动问候调度（只读）：下一次什么时候问候、定时器有没有装上。
    * 排查"设了 1 分钟却一直不来"时，先看这里的数值对不对。
@@ -2160,6 +2196,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (cardSpec.type === "chat") return grid.appendChild(chatCard());
       if (cardSpec.type === "chatlog") return grid.appendChild(chatLogCard());
       if (cardSpec.type === "greetstat") return grid.appendChild(greetStatNode());
+      if (cardSpec.type === "personas") return grid.appendChild(personasCard());
       if (cardSpec.type === "card") return grid.appendChild(cardCard());
       if (cardSpec.type === "diary") return grid.appendChild(diaryCard());
       if (cardSpec.type === "actionplay") return grid.appendChild(actionPlayCard());
