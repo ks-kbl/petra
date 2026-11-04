@@ -32,7 +32,16 @@ import {
   parseProfileResponse,
   type UserProfile,
 } from "./userProfile";
-import { applyMemoryOps, parseMemoryOps, formatMemoryForExtractor, textSimilarity, type MemoryOp } from "./memoryOps";
+import { applyMemoryOps, parseMemoryOps, formatMemoryForExtractor } from "./memoryOps";
+import { rankMemories } from "./memoryRank";
+import {
+  recordMoodSample,
+  summarizeMood,
+  moodBlock,
+  normalizeMoodSamples,
+  type MoodSample,
+} from "./moodTrend";
+import { detectCorrection } from "./correction";
 import {
   emptyChatSummary,
   normalizeChatSummary,
@@ -68,6 +77,8 @@ const PROFILE_KEY = "live2d-pet-assistant-profile";
 const MEM_LIMIT = 200;
 /** 更早对话的滚动摘要：补窗口截断后的上下文，长聊不失忆 */
 const SUMMARY_KEY = "live2d-pet-assistant-chat-summary";
+/** 情绪趋势采样：每天一个点，最近 14 天（只进 prompt，不露界面） */
+const MOOD_SAMPLES_KEY = "petra-mood-samples";
 /** 主动问候话题记录：最近几次问候的 summary / 是否被回复，用于避免一天内重复话题 */
 const GREETING_LOG_KEY = "petra-greeting-log";
 
@@ -81,6 +92,9 @@ let userProfile: UserProfile = emptyProfile();
 let chatSummary: ChatSummary = emptyChatSummary();
 /** 上次后台提取记忆时的 history 长度：按"新增了多少条"触发，而不是按长度取余 */
 let lastExtractedAt = 0;
+/** 这一轮用户是不是在纠正我（"记错了/我没说过/别记这个"）→ 立刻跑一次提取 */
+let pendingCorrection = false;
+let moodSamples: MoodSample[] = [];
 let timer: number | null = null;
 let busy = false;
 /** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant / triggerProactive） */
@@ -288,6 +302,35 @@ function saveUserProfile() {
   } catch {
     /* 忽略 */
   }
+}
+
+function loadMoodSamples() {
+  try {
+    moodSamples = normalizeMoodSamples(JSON.parse(localStorage.getItem(MOOD_SAMPLES_KEY) || "[]"));
+  } catch {
+    moodSamples = [];
+  }
+}
+
+function saveMoodSamples() {
+  try {
+    localStorage.setItem(MOOD_SAMPLES_KEY, JSON.stringify(moodSamples.slice(-14)));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 每轮记一个情绪采样点（同一天取平均），供 moodBlock 判断"他这几天怎么样" */
+function sampleMoodNow() {
+  try {
+    moodSamples = recordMoodSample(moodSamples, getMood().happiness);
+    saveMoodSamples();
+  } catch { /* 忽略 */ }
+}
+
+/** 注入用的"关于主人"上下文：画像 + 最近情绪状态（都只进 system prompt） */
+function personaContextBlock(): string {
+  return [profileBlock(userProfile), moodBlock(summarizeMood(moodSamples))].filter(Boolean).join("\n\n");
 }
 
 function loadChatSummary() {
@@ -1076,6 +1119,7 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   loadMemory();
   loadUserProfile();
   loadChatSummary();
+  loadMoodSamples();
   // 素材够了就在后台重算一份画像（不阻塞打开面板；没配 Key 就跳过）
   void (async () => {
     try {
@@ -1387,6 +1431,9 @@ async function send(text: string) {
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑
   const langReminder = buildLanguageReminder(outLang ?? "");
   const userContent = langReminder ? `${text}\n${langReminder}` : text;
+  // 用户在纠正我（"记错了/我没说过/别记这个"）：记下来，这轮回复完立刻跑一次记忆提取，
+  // 不等攒够 6 条 —— 否则 AI 会带着错的记忆再聊好几轮。
+  if (detectCorrection(text)) pendingCorrection = true;
   // 消息真正发出去才算"回应了主动问候"（没回应则下一轮问候要换话题）
   markGreetingRepliedByUser();
   history.push({ role: "user", content: userContent });
@@ -1442,8 +1489,9 @@ async function send(text: string) {
         {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
           extraTools: pluginRuntime.getOpenAITools(),
-          // 画像只走 system prompt：模型知道"这是什么样的人"，但不会被告知"有一份档案"
-          profileText: profileBlock(userProfile),
+          // 画像 + 最近情绪只走 system prompt：模型知道"这是什么样的人、最近过得怎样"，
+          // 但不会被告知"有一份档案/记录"
+          profileText: personaContextBlock(),
           // 长聊之后补上被窗口切掉的旧对话，避免"聊到一半突然不认识你"
           historySummary: summaryBlock(chatSummary),
         },
@@ -1562,10 +1610,14 @@ async function send(text: string) {
     // P3 主动学习：每攒够 6 条新消息提取一次（后台运行，不阻塞 UI）。
     // 以前用 `history.length % 5 === 0`：tool 调用会让长度跳着涨，同一余数在长会话里反复命中，
     // 提取次数不可控；改成按"自上次以来新增条数"触发。
-    if (history.length - lastExtractedAt >= 6) {
+    const correcting = pendingCorrection;
+    pendingCorrection = false;
+    if (history.length - lastExtractedAt >= 6 || correcting) {
       lastExtractedAt = history.length;
-      void extractMemoriesFromChat(s, apiKey);
+      void extractMemoriesFromChat(s, apiKey, correcting);
     }
+    // 每轮记一个情绪采样（判断"他这几天状态怎么样"用）
+    sampleMoodNow();
     if (!getBubbleText(loading).trim()) setBubbleText(loading, "(空回复)");
     // 回复说完就淡出（用户要求：「两段话说完了气泡也没有消失」）。
     // 以前这里刻意不淡出，气泡就一直挂到下一轮、把桌宠挡个正着。
@@ -2062,7 +2114,12 @@ function extractKeywords(text: string): string[] {
   return [...new Set(keywords)].slice(0, 20);
 }
 
-/** 根据当前场景召回相关记忆（返回最重要的几条） */
+/**
+ * 根据当前场景召回相关记忆。
+ *
+ * 具体打分逻辑搬到了 memoryRank.ts（纯函数 + 单测）：BM25 + 近义扩展 + 2-gram 相似度，
+ * 解决"用户说加班到三点、 памяти里有熬夜却召不回"的问题。
+ */
 function recallRelevantMemories(context: {
   timeOfDay?: string;
   currentApp?: string;
@@ -2071,54 +2128,8 @@ function recallRelevantMemories(context: {
   userText?: string;
 }): MemoryEntry[] {
   if (memory.length === 0) return [];
-  
-  const now = Date.now();
-  const scored = memory.map(m => {
-    let score = 0;
-    // 重要度权重
-    score += (4 - m.importance) * 3;
-    // 最近使用过的加分
-    const daysSinceUsed = (now - m.lastUsedAt) / 86400000;
-    score += Math.max(0, 3 - daysSinceUsed * 0.1);
-    
-    // 场景相关性加分
-    const ctx = `${context.currentApp ?? ""} ${context.currentTitle ?? ""} ${context.timeOfDay ?? ""}`;
-    for (const kw of m.keywords) {
-      if (ctx.toLowerCase().includes(kw.toLowerCase())) {
-        score += 5;
-      }
-    }
-    // 与用户当前消息相关的记忆显著加分
-    const ut = (context.userText ?? "").toLowerCase();
-    if (ut) {
-      for (const kw of m.keywords) {
-        if (ut.includes(kw.toLowerCase())) {
-          score += 6;
-        }
-      }
-    }
-    // 时间相关记忆加分
-    if (m.category === "schedule" || m.category === "habit") {
-      if (context.timeOfDay) score += 2;
-    }
-    if (m.category === "identity") score += 1; // 身份记忆总是重要
-
-    // 换个说法也能命中：关键词是子串匹配，用户说"加班到三点"命中不了"熬夜"，
-    // 这里用 2-gram 相似度补一手（比关键词宽松，比全量注入收敛）
-    if (ut) {
-      const sim = textSimilarity(m.content, context.userText ?? "");
-      if (sim >= 0.3) score += 6 * Math.min(1, sim / 0.6);
-    }
-
-    return { entry: m, score };
-  });
-  
-  scored.sort((a, b) => b.score - a.score);
-  // 召回上限从 2 提到 4：2 条经常连"称呼 + 当前话题"都不够用；
-  // 仍卡分数阈值，宁缺毋滥，避免把无关旧事翻出来。
-  return scored.filter(s => s.score >= 5).slice(0, 4).map(s => s.entry);
+  return rankMemories(memory, context, { limit: 4, minScore: 5 }).map((r) => r.entry);
 }
-
 
 /**
  * 后台轻量调用（记忆提取 / 画像提炼）共用的端点解析。
@@ -2135,7 +2146,7 @@ function backgroundEndpoint(s: any): { base: string; model: string } | null {
 }
 
 /** P3 主动学习：从最近对话中提取用户信息，后台轻量调用 */
-async function extractMemoriesFromChat(s: any, apiKey: string) {
+async function extractMemoriesFromChat(s: any, apiKey: string, correcting = false) {
   // 满了先按"最琐碎 + 最久没用"淘汰，而不是从此停止学习（长期使用必然会撞上限）
   pruneMemory();
   const recentMsgs = history.slice(-12).filter(m => m.role === "user" || m.role === "assistant");
@@ -2158,7 +2169,10 @@ async function extractMemoriesFromChat(s: any, apiKey: string) {
         "2. 事实发生变化（换工作、搬家、宠物送人、项目结束）用 update 覆盖旧结论，不要两条并存。\n" +
         "3. category: identity/preference/habit/schedule/relationship/event/other；importance: 1=核心(称呼/身份/长期偏好) 2=重要 3=琐碎。\n" +
         "4. 只记用户本人的信息，不要把助理自己说的话当事实，也不要记这次的临时任务细节。\n" +
-        "5. 没有值得记的就输出 {\"ops\":[]}。只输出 JSON，不要解释。",
+        "5. 没有值得记的就输出 {\"ops\":[]}。只输出 JSON，不要解释。\n" +
+        (correcting
+          ? "6. 用户这一轮明确在纠正你或否认某件事：优先 update 或 delete 相关旧记忆，绝对不要新增一条与旧结论并存的记忆。"
+          : ""),
     },
     {
       role: "user",
@@ -2188,8 +2202,9 @@ async function extractMemoriesFromChat(s: any, apiKey: string) {
     if (!applied.changed) return;
     memory = applied.memory;
     saveMemory();
-    // 有新素材就（按阈值）重算画像：这一步才是"越聊越懂他"的来源
-    void synthesizeUserProfile(s, apiKey);
+    // 有新素材就（按阈值）重算画像：这一步才是"越聊越懂他"的来源。
+    // 用户刚纠正过就直接重算，别让画像带着旧结论再撑半天。
+    void synthesizeUserProfile(s, apiKey, correcting);
   } catch { /* 静默失败，不影响用户体验 */ }
 }
 
@@ -2385,7 +2400,7 @@ export async function triggerProactive(): Promise<boolean> {
       false, langInstruction, "",
       {
         ...(screenshot ? { screenImage: screenshot } : {}),
-        profileText: profileBlock(userProfile),
+        profileText: personaContextBlock(),
       },
     );
 
@@ -2506,6 +2521,7 @@ export async function triggerCardCommentary(card: { rarity: string; theme: strin
 loadMemory();
 loadUserProfile();
 loadChatSummary();
+loadMoodSamples();
 
 
 
