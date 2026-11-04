@@ -4,7 +4,7 @@
  * 锁住用户明确提出的产品要求：
  * - 在设置里改完间隔后，下一次问候要按**新间隔从改完这一刻**重新计时；
  * - 重新打开小助手也重新计时；
- * - 用户的输入被钳制在 5~120 分钟，非法值回落默认 20。
+ * - 用户的输入被钳制在 1~1440 分钟，非法值回落默认 20。
  *
  * 运行：npm run test:greeting
  */
@@ -21,8 +21,10 @@ const MIN = 60 * 1000;
 // ---- 间隔钳制 ----
 check("默认 20 分钟", gs.clampGreetInterval(undefined) === 20);
 check("非法输入回落 20", gs.clampGreetInterval("不是数字") === 20);
-check("低于 5 钳到 5", gs.clampGreetInterval(1) === 5);
-check("高于 120 钳到 120", gs.clampGreetInterval(999) === 120);
+check("1 分钟原样保留（控制面板 min=1，两端必须一致）", gs.clampGreetInterval(1) === 1);
+check("低于 1 钳到 1", gs.clampGreetInterval(0) === 1);
+check("负数钳到 1", gs.clampGreetInterval(-30) === 1);
+check("高于 1440 钳到 1440", gs.clampGreetInterval(9999) === 1440);
 check("字符串数字也认", gs.clampGreetInterval("30") === 30);
 check("小数四舍五入", gs.clampGreetInterval(30.6) === 31);
 check("分钟转毫秒", gs.greetIntervalMs(20) === 20 * MIN);

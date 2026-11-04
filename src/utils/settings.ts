@@ -1,3 +1,9 @@
+import {
+  DEFAULT_BUILTIN_PERSONA_ID,
+  findBuiltinPersona,
+  isPersonaBlank,
+} from "../assistant/builtinPersonas";
+
 const KEY = "live2d-pet-settings";
 
 export type ActivityLevel = "low" | "mid" | "high";
@@ -60,6 +66,12 @@ export interface AssistantPreset {
   model: string;
   /** 人设快照：存预设时一起存下来，切换回来时连人设一起还原（旧存档没有这两个字段） */
   personaFree?: string;
+  /**
+   * 是否已经"初始化过人设"。
+   * 首次启动会自动装上内置人设；用户之后主动清空（选「空白人设」）时，
+   * 这个标记保证下次启动不会被又塞回来。
+   */
+  personaInitialized?: boolean;
   personaFields?: PersonaFields;
 }
 
@@ -71,6 +83,11 @@ export interface AssistantSettings {
   persona: string;
   /** 用户自己写的自由人设（不参与结构化拼装，单独存） */
   personaFree: string;
+  /**
+   * 是否已经"初始化过人设"（首次启动自动装内置人设后置 true）。
+   * 用户之后主动清空（选「空白人设」）时，靠它保证下次启动不会被又塞回来。
+   */
+  personaInitialized?: boolean;
   /** 结构化人设字段 */
   personaFields: PersonaFields;
   customBaseUrl: string;
@@ -128,6 +145,10 @@ export interface Settings {
    * 以前是全局单值，在模型 A 上拖过滑条再切到 B，B 的绿框/点击区/气泡位置就全偏了。
    */
   boundsPaddings: Record<string, BoundsPadding>;
+  /** 点击区域圆角（按模型存，px）；0 = 直角，和绿框一样按模型独立 */
+  boundsCorners: Record<string, number>;
+  /** 旧/兜底圆角（按模型查不到时用它） */
+  boundsCorner: number;
   /** 旧版的全局边界松紧：只用于首次迁移，新代码请用 boundsPaddings */
   boundsPadding: BoundsPadding;
   passthrough: boolean;
@@ -219,6 +240,8 @@ const DEFAULTS: Settings = {
   weatherCity: "",
   weatherBubble: true,
   boundsPaddings: {},
+  boundsCorners: {},
+  boundsCorner: 0,
   boundsPadding: { left: 0, right: 0, top: 0, bottom: 0 },
   passthrough: false,
   allowAllShell: false,
@@ -359,6 +382,22 @@ export function loadSettings(): Settings {
       : [];
     currentFactor = ACTIVITY_FACTOR[s.activity] ?? ACTIVITY_FACTOR.mid;
     currentLevel = s.activity ?? DEFAULTS.activity;
+    // 首次启动 / 人设完全为空：默认装上内置「大肥鱼」。
+    // 用 isPersonaBlank 判断而不是把 DEFAULTS 改掉 —— 这样用户主动清空人设时仍然是空白。
+    if (!s.assistant.personaInitialized && isPersonaBlank(s.assistant)) {
+      const builtin = findBuiltinPersona(DEFAULT_BUILTIN_PERSONA_ID);
+      if (builtin) {
+        s.assistant.personaFields = { ...builtin.fields };
+        s.assistant.personaFree = builtin.free;
+        if (!(s.assistant.nickname ?? "").trim()) s.assistant.nickname = builtin.suggestedNickname;
+        s.assistant.persona = composePersona(s.assistant);
+      }
+      // 落盘标记：用户以后主动清空人设（选「空白人设」）时，不会再被自动塞回来
+      s.assistant.personaInitialized = true;
+      try {
+        localStorage.setItem(KEY, JSON.stringify(s));
+      } catch { /* 忽略 */ }
+    }
     return s;
   } catch {
     return { ...DEFAULTS };

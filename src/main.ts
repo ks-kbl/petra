@@ -138,6 +138,7 @@ import { mountHandAxisControls } from "./live2d/psd/HandAxisPicker";
 import { buildHourlyQuietMenuItems } from "./features/hourly/HourlyQuietRows";
 import { listModels, PROVIDERS, getUsageStats, resetUsageStats, chatStream, pickDefaultChatModel, probeChatConnection } from "./assistant/AssistantClient";
 import { clampGreetInterval, greetIntervalMs, greetingAnchorAfterReset, hasGreetingIntervalElapsed, nextGreetingDueAt } from "./assistant/greetingSchedule";
+import { BUILTIN_PERSONAS, findBuiltinPersona } from "./assistant/builtinPersonas";
 import { getApiKey, setApiKey, normalizeOpenAIBase, presetKeyScope, currentKeyScope } from "./assistant/apiKey";
 import { registerEmotionReactor, reactToTouch, getMoodDriverValue, emotionExpression, emotionToAction } from "./assistant/EmotionEngine";
 import { showEmotionPopup } from "./assistant/EmotionPopups";
@@ -154,6 +155,7 @@ import {
   regionFingerprint,
   type LogicalRect,
   type PhysicalInteractiveRegion,
+  pointInRoundedRect,
 } from "./input/regions";
 import { appNameFromTitle, isOwnWindow } from "./utils/foregroundApp";
 
@@ -462,7 +464,9 @@ function ensureModelBoundsEl(): HTMLElement {
 /** 模型边框开关（绿框勾勒角色边界：调边界面板会自动打开，也可从菜单「显示模型边框」手动开） */
 function toggleModelBounds() {
   debugModelBoundsVisible = !debugModelBoundsVisible;
-  ensureModelBoundsEl().classList.toggle("hidden", !debugModelBoundsVisible);
+  const el = ensureModelBoundsEl();
+  el.classList.toggle("hidden", !debugModelBoundsVisible);
+  updateModelBoundsCornerStyle();
 }
 
 /** 每帧更新模型边框绿框位置（窗口坐标 = modelOffset + 角色边界） */
@@ -498,11 +502,18 @@ const PET_HIT_PADDING = 18;
 /** 检查鼠标事件是否在模型可点区域内（绿框 + 18px 余量），不是则忽略 */
 function isInsideModel(e: { clientX: number; clientY: number }): boolean {
   const r = getModelRect();
-  return (
-    e.clientX >= r.left - PET_HIT_PADDING &&
-    e.clientX <= r.right + PET_HIT_PADDING &&
-    e.clientY >= r.top - PET_HIT_PADDING &&
-    e.clientY <= r.bottom + PET_HIT_PADDING
+  const pad = PET_HIT_PADDING;
+  // 和 Rust 侧同一套圆角判定：四角是透明的就不该响应点击
+  return pointInRoundedRect(
+    e.clientX,
+    e.clientY,
+    {
+      x: r.left - pad,
+      y: r.top - pad,
+      width: r.right - r.left + pad * 2,
+      height: r.bottom - r.top + pad * 2,
+    },
+    currentBoundsCorner() + pad,
   );
 }
 
@@ -836,6 +847,28 @@ function paddingKey(): string {
 /** 当前模型的边界松紧（没有记录就退到旧版全局值，再退默认 0） */
 function currentBoundsPadding() {
   return settings.boundsPaddings[paddingKey()] ?? settings.boundsPadding ?? { ...ZERO_PADDING };
+}
+
+/** 当前模型的点击区域圆角（px）。按模型存，新模型没有记录就是 0 */
+function currentBoundsCorner(): number {
+  const v = settings.boundsCorners?.[paddingKey()];
+  const n = Number.isFinite(v) ? Number(v) : Number(settings.boundsCorner ?? 0);
+  return Math.max(0, Math.min(400, Math.round(n) || 0));
+}
+
+/** 写入当前模型的点击区域圆角，并立刻重算交互区域（不然要等下一帧才生效） */
+function setCurrentBoundsCorner(radius: number) {
+  settings.boundsCorners[paddingKey()] = Math.max(0, Math.min(400, Math.round(radius) || 0));
+  saveSettings(settings);
+  requestInteractionRegionSync(true);
+  updateModelBoundsCornerStyle();
+}
+
+/** 绿框跟着圆角一起变，用户才能直观看到"点不到的范围" */
+function updateModelBoundsCornerStyle() {
+  try {
+    ensureModelBoundsEl().style.borderRadius = `${currentBoundsCorner()}px`;
+  } catch { /* 元素还没建：下次显示时会设置 */ }
 }
 
 /** 写入当前模型的边界松紧并立刻应用到渲染层 */
@@ -1283,16 +1316,27 @@ function scheduleNextGreeting(): void {
 }
 
 /** 到点后的主动问候：待机/离开/关掉小助手时先不打扰，延后一分钟再看 */
+/** 到点但因为"用户正在聊天/待机"等原因没发出去时，隔一会儿再看，而不是重置计时 */
+function retryGreetingLater(dueAt: number, ms = 60 * 1000): void {
+  if (greetTimer !== null) clearTimeout(greetTimer);
+  greetTimer = window.setTimeout(() => {
+    greetTimer = null;
+    void fireScheduledGreeting(dueAt);
+  }, Math.max(5_000, ms));
+}
+
 async function fireScheduledGreeting(dueAt: number): Promise<void> {
-  if (!settings.assistant.enabled || settings.idleMode) {
-    scheduleNextGreeting();
+  if (!settings.assistant.enabled) return;
+  // 待机模式（缩到任务栏睡觉）期间不打扰：隔一分钟再看，别每秒空转
+  if (settings.idleMode) {
+    retryGreetingLater(dueAt);
     return;
   }
   let idleSec = 0;
   try { idleSec = await invoke<number>("get_idle_seconds"); } catch {}
   if (idleSec > 300) {
     // 用户离开了：不打扰，回来之后由 60 秒 tick 的"回归问候"或下一个到期点接手
-    greetTimer = window.setTimeout(() => void fireScheduledGreeting(dueAt), 60 * 1000);
+    retryGreetingLater(dueAt);
     return;
   }
   // 期间可能已经被别的路径问候过（回归问候），到点就别重复
@@ -1301,8 +1345,16 @@ async function fireScheduledGreeting(dueAt: number): Promise<void> {
     return;
   }
   const sent = await triggerProactive();
+  if (!sent) {
+    // **没真的发出去就不要重置锚点**。
+    // 以前这里无条件 markGreeted：用户在聊天（或对话面板开着）时每次都会被取消，
+    // 但锚点照样往前推一整个间隔 —— 表现就是"第一次之后就再也不问候了"。
+    // 现在只延后 60 秒再看，等用户空下来立刻补上。
+    retryGreetingLater(dueAt);
+    return;
+  }
   markGreeted(Date.now());
-  if (sent) trackEvent({ type: "greeting", summary: "主动问候了用户" });
+  trackEvent({ type: "greeting", summary: "主动问候了用户" });
   scheduleNextGreeting();
 }
 
@@ -2229,6 +2281,8 @@ function collectInteractionRegions(): PhysicalInteractiveRegion[] {
     clientPhysicalWidth,
     clientPhysicalHeight,
     PET_HIT_PADDING,
+    // 圆角要加回 padding：区域整体比绿框大一圈，圆角也跟着外扩才贴合
+    currentBoundsCorner() + PET_HIT_PADDING,
   );
   if (petRegion) regions.push(petRegion);
 
@@ -3431,7 +3485,12 @@ async function pushPanelState(): Promise<void> {
   panelTopmost = await invoke<boolean>("is_topmost").catch(() => false);
   try {
     await invoke("panel_push_settings", {
-      settings: JSON.stringify({ ...loadSettings(), boundsPadding: currentBoundsPadding() }),
+      settings: JSON.stringify({
+        ...loadSettings(),
+        boundsPadding: currentBoundsPadding(),
+        // 和边界松紧一样按模型上报，面板上的值才是"当前这个模型"的
+        boundsCorner: currentBoundsCorner(),
+      }),
       meta: JSON.stringify(buildPanelMeta()),
     });
   } catch (e) {
@@ -3453,9 +3512,21 @@ function schedulePanelSync(): void {
 function buildPanelMeta() {
   return {
     version: appVersion,
+    // 问候调度只读快照：控制面板用它显示"下一次什么时候问候"，
+    // 排查"设了 N 分钟却一直不来"时不用再等或翻 localStorage
+    greeting: {
+      enabled: !!settings.assistant.enabled,
+      idleMode: !!settings.idleMode,
+      intervalMinutes: clampGreetInterval(settings.assistant.greetInterval),
+      lastAt: lastGreetAt,
+      nextAt: nextGreetingDueAt(lastGreetAt, settings.assistant.greetInterval, Date.now(), 0),
+      timerArmed: greetTimer !== null,
+    },
     platform: PLATFORM === "win" ? "Windows" : PLATFORM === "mac" ? "macOS" : "Linux",
     model: currentModel.name || currentModel.type,
     providers: Object.entries(PROVIDERS).map(([id, p]) => ({ id, label: p.label, model: p.defaultModel })),
+    // 内置人设清单（只给面板渲染卡片用；正文留在 WebView 侧，点"套用"才写进设置）
+    personas: BUILTIN_PERSONAS.map((p) => ({ id: p.id, name: p.name, tagline: p.tagline })),
     languages: OUTPUT_LANGUAGE_OPTIONS,
     actions: flattenMenuActions(),
     ui: {
@@ -3566,6 +3637,9 @@ async function applyPanelPatch(patch: Record<string, unknown>): Promise<void> {
   deepAssign(settings as unknown as Record<string, unknown>, otherPatch);
   if (boundsPadding && typeof boundsPadding === "object") {
     setCurrentBoundsPadding({ ...currentBoundsPadding(), ...boundsPadding });
+  }
+  if ("boundsCorner" in patch) {
+    setCurrentBoundsCorner(Number(patch.boundsCorner) || 0);
   }
   const assistantPatch = patch.assistant as Record<string, unknown> | undefined;
   if (assistantPatch) {
@@ -4120,6 +4194,31 @@ function runPanelAction(id: string, payload?: unknown): void {
   }
   if (id.startsWith("__data:")) {
     void handlePanelDataAction(id.slice(7), payload);
+    return;
+  }
+  // 一键套用内置人设：直接覆盖 personaFields / personaFree，再用 composePersona 重新拼
+  if (id.startsWith("__persona:")) {
+    const payloadId = (payload && typeof payload === "object" && "id" in payload)
+      ? String((payload as { id?: unknown }).id ?? "")
+      : "";
+    const pid = payloadId || id.slice("__persona:".length);
+    const builtin = findBuiltinPersona(pid);
+    if (!builtin) {
+      toast("没找到这个人设", "warn");
+      return;
+    }
+    settings.assistant.personaFields = { ...builtin.fields };
+    settings.assistant.personaFree = builtin.free;
+    // 称呼只在用户还没设过时才填：不悄悄改掉用户自己的叫法
+    if (!(settings.assistant.nickname ?? "").trim() && builtin.suggestedNickname) {
+      settings.assistant.nickname = builtin.suggestedNickname;
+    }
+    settings.assistant.persona = composePersona(settings.assistant);
+    // 标记"人设已经被用户主动设过"，避免下次启动又自动套默认人设
+    settings.assistant.personaInitialized = true;
+    saveSettings(settings);
+    schedulePanelSync();
+    toast(`已套用内置人设：${builtin.name}`);
     return;
   }
   // 预设（API 配置集合）：与旧设置窗口同一套数据模型，Key 各存 preset:<id> 槽位
@@ -4903,7 +5002,7 @@ function toggleBoundsPanel() {
 
     const hint = document.createElement("div");
     hint.className = "mp-hint";
-    hint.textContent = "微调绿框四边松紧，正数放大、负数收紧";
+    hint.textContent = "微调绿框四边松紧，正数放大、负数收紧；圆角只影响点击范围";
     host.appendChild(hint);
 
     const mkSlider = (label: string, key: keyof BoundsPadding) => {
@@ -4942,6 +5041,39 @@ function toggleBoundsPanel() {
     mkSlider("上", "top");
     mkSlider("下", "bottom");
 
+    // ---- 点击区域圆角 ----
+    // 用户要求在桌宠上调、能直接看见效果：这里给一条滑条，绿框会同步变成圆角，
+    // 四角被切掉的部分就是"点不到"的地方。
+    const cornerRow = document.createElement("div");
+    cornerRow.className = "as-set-row";
+    const cornerLabel = document.createElement("span");
+    cornerLabel.className = "as-set-label";
+    cornerLabel.textContent = "圆角";
+    const cornerSlider = document.createElement("input");
+    cornerSlider.type = "range";
+    cornerSlider.min = "0";
+    cornerSlider.max = "200";
+    cornerSlider.step = "2";
+    cornerSlider.value = String(currentBoundsCorner());
+    cornerSlider.className = "as-input";
+    cornerSlider.style.flex = "1";
+    cornerSlider.style.minWidth = "0";
+    const cornerVal = document.createElement("span");
+    cornerVal.className = "as-set-label";
+    cornerVal.style.minWidth = "38px";
+    cornerVal.style.textAlign = "right";
+    cornerVal.textContent = currentBoundsCorner() + "px";
+    cornerSlider.addEventListener("input", () => {
+      const v = parseInt(cornerSlider.value, 10) || 0;
+      cornerVal.textContent = v + "px";
+      setCurrentBoundsCorner(v);
+      // 改完立刻按新圆角重画绿框（updateModelBounds 每帧只更新位置尺寸）
+      updateModelBoundsCornerStyle();
+    });
+    cornerRow.append(cornerLabel, cornerSlider, cornerVal);
+    host.appendChild(cornerRow);
+    updateModelBoundsCornerStyle();
+
     const btns = document.createElement("div");
     btns.className = "as-set-btns";
     const reset = document.createElement("button");
@@ -4949,6 +5081,8 @@ function toggleBoundsPanel() {
     reset.textContent = "重置";
     reset.addEventListener("click", () => {
       setCurrentBoundsPadding({ ...ZERO_PADDING });
+      setCurrentBoundsCorner(0);
+      updateModelBoundsCornerStyle();
       closeBoundsPanel();
     });
     const done = document.createElement("button");
@@ -5768,6 +5902,8 @@ async function toggleAssistantSettings() {
       const previousGreetInterval = settings.assistant.greetInterval;
       const nextGreetInterval = clampGreetInterval(greetInput.value);
       settings.assistant.greetInterval = nextGreetInterval;
+      // 输入框回写钳制后的值：填了超出范围/非法的数字时，让用户看到真正生效的是多少
+      if (greetInput.value.trim() !== String(nextGreetInterval)) greetInput.value = String(nextGreetInterval);
       // 输入框空闲收起（秒，0 = 不自动收起；留空/非法值回落到默认 8）
       const idleVal = parseInt(idleInput.value, 10);
       settings.assistant.inputIdleHideSec = Number.isFinite(idleVal)
