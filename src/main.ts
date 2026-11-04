@@ -155,6 +155,7 @@ import {
   regionFingerprint,
   type LogicalRect,
   type PhysicalInteractiveRegion,
+  pointInRoundedRect,
 } from "./input/regions";
 import { appNameFromTitle, isOwnWindow } from "./utils/foregroundApp";
 
@@ -463,7 +464,9 @@ function ensureModelBoundsEl(): HTMLElement {
 /** 模型边框开关（绿框勾勒角色边界：调边界面板会自动打开，也可从菜单「显示模型边框」手动开） */
 function toggleModelBounds() {
   debugModelBoundsVisible = !debugModelBoundsVisible;
-  ensureModelBoundsEl().classList.toggle("hidden", !debugModelBoundsVisible);
+  const el = ensureModelBoundsEl();
+  el.classList.toggle("hidden", !debugModelBoundsVisible);
+  updateModelBoundsCornerStyle();
 }
 
 /** 每帧更新模型边框绿框位置（窗口坐标 = modelOffset + 角色边界） */
@@ -499,11 +502,18 @@ const PET_HIT_PADDING = 18;
 /** 检查鼠标事件是否在模型可点区域内（绿框 + 18px 余量），不是则忽略 */
 function isInsideModel(e: { clientX: number; clientY: number }): boolean {
   const r = getModelRect();
-  return (
-    e.clientX >= r.left - PET_HIT_PADDING &&
-    e.clientX <= r.right + PET_HIT_PADDING &&
-    e.clientY >= r.top - PET_HIT_PADDING &&
-    e.clientY <= r.bottom + PET_HIT_PADDING
+  const pad = PET_HIT_PADDING;
+  // 和 Rust 侧同一套圆角判定：四角是透明的就不该响应点击
+  return pointInRoundedRect(
+    e.clientX,
+    e.clientY,
+    {
+      x: r.left - pad,
+      y: r.top - pad,
+      width: r.right - r.left + pad * 2,
+      height: r.bottom - r.top + pad * 2,
+    },
+    currentBoundsCorner() + pad,
   );
 }
 
@@ -837,6 +847,28 @@ function paddingKey(): string {
 /** 当前模型的边界松紧（没有记录就退到旧版全局值，再退默认 0） */
 function currentBoundsPadding() {
   return settings.boundsPaddings[paddingKey()] ?? settings.boundsPadding ?? { ...ZERO_PADDING };
+}
+
+/** 当前模型的点击区域圆角（px）。按模型存，新模型没有记录就是 0 */
+function currentBoundsCorner(): number {
+  const v = settings.boundsCorners?.[paddingKey()];
+  const n = Number.isFinite(v) ? Number(v) : Number(settings.boundsCorner ?? 0);
+  return Math.max(0, Math.min(400, Math.round(n) || 0));
+}
+
+/** 写入当前模型的点击区域圆角，并立刻重算交互区域（不然要等下一帧才生效） */
+function setCurrentBoundsCorner(radius: number) {
+  settings.boundsCorners[paddingKey()] = Math.max(0, Math.min(400, Math.round(radius) || 0));
+  saveSettings(settings);
+  requestInteractionRegionSync(true);
+  updateModelBoundsCornerStyle();
+}
+
+/** 绿框跟着圆角一起变，用户才能直观看到"点不到的范围" */
+function updateModelBoundsCornerStyle() {
+  try {
+    ensureModelBoundsEl().style.borderRadius = `${currentBoundsCorner()}px`;
+  } catch { /* 元素还没建：下次显示时会设置 */ }
 }
 
 /** 写入当前模型的边界松紧并立刻应用到渲染层 */
@@ -2249,6 +2281,8 @@ function collectInteractionRegions(): PhysicalInteractiveRegion[] {
     clientPhysicalWidth,
     clientPhysicalHeight,
     PET_HIT_PADDING,
+    // 圆角要加回 padding：区域整体比绿框大一圈，圆角也跟着外扩才贴合
+    currentBoundsCorner() + PET_HIT_PADDING,
   );
   if (petRegion) regions.push(petRegion);
 
@@ -3451,7 +3485,12 @@ async function pushPanelState(): Promise<void> {
   panelTopmost = await invoke<boolean>("is_topmost").catch(() => false);
   try {
     await invoke("panel_push_settings", {
-      settings: JSON.stringify({ ...loadSettings(), boundsPadding: currentBoundsPadding() }),
+      settings: JSON.stringify({
+        ...loadSettings(),
+        boundsPadding: currentBoundsPadding(),
+        // 和边界松紧一样按模型上报，面板上的值才是"当前这个模型"的
+        boundsCorner: currentBoundsCorner(),
+      }),
       meta: JSON.stringify(buildPanelMeta()),
     });
   } catch (e) {
@@ -3598,6 +3637,9 @@ async function applyPanelPatch(patch: Record<string, unknown>): Promise<void> {
   deepAssign(settings as unknown as Record<string, unknown>, otherPatch);
   if (boundsPadding && typeof boundsPadding === "object") {
     setCurrentBoundsPadding({ ...currentBoundsPadding(), ...boundsPadding });
+  }
+  if ("boundsCorner" in patch) {
+    setCurrentBoundsCorner(Number(patch.boundsCorner) || 0);
   }
   const assistantPatch = patch.assistant as Record<string, unknown> | undefined;
   if (assistantPatch) {

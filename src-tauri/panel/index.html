@@ -576,6 +576,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { path: "boundsPadding.right", label: "边界 · 右", type: "range", min: -120, max: 120, step: 1, unit: "px", live: true },
             { path: "boundsPadding.top", label: "边界 · 上", type: "range", min: -120, max: 120, step: 1, unit: "px", live: true },
             { path: "boundsPadding.bottom", label: "边界 · 下", type: "range", min: -120, max: 120, step: 1, unit: "px", live: true },
+            { path: "boundsCorner", label: "点击区域圆角", type: "range", min: 0, max: 200, step: 2, unit: "px", live: true, desc: "四个角一起圆：包围盒四角是透明的，圆掉之后在那里点就不会再点到桌宠（只影响点击/拖动判定，绿框会同步显示圆角）" },
             { type: "actions", items: [{ id: "__data:bounds-reset", label: "重置此模型四边边界" }] },
             { type: "actions", items: [
               { id: "bounds", label: "进入桌宠窗口调整模型边界" },

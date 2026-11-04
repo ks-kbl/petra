@@ -146,6 +146,10 @@ pub struct InteractiveRegion {
     pub width: i32,
     pub height: i32,
     pub enabled: bool,
+    /// 圆角半径（像素，和区域同一坐标系）；0 = 直角。
+    /// 用户要求：包围盒四角是透明的，不该还能点到桌宠，所以命中判定改成圆角矩形。
+    #[serde(default)]
+    pub corner_radius: f32,
 }
 
 #[derive(Clone)]
@@ -950,8 +954,34 @@ fn point_in_interactive_regions(x: i32, y: i32, regions: &[InteractiveRegion]) -
         let bottom = top + i64::from(region.height);
         let px = i64::from(x);
         let py = i64::from(y);
-        px >= left && px < right && py >= top && py < bottom
+        if !(px >= left && px < right && py >= top && py < bottom) {
+            return false;
+        }
+        point_in_rounded_rect(px, py, left, top, right, bottom, region.corner_radius)
     })
+}
+
+/// 圆角矩形命中：把点夹到「内缩 r 的矩形」上取最近点，再比距离（四角自然是 1/4 圆）。
+/// 纯整数运算，避免浮点误差让边缘判定飘。
+fn point_in_rounded_rect(
+    px: i64,
+    py: i64,
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+    radius: f32,
+) -> bool {
+    let max_r = (right - left).min(bottom - top) as f32 / 2.0;
+    let r = radius.max(0.0).min(max_r).round() as i64;
+    if r <= 0 {
+        return true;
+    }
+    let cx = px.max(left + r).min(right - 1 - r);
+    let cy = py.max(top + r).min(bottom - 1 - r);
+    let dx = px - cx;
+    let dy = py - cy;
+    dx * dx + dy * dy <= r * r
 }
 
 fn should_accept_input(

@@ -145,6 +145,10 @@ export interface Settings {
    * 以前是全局单值，在模型 A 上拖过滑条再切到 B，B 的绿框/点击区/气泡位置就全偏了。
    */
   boundsPaddings: Record<string, BoundsPadding>;
+  /** 点击区域圆角（按模型存，px）；0 = 直角，和绿框一样按模型独立 */
+  boundsCorners: Record<string, number>;
+  /** 旧/兜底圆角（按模型查不到时用它） */
+  boundsCorner: number;
   /** 旧版的全局边界松紧：只用于首次迁移，新代码请用 boundsPaddings */
   boundsPadding: BoundsPadding;
   passthrough: boolean;
@@ -236,6 +240,8 @@ const DEFAULTS: Settings = {
   weatherCity: "",
   weatherBubble: true,
   boundsPaddings: {},
+  boundsCorners: {},
+  boundsCorner: 0,
   boundsPadding: { left: 0, right: 0, top: 0, bottom: 0 },
   passthrough: false,
   allowAllShell: false,
