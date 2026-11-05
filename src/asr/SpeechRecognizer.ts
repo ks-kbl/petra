@@ -4,8 +4,8 @@
  * 后端一：浏览器原生 SpeechRecognition（Windows 的 WebView2）
  *   - continuous=true，边说边出字到输入框（onPartial）
  *   - 用"多久没新结果"判断静音，停顿 2.5 秒自动收尾发送
- *   - 一旦报 network / not-allowed 这类"用不了"的错误，本次会话内永久降级到后端二
- *     （WebView2 的原生识别依赖在线服务，国内经常直接 network）
+ *   - 一旦报 network / not-allowed 这类"用不了"的错误，降级到后端二 **90 秒**，
+ *     到点自动恢复再试（不搞"本次运行永久降级"：那样用户只能重启才能再试原生识别）
  *
  * 后端二：录音 + Rust 侧转发在线识别（Mac / Linux，以及原生不可用时的 Windows）
  *   - MediaRecorder 录 webm + AnalyserNode 做 VAD，静音 2.5 秒自动停
@@ -73,6 +73,8 @@ function mergePartial(prev: string, next: string): string {
  * 也避免"网页原生识别"和"录音 VAD"两条路各写一套数。
  */
 const LISTEN_TIMING: ListenTiming = DEFAULT_LISTEN_TIMING;
+/** 原生识别失败后的冷却时长：到点自动再试，不用重启应用 */
+const NATIVE_RETRY_MS = 90 * 1000;
 /**
  * 云端录音（非流式）专用的收尾参数：
  * 说到停顿 1.6 秒就收（默认 5 秒是给"边说边出字"的原生识别留的手感，
@@ -152,8 +154,19 @@ export interface RecognizerHandlers {
 export class SpeechRecognizer {
   private handlers: RecognizerHandlers = {};
   private backend: AsrBackend;
-  /** 原生识别被判过死刑（network / not-allowed…），本次运行不再尝试 */
-  private webSpeechBroken = false;
+  /**
+   * 原生识别"暂时"不可用到这个时刻（0 = 可用）。
+   *
+   * 以前这里是 `webSpeechBroken = true` 的**永久**降级：WebView2 的原生识别依赖在线服务，
+   * 国内网络偶尔报 network 一次，就整场会话再也不试了 —— 用户只能重启应用才能再用原生识别，
+   * 于是就有了"重启就好、用一会儿又坏"的循环。改成 90 秒冷却后自动恢复。
+   */
+  private webSpeechRetryAt = 0;
+
+  /** 现在是不是还在冷却期内 */
+  private webSpeechBrokenNow(): boolean {
+    return Date.now() < this.webSpeechRetryAt;
+  }
 
   // web-speech 后端
   private recognition: SpeechRecognitionLike | null = null;
@@ -202,14 +215,14 @@ export class SpeechRecognizer {
 
   constructor(handlers: RecognizerHandlers = {}) {
     this.handlers = handlers;
-    this.backend = pickBackend(getSpeechRecognitionCtor() !== null, this.webSpeechBroken, preferCloudAsr());
+    this.backend = pickBackend(getSpeechRecognitionCtor() !== null, this.webSpeechBrokenNow(), preferCloudAsr());
   }
 
   setHandlers(handlers: RecognizerHandlers): void { this.handlers = handlers; }
   private refreshBackend(): void {
     // Never switch the backend of an active recording; apply preferences next time.
     if (!this.isRecording()) {
-      this.backend = pickBackend(getSpeechRecognitionCtor() !== null, this.webSpeechBroken, preferCloudAsr());
+      this.backend = pickBackend(getSpeechRecognitionCtor() !== null, this.webSpeechBrokenNow(), preferCloudAsr());
     }
   }
   getBackendName(): AsrBackend { this.refreshBackend(); return this.backend; }
@@ -382,8 +395,8 @@ export class SpeechRecognizer {
    * 否则一开就报"未配置 Key"，用户看到的是两个连续的错误提示。
    */
   private degradeToSiliconFlow(reason: string): void {
-    this.webSpeechBroken = true;
-    this.backend = pickBackend(getSpeechRecognitionCtor() !== null, this.webSpeechBroken, preferCloudAsr());
+    this.webSpeechRetryAt = Date.now() + NATIVE_RETRY_MS;
+    this.backend = pickBackend(getSpeechRecognitionCtor() !== null, this.webSpeechBrokenNow(), preferCloudAsr());
     const rec = this.recognition;
     this.recognition = null;
     this.finishing = true; // abort 也会触发 onend，别让它再走"引擎自己断了"的分支
@@ -395,7 +408,8 @@ export class SpeechRecognizer {
     // 以前「没有 SpeechRecognition 构造函数」那条只提示去配 Key，用户完全不知道
     // 是浏览器识别在这台机器上不可用。
     this.handlers.onError?.(
-      `${reason}：已切换为在线识别 —— 若没配硅基流动 Key，请右键 →「🎤 语音识别设置」填一个，再点一次麦克风`,
+      `${reason}：这次先用在线识别，${Math.round(NATIVE_RETRY_MS / 1000)} 秒后会自动重试系统识别。`
+      + `若在线识别也没配好，请右键 →「🎤 语音识别设置」检查 Key`,
     );
   }
 
@@ -739,6 +753,12 @@ export class SpeechRecognizer {
     } catch (e) {
       if (token !== this.startToken) return;
       const msg = e instanceof Error ? e.message : String(e);
+      // 云端明确"用不了"（余额不足 / Key 无效 / 未开通）：立刻把原生识别的冷却清掉，
+      // 下次点麦克风会重新试系统识别 —— 而不是在一条走不通的路上反复撞。
+      if (/402|余额|balance|insufficient|401|未配置|未开通/i.test(msg)) {
+        this.webSpeechRetryAt = 0;
+        asrLog("云端识别不可用，已解除原生识别冷却，下次优先重试系统识别");
+      }
       this.handlers.onError?.(msg.startsWith("未配置") ? msg : `语音识别失败：${msg}`);
     }
   }

@@ -4051,11 +4051,15 @@ async fn tts_synthesize(
 /// 语音识别的服务端点与模型：与 TTS 同一路子 —— 请求从 Rust 侧发出，
 /// 密钥只存在于 Rust（DPAPI / Keychain / 600 权限文件），前端只拿到转写出来的文本。
 const ASR_API_URL: &str = "https://api.siliconflow.cn/v1/audio/transcriptions";
-/// 默认识别模型：XingChen (中国电信) 的 ASR-V3.2-Ultra，中文短句比 SenseVoice 更稳。
-const ASR_MODEL: &str = "XingChenAGI/XingChenASR-V3.2-Ultra";
-/// 兜底模型：万一账号没开通上面的模型（400/403/404），自动退回这个，
-/// 别让「模型没权限」直接把语音输入整条链路废掉。
-const ASR_MODEL_FALLBACK: &str = "FunAudioLLM/SenseVoiceSmall";
+/// 默认识别模型：**免费**的 SenseVoiceSmall。
+///
+/// 以前默认是 XingChen（中国电信）的付费模型 —— 内置默认 Key 一分钱没有，
+/// 于是所有用内置 Key 的人一点麦克风就吃 402「余额不足」，而免费的兜底模型
+/// 又因为 402 不在"可重试"列表里根本没被试过。现在把免费模型放到第一位：
+/// 开箱即用不花钱，账号有余额才谈得上用付费模型。
+const ASR_MODEL: &str = "FunAudioLLM/SenseVoiceSmall";
+/// 兜底模型：免费模型不认（极少见）而账号确实有余额时，换这个更稳的中文模型。
+const ASR_MODEL_FALLBACK: &str = "XingChenAGI/XingChenASR-V3.2-Ultra";
 
 /// 内置的默认 ASR Key：**编译期**从环境变量注入，源码与仓库里都没有这个字符串。
 ///
@@ -4487,9 +4491,11 @@ async fn asr_transcribe(app: AppHandle, audio: String) -> Result<String, String>
             "语音识别服务返回 {status}: {}",
             text.chars().take(200).collect::<String>()
         );
-        // 只有「模型不存在 / 没权限 / 参数不对」才值得换模型重试；
+        // 「模型不存在 / 没权限 / 参数不对」值得换模型重试。
+        // 402（余额不足 / 没开通付费模型）**也要换**：付费模型没钱不代表免费模型不能用，
+        // 以前这里把 402 当终局错误直接 break，结果免费兜底模型一次都没试过。
         // 401（Key 错）、429（限流）、5xx 换模型也没用，直接报错更诚实。
-        let retryable = matches!(status.as_u16(), 400 | 403 | 404 | 422);
+        let retryable = matches!(status.as_u16(), 400 | 402 | 403 | 404 | 422);
         log_line(&format!(
             "[asr] {model} 失败（{status}），retryable={retryable}，bytes={}，body={}",
             bytes.len(),
@@ -4498,6 +4504,12 @@ async fn asr_transcribe(app: AppHandle, audio: String) -> Result<String, String>
         if !retryable {
             break;
         }
+    }
+    // 两个模型都失败：余额不足是最常见的一类，给一句能照着做的中文提示
+    if last_err.contains("402") || last_err.contains("balance") || last_err.contains("30001") {
+        return Err(format!(
+            "{last_err} —— 语音识别账号余额不足（付费模型需要余额；免费模型也失败时请到「🎤 语音识别设置」换用自己的 Key）"
+        ));
     }
     Err(last_err)
 }
