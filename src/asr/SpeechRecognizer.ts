@@ -73,8 +73,10 @@ function mergePartial(prev: string, next: string): string {
  * 也避免"网页原生识别"和"录音 VAD"两条路各写一套数。
  */
 const LISTEN_TIMING: ListenTiming = DEFAULT_LISTEN_TIMING;
-/** 原生识别失败后的冷却时长：到点自动再试，不用重启应用 */
-const NATIVE_RETRY_MS = 90 * 1000;
+/** 原地重连几次都失败后，原生识别的冷却时长（很短：20 秒后再试一次） */
+const NATIVE_RETRY_MS = 20 * 1000;
+/** 同一次按键里，原生识别原地重连的最大次数 */
+const NATIVE_MAX_RETRIES = 3;
 /** 云端识别明确不可用后的停用时长 */
 const CLOUD_BLOCK_MS = 10 * 60 * 1000;
 /**
@@ -171,6 +173,10 @@ export class SpeechRecognizer {
    * 只会每次都弹一遍余额不足的红色错误。10 分钟后再说。
    */
   private cloudBlockedUntil = 0;
+
+  /** 本次按键里原生识别已经原地重连了几次（成功识别到内容就清零） */
+  private nativeRetryCount = 0;
+  private nativeRetryTimer: number | null = null;
 
   private cloudBlockedNow(): boolean {
     return Date.now() < this.cloudBlockedUntil;
@@ -313,6 +319,8 @@ export class SpeechRecognizer {
     rec.onsoundend = () => { this.listen.speaking = false; markActivity(); };
 
     rec.onresult = (e: SpeechRecognitionEvent) => {
+      // 能出字说明这一路是通的：清掉"原地重连"计数，下次抖动仍然可以立刻重连
+      this.nativeRetryCount = 0;
       // 收尾之后引擎还会补一两个迟到的结果（停麦的那一瞬），别再写回输入框 ——
       // 否则用户刚发出去，输入框里又冒出半句没头没尾的话
       if (this.finishing || this.recognition !== rec) return;
@@ -341,7 +349,9 @@ export class SpeechRecognizer {
         return;
       }
       if (isFatalWebSpeechError(err)) {
-        // 这台机器上原生识别根本用不了：别再让用户对着红点干等
+        // network 这类多半是"这一次连不上"，不是"这台机器不能识别"：
+        // 先在同一轮里立刻重连（用户几乎无感），别一上来就降级、也别让用户干等。
+        if (this.retryNativeNow(err)) return;
         this.degradeToSiliconFlow(`浏览器语音识别不可用（${err}）`);
         return;
       }
@@ -410,6 +420,37 @@ export class SpeechRecognizer {
    * 不在这里自动重开录音：调用方（按钮）需要先确认在线识别配了 Key，
    * 否则一开就报"未配置 Key"，用户看到的是两个连续的错误提示。
    */
+  /**
+   * 原生识别原地重连：网络抖一下（`network`）不该让用户等到降级。
+   *
+   * 返回 true = 已经安排了重连，调用方不要再降级。
+   * 连续失败 `NATIVE_MAX_RETRIES` 次才认输 —— 那时才值得切云端。
+   * 用递增延迟（120/240/360ms）只是让引擎先把上一次的状态复位，用户基本无感。
+   */
+  private retryNativeNow(err: string): boolean {
+    if (this.nativeRetryCount >= NATIVE_MAX_RETRIES) {
+      this.nativeRetryCount = 0;
+      return false;
+    }
+    this.nativeRetryCount++;
+    const attempt = this.nativeRetryCount;
+    // 先把这一路彻底放掉，否则上一次的 onend/onerror 会跟新会话打架
+    const rec = this.recognition;
+    this.recognition = null;
+    this.finishing = true;
+    this.clearAutoStop();
+    try { rec?.abort(); } catch { /* ignore */ }
+    asrLog(`原生识别报 ${err}，第 ${attempt}/${NATIVE_MAX_RETRIES} 次原地重连`);
+    if (this.nativeRetryTimer !== null) window.clearTimeout(this.nativeRetryTimer);
+    this.nativeRetryTimer = window.setTimeout(() => {
+      this.nativeRetryTimer = null;
+      // 用户已经松手 / 已经切到别的后端：不再重连
+      if (this.finishing && !this.active) return;
+      this.startWebSpeech();
+    }, 120 * attempt);
+    return true;
+  }
+
   private degradeToSiliconFlow(reason: string): void {
     this.webSpeechRetryAt = Date.now() + NATIVE_RETRY_MS;
     this.backend = pickBackend(getSpeechRecognitionCtor() !== null, this.webSpeechBrokenNow(), preferCloudAsr());
@@ -424,7 +465,7 @@ export class SpeechRecognizer {
     // 以前「没有 SpeechRecognition 构造函数」那条只提示去配 Key，用户完全不知道
     // 是浏览器识别在这台机器上不可用。
     this.handlers.onError?.(
-      `${reason}：这次先用在线识别，${Math.round(NATIVE_RETRY_MS / 1000)} 秒后会自动重试系统识别。`
+      `${reason}：这次先用在线识别，${Math.round(NATIVE_RETRY_MS / 1000)} 秒后会自动切回系统识别再试。`
       + `若在线识别也没配好，请右键 →「🎤 语音识别设置」检查 Key`,
     );
   }
