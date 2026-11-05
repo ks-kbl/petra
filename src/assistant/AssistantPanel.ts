@@ -1399,13 +1399,16 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
     historyLoaded = true;
   }
   inputBar!.classList.remove("hidden");
+  // 没传 rect（语音快捷键、右键菜单唤出等）就向主进程要一份当前模型矩形，
+  // 否则输入框会停在上一次的旧位置 / 屏幕角落。
+  const rect = modelRect ?? modelRectProvider?.() ?? null;
   // 定位到模型（绿框）附近：默认放底部，放不下翻到上方；始终钳制在窗口可见区内（贴边自适应）
-  if (modelRect) {
+  if (rect) {
     const vr = getVisibleRect();
     const barW = inputBar!.offsetWidth || 185;
     const barH = inputBar!.offsetHeight || 60;
     // 水平居中在模型正下方：模型中心 - 输入框半宽
-    const modelCenterX = modelRect.left + (modelRect.right - modelRect.left) / 2;
+    const modelCenterX = rect.left + (rect.right - rect.left) / 2;
     const centeredLeft = modelCenterX - barW / 2;
     // 避开已显示的信息板（避免叠放遮挡：信息板先于输入框定位）
     const infoEl = document.getElementById("info-panel");
@@ -1416,9 +1419,9 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
       l < infoRect.right && l + barW > infoRect.left &&
       t < infoRect.bottom && t + barH > infoRect.top;
     const cands = [
-      { left: centeredLeft, top: modelRect.bottom + 10 }, // 模型下方居中（默认）
+      { left: centeredLeft, top: rect.bottom + 10 }, // 模型下方居中（默认）
       { left: centeredLeft, top: vr.bottom - barH }, // 可见区底部居中（贴底时允许盖住模型下半部分）
-      { left: centeredLeft, top: modelRect.top - barH - 10 }, // 模型上方居中（最后尝试）
+      { left: centeredLeft, top: rect.top - barH - 10 }, // 模型上方居中（最后尝试）
     ];
     let pick: { left: number; top: number } | null = null;
     for (const c of cands) {
