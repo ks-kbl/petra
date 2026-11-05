@@ -1136,6 +1136,26 @@ function onVoiceKeydown(e: KeyboardEvent): void {
 }
 
 /** 点麦克风：没在听就开始听，正在听就取消（取消 = 丢弃，不发送） */
+/**
+ * 语音输入快捷键的入口：先把对话框叫出来，再开麦。
+ *
+ * - 面板没开 → 打开它（快捷键按下时 Rust 已经把窗口提到前台）
+ * - 已经在录 → 收尾提交（和点麦克风按钮一致，不乱丢内容）
+ * - 正在播 TTS → toggleVoiceInput 内部会先停掉，避免把自己的声音录进去
+ */
+export function toggleVoiceInputFromHotkey(): void {
+  try {
+    ensureInput();
+    ensureBubbles();
+    void openAssistant().then(() => {
+      if (!recognizer?.isRecording()) resetTimer();
+      void toggleVoiceInput();
+    });
+  } catch (e) {
+    console.warn("[asr] 快捷键开麦失败", e);
+  }
+}
+
 async function toggleVoiceInput(): Promise<void> {
   const r = wireRecognizer();
   resetTimer(); // 碰麦克风也算"人在互动"，别让空闲超时把面板收走

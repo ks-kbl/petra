@@ -184,6 +184,11 @@ pub struct AssistantHotkey {
     pub shortcut: std::sync::Mutex<Option<Shortcut>>,
 }
 
+/// 语音输入快捷键的注册状态（和呼出快捷键互不影响，各占一个组合）
+pub struct VoiceHotkey {
+    pub shortcut: std::sync::Mutex<Option<Shortcut>>,
+}
+
 /// 拖动状态：开始后由 8ms 线程直接 GetCursorPos 跟随（零每帧 IPC）。
 /// locked_y 为待机边缘滑动：y 锁定在该值（物理），只随鼠标水平移动。
 pub struct DragState {
@@ -5587,6 +5592,47 @@ fn unregister_assistant_shortcut(
     Ok(())
 }
 
+/// 注册（或替换）语音输入快捷键：按下直接开始说话（前端收到 `voice-hotkey` 后开麦）。
+#[tauri::command]
+fn register_voice_shortcut(
+    app: AppHandle,
+    state: State<'_, VoiceHotkey>,
+    shortcut: String,
+) -> Result<(), String> {
+    let trimmed = shortcut.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("快捷键不能为空".into());
+    }
+    if let Some(prev) = state.shortcut.lock().unwrap().take() {
+        let _ = app.global_shortcut().unregister(prev);
+    }
+    let sc = Shortcut::from_str(&trimmed).map_err(|e| format!("快捷键格式无效：{e}"))?;
+    app.global_shortcut()
+        .on_shortcut(sc, |app, _shortcut, event| {
+            if event.state() == ShortcutState::Pressed {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+                let _ = app.emit("voice-hotkey", ());
+            }
+        })
+        .map_err(|e| format!("注册失败（可能已被占用）：{e}"))?;
+    *state.shortcut.lock().unwrap() = Some(sc);
+    Ok(())
+}
+
+#[tauri::command]
+fn unregister_voice_shortcut(
+    app: AppHandle,
+    state: State<'_, VoiceHotkey>,
+) -> Result<(), String> {
+    if let Some(prev) = state.shortcut.lock().unwrap().take() {
+        let _ = app.global_shortcut().unregister(prev);
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// 在**系统层面**捕获一次快捷键组合（Windows 低级键盘钩子）。
 ///
@@ -5838,6 +5884,9 @@ pub fn run() {
         .manage(AssistantHotkey {
             shortcut: std::sync::Mutex::new(None),
         })
+        .manage(VoiceHotkey {
+            shortcut: std::sync::Mutex::new(None),
+        })
         .manage(InteractionState {
             snapshot: std::sync::Mutex::new(InteractionSnapshot {
                 regions: Vec::new(),
@@ -5875,6 +5924,7 @@ pub fn run() {
             register_assistant_shortcut, unregister_assistant_shortcut, capture_hotkey,
             tts_synthesize, set_tts_key, get_tts_key,
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
+            register_voice_shortcut, unregister_voice_shortcut,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
             capture_screen,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,
