@@ -4101,7 +4101,22 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
         break;
       }
       case "models-fetch": {
+        // 面板可能刚粘贴了 Key 但还没点「保存」——这时候直接拿它去测，
+        // 比先报一个 401「无效的令牌」再让用户猜要友好得多。
+        const typed = String(p.key ?? "").trim();
+        if (typed) {
+          const scope = settings.assistant.activePresetId
+            ? presetKeyScope(settings.assistant.activePresetId)
+            : settings.assistant.provider;
+          await setApiKey(typed, scope);
+          clearApiKeyCache();
+          panelKeys = { ...panelKeys, assistant: true };
+        }
         const key = await getApiKey();
+        if (!key) {
+          toast("还没填 API Key：在上面的「API Key」里粘贴后点保存（或直接点获取模型列表，会自动保存）", "warn");
+          break;
+        }
         panelAssistantModels = await listModels(
           settings.assistant.provider,
           key,

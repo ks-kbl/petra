@@ -492,6 +492,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     try { return sessionStorage.getItem("petra.panel.token") || ""; } catch (_) { return ""; }
   })();
 
+  // 面板上 assistant 的 Key 输入框（用户常粘完直接点「获取模型列表」，没点保存）
+  let pendingAssistantKeyInput = null;
+
   const params = new URLSearchParams(location.search);
   const state = { settings: {}, meta: {}, seq: 0, online: false, section: params.get("s") || "overview", timer: null, lastCommitAt: 0 };
 
@@ -655,7 +658,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { path: "assistant.provider", label: "供应商", type: "select", options: "providers" },
             { path: "assistant.model", label: "模型", type: "text", placeholder: "留空则使用供应商默认模型" },
             { path: "assistant.customBaseUrl", label: "自定义接口地址", type: "text", placeholder: "仅选择自定义供应商时填写" },
-            { type: "actions", items: [{ id: "__data:models-fetch", label: "获取模型列表" }] },
+            { type: "actions", items: [{ id: "__data:models-fetch", label: "获取模型列表", passKey: true }] },
             { type: "secret", key: "assistant", label: "API Key", desc: "填写时不会显示，填写后覆盖当前预设设置" },
             { type: "usage" },
           ],
@@ -1072,6 +1075,8 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       inp.setAttribute("autocorrect", "off");
       inp.setAttribute("autocapitalize", "off");
       inputRow.appendChild(inp);
+      // 记住输入框：面板上的「获取模型列表」会把它带过去（用户常常粘完 Key 直接点获取）
+      if (spec.key === "assistant") pendingAssistantKeyInput = inp;
       const save = el("button", "btn btn-sm btn-primary", configured ? "更新" : "保存");
       save.onclick = () => runAction(`__key:${spec.key}`, { value: inp.value });
       inputRow.appendChild(save);
@@ -1159,7 +1164,13 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       const wrap = el("div", "btn-row");
       spec.items.forEach((it) => {
         const b = el("button", "btn btn-sm" + (it.primary ? " btn-primary" : ""), it.label);
-        b.onclick = () => runAction(it.id, it.label);
+        b.onclick = () => {
+          // passKey：把 Key 输入框里**还没保存**的内容一起带过去（常见操作：粘完直接点获取）
+          const payload = it.passKey && pendingAssistantKeyInput
+            ? { key: pendingAssistantKeyInput.value.trim() }
+            : it.label;
+          runAction(it.id, payload);
+        };
         wrap.appendChild(b);
       });
       return wrap;
