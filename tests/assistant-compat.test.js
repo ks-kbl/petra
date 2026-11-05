@@ -54,6 +54,16 @@ const json = (obj, status = 200) =>
       check("404 时建议手填模型名", /手填|手动填写/.test(err), err.slice(0, 80));
     }
 
+    // ---- 0c) /models 里图像/语音模型混进来：要过滤掉，别让用户选到必 400 的模型 ----
+    {
+      global.fetch = async () =>
+        json({ data: [{ id: "gpt-image-2" }, { id: "deepseek-v4.1-flash" }, { id: "gpt-image-2.5" }] });
+      const list = await ac.listModels("custom", "sk-key", "https://example.com/v1");
+      check("过滤掉图像模型", list.length === 1 && list[0] === "deepseek-v4.1-flash", JSON.stringify(list));
+    }
+    check("能识别非对话模型名", ac.looksLikeNonChatModel("gpt-image-2") === true);
+    check("普通聊天模型不误判", ac.looksLikeNonChatModel("deepseek-v4.1-flash") === false);
+
     // ---- 1) tools 被拒 → 自动降级为无工具请求，并记住该端点 ----
     {
       const requests = [];

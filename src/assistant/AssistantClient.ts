@@ -220,6 +220,15 @@ export function stripToolData(messages: ChatMessage[]): ChatMessage[] {
 /** 模型名里明显不是对话模型的排除项（中转站的 /models 常把 embedding/tts/image 混在一起） */
 const NON_CHAT_MODEL_RE =
   /(embed|embedding|rerank|whisper|tts|speech|transcri|audio|image|dall[-_ ]?e|moderation|bge|clip|stable[-_ ]?diffusion|sdxl|flux|ocr|guard|safety)/i;
+/**
+ * 这个模型名看起来是不是"非对话模型"（图像/语音/向量/审核…）。
+ * 中转站的 /models 常把它们和聊天模型混在一起，用户很容易挑到 gpt-image-2 这种，
+ * 然后 chat/completions 直接 400 —— 给一句能读懂的解释。
+ */
+export function looksLikeNonChatModel(name: string): boolean {
+  return NON_CHAT_MODEL_RE.test(String(name || ""));
+}
+
 /** 对话模型的常见关键词，用于在候选里优先挑一个能聊的 */
 const CHAT_MODEL_HINT_RE =
   /(chat|instruct|gpt|claude|deepseek|qwen|glm|llama|mixtral|gemini|grok|moonshot|kimi|yi-|ernie|command-r|mistral|sonnet|opus|haiku|o1|o3|o4)/i;
@@ -972,7 +981,11 @@ export async function chatStream(
     const hint = provider === "custom"
       ? " (自定义/中转站端点：请确认 URL 是否带 /v1、模型名是否与中转站文档一致)"
       : "";
-    throw new Error(`API 错误 ${lastStatus || 0}${hint}: ${errText.slice(0, 300)}`);
+    // 选了图像/语音类模型时，端点只会回一句 Upstream request failed / 400 —— 这里补一句人话
+    const nonChat = looksLikeNonChatModel(m)
+      ? "（这个模型看起来是图像/语音类模型，不是对话模型，换一个聊天模型试试，比如 deepseek-chat、gpt-4o-mini）"
+      : "";
+    throw new Error(`API 错误 ${lastStatus || 0}${hint}: ${errText.slice(0, 300)}${nonChat}`);
   }
   if (!res || !res.body) {
     throw new Error(`API 错误 ${lastStatus || 0}: ${errText.slice(0, 300) || "没有收到响应"}`);
@@ -1370,7 +1383,12 @@ export async function listModels(
   for (const url of urls) {
     try {
       const arr = await fetchModelList(url, apiKey);
-      if (arr.length) return arr;
+      if (arr.length) {
+        // 中转站常把图像/语音/向量模型混在同一个列表里（比如 gpt-image-2），
+        // 选错就是 400。这里只留像对话模型的；万一全被过滤就原样返回，别让用户没得选。
+        const chatLike = arr.filter((m) => !looksLikeNonChatModel(m));
+        return chatLike.length ? chatLike : arr;
+      }
       errors.push(`${url}：返回了空的模型列表`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
