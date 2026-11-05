@@ -4092,9 +4092,13 @@ fn asr_key_or_default(stored: String) -> String {
 ///
 /// 前端点麦克风前先问它：没有就直接提示去配置，别白录一轮再报错。
 /// 注意别用 get_asr_key 做这件事 —— 那个只报"用户自己填的"，内置默认是隐藏的。
-/// 生效中的 ASR Key（用户填的优先，否则内置）+ 它是不是内置的。
-/// ⚠️ 这条命令会把 Key 明文交给前端 —— 用户明确说过"不怕泄露，直接贴在控制面板上"，
-/// 所以面板可以把 Key 显示出来方便查看/复制。别拿它做别的用途。
+/// 语音识别 Key 的状态 —— **绝不回明文**。
+///
+/// 以前这里把生效中的 Key（含内置默认 Key）原样交给前端，面板再显示成可选中的文本，
+/// 结果内置 Key 被随意外传/复制，账号被刷到欠费。现在只回：
+/// - `ready`：有没有可用的 Key（用户自己的或内置的）
+/// - `builtin`：是不是在用内置的那个
+/// - `masked`：掩码，例如 `sk-df****gzoa`，仅供界面显示"已配置"
 #[tauri::command]
 fn asr_key_info(app: AppHandle) -> serde_json::Value {
     let own = read_stored_asr_key(&app);
@@ -4104,7 +4108,26 @@ fn asr_key_info(app: AppHandle) -> serde_json::Value {
     } else {
         (builtin, true)
     };
-    serde_json::json!({ "key": key, "builtin": from_builtin })
+    serde_json::json!({
+        "ready": !key.trim().is_empty(),
+        "builtin": from_builtin,
+        "masked": mask_secret(&key),
+    })
+}
+
+/// 把密钥打码成 `sk-xxxx****yyyy`：只留头 5 位和尾 4 位，够人辨认、不够拿来用。
+fn mask_secret(key: &str) -> String {
+    let k = key.trim();
+    let chars: Vec<char> = k.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    if chars.len() <= 10 {
+        return "****".to_string();
+    }
+    let head: String = chars.iter().take(5).collect();
+    let tail: String = chars.iter().skip(chars.len() - 4).collect();
+    format!("{head}****{tail}")
 }
 
 /// 当前用的云端识别模型名（面板上显示，免得用户不清楚到底在跑哪个模型）

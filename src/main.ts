@@ -3442,8 +3442,9 @@ async function refreshPanelKeys(): Promise<void> {
     invoke<boolean>("asr_key_ready").catch(() => false),
   ]);
   panelKeys = { assistant: !!a, tts: !!t, asr: !!r };
-  const asrInfo = await invoke<{ key: string; builtin: boolean }>("asr_key_info").catch(() => null);
-  panelKeyValues = { asr: asrInfo?.key ?? "", asrBuiltin: !!asrInfo?.builtin };
+  // 只拿掩码：Key 明文不再进前端内存（以前面板能明文显示，内置 Key 被复制外传过）
+  const asrInfo = await invoke<{ masked: string; builtin: boolean; ready: boolean }>("asr_key_info").catch(() => null);
+  panelKeyValues = { asr: asrInfo?.masked ?? "", asrBuiltin: !!asrInfo?.builtin };
   panelAsrModel = await invoke<string>("asr_model_name").catch(() => "");
 }
 
