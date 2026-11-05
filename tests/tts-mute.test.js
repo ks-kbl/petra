@@ -80,7 +80,7 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
   check("默认不静音", ttsPlayer.muted === false);
 
   ttsPlayer.setConfig(true, "test-key", "test-speaker");
-  ttsPlayer.pushDelta("今天天气不错哦。");
+  ttsPlayer.pushDelta("今天天气不错，我们出去走走吧。");
   await settle();
   await settle();
   await settle();
@@ -105,7 +105,7 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
 
   // 静音状态下进来的下一段，开播时也必须是静音
   ttsPlayer.setMuted(true);
-  ttsPlayer.pushDelta("第二句也要安静。");
+  ttsPlayer.pushDelta("第二句也要安静，别忘了把音量压住。");
   await settle();
   await settle();
   await settle();

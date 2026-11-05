@@ -1170,6 +1170,28 @@ function captureAssistantHotkey(): Promise<string | null> {
   });
 }
 
+/** 语音输入快捷键：注册 / 清除（和呼出快捷键互不影响） */
+async function registerVoiceHotkey(acc: string): Promise<boolean> {
+  try {
+    await invoke("register_voice_shortcut", { shortcut: acc });
+    return true;
+  } catch (e) {
+    console.error("register_voice_shortcut failed:", e);
+    return false;
+  }
+}
+
+async function clearVoiceHotkey(): Promise<void> {
+  settings.assistant.voiceShortcut = "";
+  saveSettings(settings);
+  try {
+    await invoke("unregister_voice_shortcut");
+  } catch (e) {
+    console.error("unregister_voice_shortcut failed:", e);
+  }
+  toast("已清除语音输入快捷键");
+}
+
 /** 调 Rust 注册/替换全局快捷键，返回是否成功 */
 async function registerAssistantHotkey(acc: string): Promise<boolean> {
   try {
@@ -1243,6 +1265,21 @@ async function setupAssistantHotkeyListener() {
   const saved = loadSettings().assistant.shortcut;
   if (saved) {
     await registerAssistantHotkey(saved);
+  }
+
+  // 语音输入快捷键：按下直接在麦克风上说话，说完自动发送
+  await listen("voice-hotkey", async () => {
+    const s = loadSettings();
+    if (!s.assistant.enabled) {
+      toast("小助手模式没开，右键开启后再用语音输入", "info");
+      return;
+    }
+    const { toggleVoiceInputFromHotkey } = await import("./assistant/AssistantPanel");
+    toggleVoiceInputFromHotkey();
+  });
+  const savedVoice = loadSettings().assistant.voiceShortcut;
+  if (savedVoice) {
+    await registerVoiceHotkey(savedVoice);
   }
 }
 
@@ -3442,8 +3479,9 @@ async function refreshPanelKeys(): Promise<void> {
     invoke<boolean>("asr_key_ready").catch(() => false),
   ]);
   panelKeys = { assistant: !!a, tts: !!t, asr: !!r };
-  const asrInfo = await invoke<{ key: string; builtin: boolean }>("asr_key_info").catch(() => null);
-  panelKeyValues = { asr: asrInfo?.key ?? "", asrBuiltin: !!asrInfo?.builtin };
+  // 只拿掩码：Key 明文不再进前端内存（以前面板能明文显示，内置 Key 被复制外传过）
+  const asrInfo = await invoke<{ masked: string; builtin: boolean; ready: boolean }>("asr_key_info").catch(() => null);
+  panelKeyValues = { asr: asrInfo?.masked ?? "", asrBuiltin: !!asrInfo?.builtin };
   panelAsrModel = await invoke<string>("asr_model_name").catch(() => "");
 }
 
@@ -3959,13 +3997,21 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
       case "hotkey-capture": {
         // 在系统层面捕获一次按键：浏览器会把 Ctrl+W / Ctrl+T / Alt+← 这类组合吃掉，
         // 面板里根本收不到 keydown，所以交给 Rust 的低级键盘钩子。
+        const isVoice = p.target === "voice";
         try {
           const acc = (await invoke<string>("capture_hotkey")).trim();
           if (!acc) throw new Error("没捕获到按键");
-          settings.assistant.shortcut = acc;
-          saveSettings(settings);
-          const ok = await registerAssistantHotkey(acc);
-          toast(ok ? `呼出快捷键设为 ${acc}` : `快捷键 ${acc} 注册失败，换一个试试`, ok ? "info" : "warn");
+          if (isVoice) {
+            const ok = await registerVoiceHotkey(acc);
+            if (ok) settings.assistant.voiceShortcut = acc;
+            saveSettings(settings);
+            toast(ok ? `语音输入快捷键设为 ${acc}` : `快捷键 ${acc} 注册失败，换一个试试`, ok ? "info" : "warn");
+          } else {
+            settings.assistant.shortcut = acc;
+            saveSettings(settings);
+            const ok = await registerAssistantHotkey(acc);
+            toast(ok ? `呼出快捷键设为 ${acc}` : `快捷键 ${acc} 注册失败，换一个试试`, ok ? "info" : "warn");
+          }
         } catch (e) {
           toast(`没录上：${e instanceof Error ? e.message : String(e)}`, "warn");
         }
@@ -3975,6 +4021,18 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
       }
       case "hotkey-set": {
         const acc = String(p.value ?? "").trim();
+        if (p.target === "voice") {
+          if (acc) {
+            const ok = await registerVoiceHotkey(acc);
+            if (ok) settings.assistant.voiceShortcut = acc;
+            saveSettings(settings);
+            toast(ok ? `语音输入快捷键设为 ${acc}` : `快捷键 ${acc} 注册失败，换一个试试`, ok ? "info" : "warn");
+          } else {
+            await clearVoiceHotkey();
+          }
+          await pushPanelState();
+          break;
+        }
         settings.assistant.shortcut = acc;
         saveSettings(settings);
         if (acc) {

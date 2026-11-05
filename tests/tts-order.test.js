@@ -72,12 +72,12 @@ URL.createObjectURL = (blob) => `blob:${blob.parts[0][0]}`;
 
 /** 每句的合成耗时（毫秒）与编号；慢的那句故意放最前面 */
 const PLAN = {
-  "第一句。": { id: 1, ms: 60 },
-  "第二句。": { id: 2, ms: 5 },
-  "第三句。": { id: 3, ms: 5 },
-  "第四句。": { id: 4, ms: 5 },
-  "第五句。": { id: 5, ms: 5, fail: true },
-  "第六句。": { id: 6, ms: 5 },
+  "第一句要说得长一点，才够断句的长度。": { id: 1, ms: 60 },
+  "第二句也要说得长一点，才不会被并进上一句。": { id: 2, ms: 5 },
+  "第三句同样要足够长，才能单独成为一段。": { id: 3, ms: 5 },
+  "第四句继续说点长的话，方便验证播放顺序。": { id: 4, ms: 5 },
+  "第五句也不能太短，否则会被合并处理。": { id: 5, ms: 5, fail: true },
+  "第六句到这里差不多了，长度刚刚好够用。": { id: 6, ms: 5 },
 };
 /** 合成"完成"的先后顺序（用来证明乱序合成这件事真的发生了） */
 const finished = [];
@@ -112,14 +112,14 @@ const order = () => playOrder.join(",");
   ttsPlayer.setConfig(true, "test-key", "test-speaker");
 
   // ---------- 场景 A：第一句合成最慢 ----------
-  ttsPlayer.pushDelta("第一句。");
-  ttsPlayer.pushDelta("第二句。");
-  ttsPlayer.pushDelta("第三句。");
+  ttsPlayer.pushDelta("第一句要说得长一点，才够断句的长度。");
+  ttsPlayer.pushDelta("第二句也要说得长一点，才不会被并进上一句。");
+  ttsPlayer.pushDelta("第三句同样要足够长，才能单独成为一段。");
   await sleep(120); // 等三句的合成都回来（第一句最慢）
 
   check(
     "前提：合成确实是乱序完成的（后面的句子先回来）",
-    finished[0] !== "第一句。",
+    finished[0] !== "第一句要说得长一点，才够断句的长度。",
     finished.join(" → "),
   );
   check("三句都预取到了", created.length === 3, `created=${created.length}`);
@@ -142,9 +142,9 @@ const order = () => playOrder.join(",");
   // ---------- 场景 B：中间那句合成失败 ----------
   finished.length = 0;
   const warnsBefore = warnings.length;
-  ttsPlayer.pushDelta("第四句。");
-  ttsPlayer.pushDelta("第五句。");
-  ttsPlayer.pushDelta("第六句。");
+  ttsPlayer.pushDelta("第四句继续说点长的话，方便验证播放顺序。");
+  ttsPlayer.pushDelta("第五句也不能太短，否则会被合并处理。");
+  ttsPlayer.pushDelta("第六句到这里差不多了，长度刚刚好够用。");
   await sleep(120);
 
   check(

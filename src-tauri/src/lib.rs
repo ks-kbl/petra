@@ -184,6 +184,11 @@ pub struct AssistantHotkey {
     pub shortcut: std::sync::Mutex<Option<Shortcut>>,
 }
 
+/// 语音输入快捷键的注册状态（和呼出快捷键互不影响，各占一个组合）
+pub struct VoiceHotkey {
+    pub shortcut: std::sync::Mutex<Option<Shortcut>>,
+}
+
 /// 拖动状态：开始后由 8ms 线程直接 GetCursorPos 跟随（零每帧 IPC）。
 /// locked_y 为待机边缘滑动：y 锁定在该值（物理），只随鼠标水平移动。
 pub struct DragState {
@@ -4051,11 +4056,15 @@ async fn tts_synthesize(
 /// 语音识别的服务端点与模型：与 TTS 同一路子 —— 请求从 Rust 侧发出，
 /// 密钥只存在于 Rust（DPAPI / Keychain / 600 权限文件），前端只拿到转写出来的文本。
 const ASR_API_URL: &str = "https://api.siliconflow.cn/v1/audio/transcriptions";
-/// 默认识别模型：XingChen (中国电信) 的 ASR-V3.2-Ultra，中文短句比 SenseVoice 更稳。
-const ASR_MODEL: &str = "XingChenAGI/XingChenASR-V3.2-Ultra";
-/// 兜底模型：万一账号没开通上面的模型（400/403/404），自动退回这个，
-/// 别让「模型没权限」直接把语音输入整条链路废掉。
-const ASR_MODEL_FALLBACK: &str = "FunAudioLLM/SenseVoiceSmall";
+/// 默认识别模型：**免费**的 SenseVoiceSmall。
+///
+/// 以前默认是 XingChen（中国电信）的付费模型 —— 内置默认 Key 一分钱没有，
+/// 于是所有用内置 Key 的人一点麦克风就吃 402「余额不足」，而免费的兜底模型
+/// 又因为 402 不在"可重试"列表里根本没被试过。现在把免费模型放到第一位：
+/// 开箱即用不花钱，账号有余额才谈得上用付费模型。
+const ASR_MODEL: &str = "FunAudioLLM/SenseVoiceSmall";
+/// 兜底模型：免费模型不认（极少见）而账号确实有余额时，换这个更稳的中文模型。
+const ASR_MODEL_FALLBACK: &str = "XingChenAGI/XingChenASR-V3.2-Ultra";
 
 /// 内置的默认 ASR Key：**编译期**从环境变量注入，源码与仓库里都没有这个字符串。
 ///
@@ -4088,9 +4097,13 @@ fn asr_key_or_default(stored: String) -> String {
 ///
 /// 前端点麦克风前先问它：没有就直接提示去配置，别白录一轮再报错。
 /// 注意别用 get_asr_key 做这件事 —— 那个只报"用户自己填的"，内置默认是隐藏的。
-/// 生效中的 ASR Key（用户填的优先，否则内置）+ 它是不是内置的。
-/// ⚠️ 这条命令会把 Key 明文交给前端 —— 用户明确说过"不怕泄露，直接贴在控制面板上"，
-/// 所以面板可以把 Key 显示出来方便查看/复制。别拿它做别的用途。
+/// 语音识别 Key 的状态 —— **绝不回明文**。
+///
+/// 以前这里把生效中的 Key（含内置默认 Key）原样交给前端，面板再显示成可选中的文本，
+/// 结果内置 Key 被随意外传/复制，账号被刷到欠费。现在只回：
+/// - `ready`：有没有可用的 Key（用户自己的或内置的）
+/// - `builtin`：是不是在用内置的那个
+/// - `masked`：掩码，例如 `sk-df****gzoa`，仅供界面显示"已配置"
 #[tauri::command]
 fn asr_key_info(app: AppHandle) -> serde_json::Value {
     let own = read_stored_asr_key(&app);
@@ -4100,7 +4113,26 @@ fn asr_key_info(app: AppHandle) -> serde_json::Value {
     } else {
         (builtin, true)
     };
-    serde_json::json!({ "key": key, "builtin": from_builtin })
+    serde_json::json!({
+        "ready": !key.trim().is_empty(),
+        "builtin": from_builtin,
+        "masked": mask_secret(&key),
+    })
+}
+
+/// 把密钥打码成 `sk-xxxx****yyyy`：只留头 5 位和尾 4 位，够人辨认、不够拿来用。
+fn mask_secret(key: &str) -> String {
+    let k = key.trim();
+    let chars: Vec<char> = k.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    if chars.len() <= 10 {
+        return "****".to_string();
+    }
+    let head: String = chars.iter().take(5).collect();
+    let tail: String = chars.iter().skip(chars.len() - 4).collect();
+    format!("{head}****{tail}")
 }
 
 /// 当前用的云端识别模型名（面板上显示，免得用户不清楚到底在跑哪个模型）
@@ -4487,9 +4519,11 @@ async fn asr_transcribe(app: AppHandle, audio: String) -> Result<String, String>
             "语音识别服务返回 {status}: {}",
             text.chars().take(200).collect::<String>()
         );
-        // 只有「模型不存在 / 没权限 / 参数不对」才值得换模型重试；
+        // 「模型不存在 / 没权限 / 参数不对」值得换模型重试。
+        // 402（余额不足 / 没开通付费模型）**也要换**：付费模型没钱不代表免费模型不能用，
+        // 以前这里把 402 当终局错误直接 break，结果免费兜底模型一次都没试过。
         // 401（Key 错）、429（限流）、5xx 换模型也没用，直接报错更诚实。
-        let retryable = matches!(status.as_u16(), 400 | 403 | 404 | 422);
+        let retryable = matches!(status.as_u16(), 400 | 402 | 403 | 404 | 422);
         log_line(&format!(
             "[asr] {model} 失败（{status}），retryable={retryable}，bytes={}，body={}",
             bytes.len(),
@@ -4498,6 +4532,14 @@ async fn asr_transcribe(app: AppHandle, audio: String) -> Result<String, String>
         if !retryable {
             break;
         }
+    }
+    // 两个模型都失败：余额不足是最常见的一类，给一句能照着做的中文提示
+    if last_err.contains("402") || last_err.contains("balance") || last_err.contains("30001") {
+        return Err(format!(
+            "{last_err} —— 硅基流动的语音模型本身是免费的（¥0/千字符），报「余额不足」通常是账号的问题：\
+             欠费、未实名，或内置 Key 的免费额度已经用尽。请到「🎤 语音识别设置」换用自己的 Key（免费注册即可），\
+             或检查该账号状态"
+        ));
     }
     Err(last_err)
 }
@@ -5550,6 +5592,47 @@ fn unregister_assistant_shortcut(
     Ok(())
 }
 
+/// 注册（或替换）语音输入快捷键：按下直接开始说话（前端收到 `voice-hotkey` 后开麦）。
+#[tauri::command]
+fn register_voice_shortcut(
+    app: AppHandle,
+    state: State<'_, VoiceHotkey>,
+    shortcut: String,
+) -> Result<(), String> {
+    let trimmed = shortcut.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("快捷键不能为空".into());
+    }
+    if let Some(prev) = state.shortcut.lock().unwrap().take() {
+        let _ = app.global_shortcut().unregister(prev);
+    }
+    let sc = Shortcut::from_str(&trimmed).map_err(|e| format!("快捷键格式无效：{e}"))?;
+    app.global_shortcut()
+        .on_shortcut(sc, |app, _shortcut, event| {
+            if event.state() == ShortcutState::Pressed {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+                let _ = app.emit("voice-hotkey", ());
+            }
+        })
+        .map_err(|e| format!("注册失败（可能已被占用）：{e}"))?;
+    *state.shortcut.lock().unwrap() = Some(sc);
+    Ok(())
+}
+
+#[tauri::command]
+fn unregister_voice_shortcut(
+    app: AppHandle,
+    state: State<'_, VoiceHotkey>,
+) -> Result<(), String> {
+    if let Some(prev) = state.shortcut.lock().unwrap().take() {
+        let _ = app.global_shortcut().unregister(prev);
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// 在**系统层面**捕获一次快捷键组合（Windows 低级键盘钩子）。
 ///
@@ -5801,6 +5884,9 @@ pub fn run() {
         .manage(AssistantHotkey {
             shortcut: std::sync::Mutex::new(None),
         })
+        .manage(VoiceHotkey {
+            shortcut: std::sync::Mutex::new(None),
+        })
         .manage(InteractionState {
             snapshot: std::sync::Mutex::new(InteractionSnapshot {
                 regions: Vec::new(),
@@ -5838,6 +5924,7 @@ pub fn run() {
             register_assistant_shortcut, unregister_assistant_shortcut, capture_hotkey,
             tts_synthesize, set_tts_key, get_tts_key,
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
+            register_voice_shortcut, unregister_voice_shortcut,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
             capture_screen,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,

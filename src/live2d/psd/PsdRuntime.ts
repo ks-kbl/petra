@@ -451,28 +451,30 @@ export class PsdRuntime {
     // 幅度取中间值：0.13 那版像"一直在摇"，0.06 那版又小到只剩抖动感（幅度太小时，
     // 同样的位移被分摊到很少的像素上，看起来反而是"卡"）。0.10/0.06/0.05/0.08 是刚好
     // 能看出在动、又不打扰的量级。
+    // 两个正弦叠在一起、还都是"永远在动"的曲线，观感就是持续左右摇。
+    // 现在只留一条很慢很轻的呼吸式摆动（周期 30 秒量级），把"动"交给下面的随机小动作。
     if (this.autoIdle) {
-      this.tgt.angleX += 0.10 * Math.sin(t * 0.42) + 0.03 * Math.sin(t * 1.13);
-      this.tgt.angleY += 0.06 * Math.sin(t * 0.31 + 1.7);
-      this.tgt.angleZ += 0.05 * Math.sin(t * 0.23 + 0.5);
-      this.tgt.body += 0.08 * Math.sin(t * 0.19 + 2.1);
+      this.tgt.angleX += 0.045 * Math.sin(t * 0.21);
+      this.tgt.angleY += 0.03 * Math.sin(t * 0.17 + 1.7);
+      this.tgt.angleZ += 0.02 * Math.sin(t * 0.13 + 0.5);
+      this.tgt.body += 0.035 * Math.sin(t * 0.11 + 2.1);
     }
     // ---- 随机小动作（平滑漂移，避免突变弹跳） ----
     if (this.autoRand) {
       if (now * 1000 > this.nextRnd) {
-        // 1.2~2.2 秒换一次目标：收敛时间约 1 秒，这样目标还没完全停住就换下一个，
-        // 动作是连着的；再慢就变成"动一下、定住、再动一下"的顿挫感。
-        this.nextRnd = now * 1000 + 1200 + Math.random() * 1000;
-        this.rndTarget.ax = (Math.random() * 2 - 1) * 0.25;
-        this.rndTarget.ay = (Math.random() * 2 - 1) * 0.13;
-        this.rndTarget.az = (Math.random() * 2 - 1) * 0.08;
-        this.rndTarget.bd = (Math.random() * 2 - 1) * 0.07;
-        this.rndTarget.ex = (Math.random() * 2 - 1) * 0.32;
-        this.rndTarget.ey = (Math.random() * 2 - 1) * 0.18;
+        // **偶发**而不是"一直在动"：换完目标后先静止 4~9 秒，再动下一次。
+        // 人待机就是这样的 —— 大部分时间不动，偶尔换个姿势；一直匀速摆反而像机器。
+        // （收敛在 ~0.7 秒内完成，所以"动"的那一下是连贯的，不会被看成卡顿。）
+        this.nextRnd = now * 1000 + 4000 + Math.random() * 5000;
+        this.rndTarget.ax = (Math.random() * 2 - 1) * 0.16;
+        this.rndTarget.ay = (Math.random() * 2 - 1) * 0.09;
+        this.rndTarget.az = (Math.random() * 2 - 1) * 0.05;
+        this.rndTarget.bd = (Math.random() * 2 - 1) * 0.05;
+        this.rndTarget.ex = (Math.random() * 2 - 1) * 0.26;
+        this.rndTarget.ey = (Math.random() * 2 - 1) * 0.15;
       }
-      // 收敛系数拉回 1.0：0.55 那版太慢，目标之间是"慢慢挪过去再停住"，
-      // 观感就是一顿一顿的。1.0 大约 1 秒到位，动作连贯。
-      const k = Math.min(1, dt * 1.0);
+      // 收敛快一点（~0.7 秒到位）：动作本身要连贯，静止期靠上面的间隔拉长
+      const k = Math.min(1, dt * 1.4);
       this.rnd.ax += (this.rndTarget.ax - this.rnd.ax) * k;
       this.rnd.ay += (this.rndTarget.ay - this.rnd.ay) * k;
       this.rnd.az += (this.rndTarget.az - this.rnd.az) * k;

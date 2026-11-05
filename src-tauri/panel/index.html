@@ -212,6 +212,11 @@ html[data-theme="dark"] .navbar{
 .chatlog-empty .ce-sub{margin-top:6px; font-size:12.5px; color:var(--txt3)}
 .chatlog-tip{margin:0 0 10px; font-size:12px; color:var(--txt3)}
 .chatlog-chip-old{border-style:dashed}
+.kb-masked{
+  font-family:ui-monospace,Consolas,monospace; font-size:12px; color:var(--txt2);
+  padding:6px 10px; border-radius:8px; background:var(--brand-soft);
+  border:1px dashed var(--line-strong); user-select:none;
+}
 .persona-grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(min(260px,100%), 1fr)); gap:12px; margin-top:6px}
 .persona-item{
   border:1px solid var(--line); border-radius:14px; padding:14px 16px;
@@ -656,6 +661,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { path: "assistant.greetInterval", label: "主动问候间隔", type: "number", min: 1, max: 1440, unit: "分钟" },
               { path: "assistant.inputIdleHideSec", label: "输入框空闲收起", type: "number", min: 0, max: 600, unit: "秒（0 = 不收起）" },
             { type: "hotkey", label: "呼出快捷键", desc: "点「录制」后直接按组合键（Esc 取消）。由系统层面捕获，浏览器占用的组合也能录；也可以手输" },
+            { type: "hotkey", field: "voiceShortcut", target: "voice", label: "语音输入快捷键", desc: "按下直接在麦克风上说话，说完自动发送；再按一次取消。和上面的呼出快捷键互不影响" },
             
           ],
         },
@@ -722,7 +728,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
           title: "语音识别", desc: "语音输入。Windows 默认用系统识别（更准、不花识别费）；Mac/Linux 没有系统识别，自动走云端模型",
           fields: [
             { path: "asr.micAllowed", label: "允许使用麦克风", type: "switch" },
-            { type: "secret", key: "asr", label: "语音识别 Key", desc: "内置Key会直接显示，可以进行更换，填写后覆盖原设置" },
+            { type: "secret", key: "asr", label: "语音识别 Key", desc: "出于安全不再展示明文：只显示掩码，粘贴新 Key 会覆盖（留空则继续用内置 Key）" },
             { path: "asr.cloudFirst", label: "优先用云端模型识别", type: "switch", desc: "默认关：Windows 用系统识别（流式、自带断句，比云端整段识别准）。开：改用下方标注的云端模型（Mac/Linux 没有系统识别，会忽略此开关直接走云端）" },
             { path: "asr.denoise", label: "降噪和自动增益", type: "switch", desc: "默认关。采集端做降噪/自动增益/回声消除，理论上是给喧闹环境用的，但实测对小模型识别多为负收益（会削齿音、把底噪拉高），觉得识别变差就先确认它是关的" },
             { type: "note", text: () => "云端模型" + ((state.meta.data || {}).asrModel || "—") + "（api.siliconflow.cn）；账号未开通该模型时会自动退回 FunAudioLLM/SenseVoiceSmall" },
@@ -1021,9 +1027,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       const values = d.keyValues || {};
       const current = values[spec.key] || "";
       const isBuiltin = spec.key === "asr" && !!values.asrBuiltin;
-      // 只有 ASR 这类「用户自己贴过、明确要看」的 Key 才明文回显；
-      // 付费 Key（小助手/语音朗读）面板根本不拿到值，只能覆盖写入。
-      const reveal = !!current;
+      // **一律不回显明文**：面板只拿得到掩码（Rust 侧就打好了码）。
+      // 以前 ASR 会把整串 Key 显示成可选中的文本，内置 Key 就是这么被复制出去、把账号刷欠费的。
+      const reveal = false;
       const block = el("div", "keyblock");
       const head = el("div", "kb-head");
       head.appendChild(el("span", "kb-label", spec.label));
@@ -1033,16 +1039,28 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       block.appendChild(head);
       if (spec.desc) block.appendChild(el("div", "kb-desc", spec.desc));
 
+      // 当前值只显示掩码，且是纯文本（不可选中、不可复制）
+      if (current) {
+        const maskedRow = el("div", "kb-masked");
+        maskedRow.textContent = `当前：${current}`;
+        maskedRow.style.userSelect = "none";
+        maskedRow.addEventListener("copy", (e) => e.preventDefault());
+        block.appendChild(maskedRow);
+      }
+
       const inputRow = el("div", "kb-row");
       const inp = document.createElement("input");
       inp.className = "kb-input";
-      inp.type = reveal ? "text" : "password";
-      inp.value = current;
-      inp.placeholder = reveal ? "粘贴 Key" : configured ? "已配置" : "粘贴 Key";
+      inp.type = "password";
+      inp.value = "";
+      inp.placeholder = configured ? "粘贴新 Key 覆盖（当前已配置）" : "粘贴 Key";
       inp.spellcheck = false;
-      inp.autocomplete = "off";
+      inp.autocomplete = "new-password";
+      // 浏览器别把它当表单字段缓存/自动填充
+      inp.setAttribute("autocorrect", "off");
+      inp.setAttribute("autocapitalize", "off");
       inputRow.appendChild(inp);
-      const save = el("button", "btn btn-sm btn-primary", reveal ? "更新" : "保存");
+      const save = el("button", "btn btn-sm btn-primary", configured ? "更新" : "保存");
       save.onclick = () => runAction(`__key:${spec.key}`, { value: inp.value });
       inputRow.appendChild(save);
       const clr = el("button", "btn btn-sm btn-ghost", "清除");
@@ -1070,10 +1088,14 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     // 快捷键：在浏览器里直接按组合键录
     if (spec.type === "hotkey") {
       const { row, ctl } = rowWrap(spec.label, spec.desc);
+      // 一个渲染函数服务两个快捷键：呼出对话框（shortcut）和语音输入（voiceShortcut）
+      const field = spec.field || "shortcut";
+      const target = spec.target || "";
+      const readValue = () => (state.settings.assistant && state.settings.assistant[field]) || "";
       const inp = document.createElement("input");
       inp.type = "text";
       // 允许手输：非 Windows 没有钩子，钩子也可能被安全软件拦，留一条手动兜底
-      inp.value = (state.settings.assistant && state.settings.assistant.shortcut) || "";
+      inp.value = readValue();
       inp.placeholder = "点「录制」自动捕获，或手输如 Ctrl+Alt+K";
       const rec = el("button", "btn btn-sm", "录制");
       // 录制交给 Rust 的低级键盘钩子（__data:hotkey-capture）：
@@ -1087,19 +1109,19 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
         pollTimer = setInterval(async () => {
           n++;
           const okRefresh = await refresh(true);
-          const now = (state.settings.assistant && state.settings.assistant.shortcut) || "";
+          const now = readValue();
           if (!okRefresh || now !== before || n > 24) clearInterval(pollTimer);
         }, 900);
       };
       rec.onclick = () => {
         rec.textContent = "按组合键…";
         startPoll(inp.value);
-        runAction("__data:hotkey-capture", "捕获快捷键");
+        runAction("__data:hotkey-capture", { target }, "捕获快捷键");
       };
       const save = el("button", "btn btn-sm btn-primary", "保存");
-      save.onclick = () => runAction("__data:hotkey-set", { value: inp.value });
+      save.onclick = () => runAction("__data:hotkey-set", { value: inp.value, target });
       const clr = el("button", "btn btn-sm", "清除");
-      clr.onclick = () => runAction("__data:hotkey-set", { value: "" });
+      clr.onclick = () => runAction("__data:hotkey-set", { value: "", target });
       ctl.append(inp, rec, save, clr);
       return row;
     }

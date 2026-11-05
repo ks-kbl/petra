@@ -80,7 +80,11 @@ function load(file, dependencies, globals = {}) {
   assert.equal(recognizer.getBackendName(), 'siliconflow', 'active recording must retain its backend');
   recognizer.active = false;
   assert.equal(recognizer.getBackendName(), 'web-speech');
-  recognizer.webSpeechBroken = true;
+  // 原生识别冷却期内 → 回落到云端（需要 Key）
+  recognizer.webSpeechRetryAt = Date.now() + 60 * 1000;
   assert.equal(recognizer.needsApiKey(), true, 'broken native backend must still fall back');
+  // 冷却到期后自动恢复原生识别 —— 不再"一次失败就整场会话放弃"
+  recognizer.webSpeechRetryAt = Date.now() - 1;
+  assert.equal(recognizer.needsApiKey(), false, 'native backend must recover after cooldown');
   console.log('panel-regressions: all assertions passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

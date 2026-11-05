@@ -43,6 +43,15 @@ import {
 } from "./moodTrend";
 import { detectCorrection } from "./correction";
 import {
+  emptySelfState,
+  normalizeSelfState,
+  settleDay,
+  recordEvent,
+  detectSocialEvents,
+  selfBlock,
+  type SelfState,
+} from "./selfModel";
+import {
   contentHash,
   needsEmbedding,
   normalizeEmbeddingCache,
@@ -98,6 +107,8 @@ const SUMMARY_KEY = "live2d-pet-assistant-chat-summary";
 const MOOD_SAMPLES_KEY = "petra-mood-samples";
 /** 主动提起旧事的节流状态（3 小时冷却 / 每天最多 2 次） */
 const NUDGE_KEY = "petra-memory-nudge";
+/** 自我状态：长期相处形成的性格偏移（每天结算一次，极慢） */
+const SELF_KEY = "petra-self-state";
 /** 记忆向量缓存（语义查重用；端点不支持就整条链路静默跳过） */
 const EMB_KEY = "petra-memory-embeddings";
 /** 端点不支持 embedding 的标记（记日期，24 小时内不再试，避免每条消息都撞一次 404） */
@@ -119,6 +130,7 @@ let lastExtractedAt = 0;
 let pendingCorrection = false;
 let moodSamples: MoodSample[] = [];
 let nudgeState: NudgeState = emptyNudgeState();
+let selfState: SelfState = emptySelfState();
 let memoryEmbeddings: EmbeddingCache = {};
 let embeddingUnsupportedDay = "";
 let timer: number | null = null;
@@ -432,6 +444,41 @@ async function refreshMemoryEmbeddings(s: any, apiKey: string) {
   }
 }
 
+function loadSelfState() {
+  try {
+    selfState = normalizeSelfState(JSON.parse(localStorage.getItem(SELF_KEY) || "null"));
+  } catch {
+    selfState = emptySelfState();
+  }
+}
+
+function saveSelfState() {
+  try {
+    localStorage.setItem(SELF_KEY, JSON.stringify(selfState));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 每条用户消息只"打点"，不改人格 —— 真正的变化发生在跨天结算那一次。
+ * 这样单次对话永远不可能让她性情大变。
+ */
+function noteSocialEvents(text: string, correcting: boolean) {
+  try {
+    for (const ev of detectSocialEvents(text)) selfState = recordEvent(selfState, ev);
+    if (correcting) selfState = recordEvent(selfState, "corrected");
+    // 跨天就结算一次（同一天反复调用是幂等的）
+    const settled = settleDay(selfState);
+    if (settled !== selfState) {
+      selfState = settled;
+      saveSelfState();
+      return;
+    }
+    saveSelfState();
+  } catch { /* 忽略：自我状态只是锦上添花 */ }
+}
+
 function loadNudgeState() {
   try {
     nudgeState = normalizeNudgeState(JSON.parse(localStorage.getItem(NUDGE_KEY) || "null"));
@@ -504,7 +551,11 @@ function sampleMoodNow() {
 
 /** 注入用的"关于主人"上下文：画像 + 最近情绪状态（都只进 system prompt） */
 function personaContextBlock(): string {
-  return [profileBlock(userProfile), moodBlock(summarizeMood(moodSamples))].filter(Boolean).join("\n\n");
+  return [
+    profileBlock(userProfile),
+    selfBlock(selfState),
+    moodBlock(summarizeMood(moodSamples)),
+  ].filter(Boolean).join("\n\n");
 }
 
 function loadChatSummary() {
@@ -1085,6 +1136,26 @@ function onVoiceKeydown(e: KeyboardEvent): void {
 }
 
 /** 点麦克风：没在听就开始听，正在听就取消（取消 = 丢弃，不发送） */
+/**
+ * 语音输入快捷键的入口：先把对话框叫出来，再开麦。
+ *
+ * - 面板没开 → 打开它（快捷键按下时 Rust 已经把窗口提到前台）
+ * - 已经在录 → 收尾提交（和点麦克风按钮一致，不乱丢内容）
+ * - 正在播 TTS → toggleVoiceInput 内部会先停掉，避免把自己的声音录进去
+ */
+export function toggleVoiceInputFromHotkey(): void {
+  try {
+    ensureInput();
+    ensureBubbles();
+    void openAssistant().then(() => {
+      if (!recognizer?.isRecording()) resetTimer();
+      void toggleVoiceInput();
+    });
+  } catch (e) {
+    console.warn("[asr] 快捷键开麦失败", e);
+  }
+}
+
 async function toggleVoiceInput(): Promise<void> {
   const r = wireRecognizer();
   resetTimer(); // 碰麦克风也算"人在互动"，别让空闲超时把面板收走
@@ -1305,6 +1376,7 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   loadMoodSamples();
   loadNudgeState();
   loadMemoryEmbeddings();
+  loadSelfState();
   // 打开对话面板也是一次"见到用户"，顺手采一个情绪点（比以前只在聊天/问候后采样更连续）
   sampleMoodNow();
   // 素材够了就在后台重算一份画像（不阻塞打开面板；没配 Key 就跳过）
@@ -1327,13 +1399,16 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
     historyLoaded = true;
   }
   inputBar!.classList.remove("hidden");
+  // 没传 rect（语音快捷键、右键菜单唤出等）就向主进程要一份当前模型矩形，
+  // 否则输入框会停在上一次的旧位置 / 屏幕角落。
+  const rect = modelRect ?? modelRectProvider?.() ?? null;
   // 定位到模型（绿框）附近：默认放底部，放不下翻到上方；始终钳制在窗口可见区内（贴边自适应）
-  if (modelRect) {
+  if (rect) {
     const vr = getVisibleRect();
     const barW = inputBar!.offsetWidth || 185;
     const barH = inputBar!.offsetHeight || 60;
     // 水平居中在模型正下方：模型中心 - 输入框半宽
-    const modelCenterX = modelRect.left + (modelRect.right - modelRect.left) / 2;
+    const modelCenterX = rect.left + (rect.right - rect.left) / 2;
     const centeredLeft = modelCenterX - barW / 2;
     // 避开已显示的信息板（避免叠放遮挡：信息板先于输入框定位）
     const infoEl = document.getElementById("info-panel");
@@ -1344,9 +1419,9 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
       l < infoRect.right && l + barW > infoRect.left &&
       t < infoRect.bottom && t + barH > infoRect.top;
     const cands = [
-      { left: centeredLeft, top: modelRect.bottom + 10 }, // 模型下方居中（默认）
+      { left: centeredLeft, top: rect.bottom + 10 }, // 模型下方居中（默认）
       { left: centeredLeft, top: vr.bottom - barH }, // 可见区底部居中（贴底时允许盖住模型下半部分）
-      { left: centeredLeft, top: modelRect.top - barH - 10 }, // 模型上方居中（最后尝试）
+      { left: centeredLeft, top: rect.top - barH - 10 }, // 模型上方居中（最后尝试）
     ];
     let pick: { left: number; top: number } | null = null;
     for (const c of cands) {
@@ -1625,7 +1700,10 @@ async function send(text: string) {
   const userContent = langReminder ? `${text}\n${langReminder}` : text;
   // 用户在纠正我（"记错了/我没说过/别记这个"）：记下来，这轮回复完立刻跑一次记忆提取，
   // 不等攒够 6 条 —— 否则 AI 会带着错的记忆再聊好几轮。
-  if (detectCorrection(text)) pendingCorrection = true;
+  const correctingNow = detectCorrection(text);
+  if (correctingNow) pendingCorrection = true;
+  // 社交事件打点（零成本，不改人格）
+  noteSocialEvents(text, correctingNow);
   // 消息真正发出去才算"回应了主动问候"（没回应则下一轮问候要换话题）
   markGreetingRepliedByUser();
   pushHistory({ role: "user", content: userContent, ts: Date.now() });
@@ -2725,6 +2803,7 @@ loadUserProfile();
 loadChatSummary();
 loadMoodSamples();
 loadNudgeState();
+loadSelfState();
 
 
 

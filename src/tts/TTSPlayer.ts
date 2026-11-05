@@ -4,6 +4,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { takeSpeechSegment, flushSpeechSegment } from "./sentenceSplit";
 
 class TTSPlayer {
   private enabled = false;
@@ -75,14 +76,18 @@ class TTSPlayer {
       this.buffer = this.buffer.split("\n---")[0];
       this.stopped = true;
     }
-    const sentence = this.extractSentence();
-    if (sentence) this.enqueue(sentence);
+    // 攒够一句再送：短句会合并，不会出现"好。/对。"各自合成一次的碎片感
+    let seg: { segment: string; rest: string } | null = null;
+    while ((seg = takeSpeechSegment(this.buffer))) {
+      this.buffer = seg.rest;
+      this.enqueue(seg.segment);
+    }
   }
 
   flush() {
     if (!this.enabled) return;
     if (!this.stopped) {
-      const rest = this.buffer.trim();
+      const rest = flushSpeechSegment(this.buffer);
       if (rest) this.enqueue(rest);
     }
     this.buffer = "";
@@ -101,23 +106,15 @@ class TTSPlayer {
     this.current = null;
   }
 
-  private extractSentence(): string | null {
-    this.buffer = this.buffer.replace(/^\n+/, "");
-    // 句末标点：中文/日文全角 + 英文句点。
-    // 英文句点必须要求"后面跟空白或到结尾"，否则会把 3.14 / v1.2 这类小数点切开。
-    const match = /^(.{2,}?(?:[。！？!?；;…]|\.(?=\s|$)))/s.exec(this.buffer);
-    if (!match) return null;
-    const sentence = match[1];
-    this.buffer = this.buffer.slice(sentence.length);
-    return sentence;
-  }
-
   private enqueue(text: string) {
     let clean = text
       .replace(/[（(][^）)]*[）)]/g, "")
       .replace(/[*_`#~|]/g, "")
       .replace(/\n---\n[\s\S]*$/, "")
+      .replace(/\s+/g, " ")
       .trim();
+    // 补一个句末标点：没有收尾标点时 TTS 的语调会"悬着"，听起来就是断在半句上
+    if (clean && !/[。！？!?…]$/.test(clean)) clean += "。";
     if (!clean || clean.length < 2) return;
     const item = { text: clean, audio: null as HTMLAudioElement | null, ready: false, blobUrl: null as string | null };
     this.queue.push(item);
