@@ -30,6 +30,30 @@ const json = (obj, status = 200) =>
 (async () => {
   const originalFetch = global.fetch;
   try {
+    // ---- 0) /models 报 401：提示必须指向"Key 无效"，不能甩锅给"站点不支持 /models" ----
+    {
+      global.fetch = async () => json({ error: { message: "无效的令牌" } }, 401);
+      let err = "";
+      try {
+        await ac.listModels("custom", "sk-bad-key", "https://example.com/v1");
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e);
+      }
+      check("401 时提示 Key 问题", /Key 的问题|重新生成/.test(err), err.slice(0, 80));
+      check("401 时不再提「不提供 /models」", !/不提供 \/models/.test(err), err.slice(0, 80));
+    }
+    // ---- 0b) /models 报 404：这时才该建议手填模型名 ----
+    {
+      global.fetch = async () => json({ error: { message: "Invalid URL" } }, 404);
+      let err = "";
+      try {
+        await ac.listModels("custom", "sk-key", "https://example.com/v1");
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e);
+      }
+      check("404 时建议手填模型名", /手填|手动填写/.test(err), err.slice(0, 80));
+    }
+
     // ---- 1) tools 被拒 → 自动降级为无工具请求，并记住该端点 ----
     {
       const requests = [];

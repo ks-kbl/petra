@@ -1364,22 +1364,36 @@ export async function listModels(
   const urls = useOllamaApi ? [`${ollamaOrigin(base)}/api/tags`, `${base}/models`] : [`${base}/models`];
 
   const errors: string[] = [];
+  /** 失败到底是"Key 不对"还是"这个端点没有 /models"，两者给的建议完全不同 */
+  let authFailed = false;
+  let noModelsApi = false;
   for (const url of urls) {
     try {
       const arr = await fetchModelList(url, apiKey);
       if (arr.length) return arr;
       errors.push(`${url}：返回了空的模型列表`);
     } catch (e: unknown) {
-      errors.push(`${url}：${e instanceof Error ? e.message : String(e)}`);
+      const msg = e instanceof Error ? e.message : String(e);
+      errors.push(`${url}：${msg}`);
+      if (/HTTP\s*(401|403)|无效的令牌|Invalid token|Unauthorized|invalid_api_key/i.test(msg)) authFailed = true;
+      if (/HTTP\s*(404|405|501)|not\s*found|不支持|Invalid URL/i.test(msg)) noModelsApi = true;
     }
   }
   const localHint = /(localhost|127\.0\.0\.1)/.test(base)
     ? "（本地服务：若报 Failed to fetch，多半是浏览器跨域被拦——给服务设 OLLAMA_ORIGINS=* 后重启即可）"
     : "";
-  const customHint = provider === "custom"
-    ? "（很多中转站不提供 /models 接口；这不代表不能用。请直接在「模型名」里手动填写中转站文档里的模型名）"
-    : "";
-  throw new Error(errors.join("；") + localHint + customHint);
+  // 按失败原因给**对应**的建议。
+  // 以前不管什么原因都追加"很多中转站不提供 /models" —— 用户 Key 填错（401）时看到
+  // 这句会以为"是站点不支持、不是我的问题"，反而找不到真正原因。
+  let hint = "";
+  if (authFailed) {
+    hint = "（这是 Key 的问题：请到中转站/供应商后台重新生成一个 API Key，粘贴时注意别带上空格或换行；换 Key 后可以再点一次「获取模型列表」）";
+  } else if (noModelsApi && provider === "custom") {
+    hint = "（这个端点没有 /models 接口，但不影响聊天：直接在「模型名」里手动填写中转站文档里写的模型名即可）";
+  } else if (provider === "custom") {
+    hint = "（若确认 Key 没错，可能就是站点不提供 /models：直接在「模型名」里手填模型名即可）";
+  }
+  throw new Error(errors.join("；") + localHint + hint);
 }
 
 /** 从 AI 自由文本中提取 CMD: <命令> 行（兜底，不用 function calling 时） */
