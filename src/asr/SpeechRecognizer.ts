@@ -75,6 +75,8 @@ function mergePartial(prev: string, next: string): string {
 const LISTEN_TIMING: ListenTiming = DEFAULT_LISTEN_TIMING;
 /** 原生识别失败后的冷却时长：到点自动再试，不用重启应用 */
 const NATIVE_RETRY_MS = 90 * 1000;
+/** 云端识别明确不可用后的停用时长 */
+const CLOUD_BLOCK_MS = 10 * 60 * 1000;
 /**
  * 云端录音（非流式）专用的收尾参数：
  * 说到停顿 1.6 秒就收（默认 5 秒是给"边说边出字"的原生识别留的手感，
@@ -163,6 +165,17 @@ export class SpeechRecognizer {
    */
   private webSpeechRetryAt = 0;
 
+  /**
+   * 云端识别"明确用不了"（余额不足 / Key 无效）时，到这个时刻之前不再尝试。
+   * 免费模型也吃 402 说明是**账号**的问题（欠费/未实名），再点多少次都一样，
+   * 只会每次都弹一遍余额不足的红色错误。10 分钟后再说。
+   */
+  private cloudBlockedUntil = 0;
+
+  private cloudBlockedNow(): boolean {
+    return Date.now() < this.cloudBlockedUntil;
+  }
+
   /** 现在是不是还在冷却期内 */
   private webSpeechBrokenNow(): boolean {
     return Date.now() < this.webSpeechRetryAt;
@@ -222,7 +235,10 @@ export class SpeechRecognizer {
   private refreshBackend(): void {
     // Never switch the backend of an active recording; apply preferences next time.
     if (!this.isRecording()) {
-      this.backend = pickBackend(getSpeechRecognitionCtor() !== null, this.webSpeechBrokenNow(), preferCloudAsr());
+      // 云端刚被判"用不了"时，即使原生识别出过错也优先回原生：
+      // 不然就变成"原生不行→云端→云端也不行→每次都弹错"的死循环。
+      const broken = this.webSpeechBrokenNow() && !this.cloudBlockedNow();
+      this.backend = pickBackend(getSpeechRecognitionCtor() !== null, broken, preferCloudAsr() && !this.cloudBlockedNow());
     }
   }
   getBackendName(): AsrBackend { this.refreshBackend(); return this.backend; }
@@ -756,8 +772,17 @@ export class SpeechRecognizer {
       // 云端明确"用不了"（余额不足 / Key 无效 / 未开通）：立刻把原生识别的冷却清掉，
       // 下次点麦克风会重新试系统识别 —— 而不是在一条走不通的路上反复撞。
       if (/402|余额|balance|insufficient|401|未配置|未开通/i.test(msg)) {
+        // 云端这条路走不通了：10 分钟内别再试，同时把原生识别的冷却清掉，
+        // 下次点麦克风直接回系统识别，不再一条条弹"余额不足"。
+        this.cloudBlockedUntil = Date.now() + CLOUD_BLOCK_MS;
         this.webSpeechRetryAt = 0;
-        asrLog("云端识别不可用，已解除原生识别冷却，下次优先重试系统识别");
+        asrLog("云端识别不可用，10 分钟内不再尝试，已切回系统识别优先");
+        this.handlers.onError?.(
+          `${msg.startsWith("未配置") ? msg : `语音识别失败：${msg}`}\n`
+          + "（在线识别先停用 10 分钟，这段时间会用系统识别；硅基流动的语音模型本身免费，"
+          + "报余额不足通常是账号欠费/未实名，或内置 Key 额度用尽 —— 可在「🎤 语音识别设置」换用自己的 Key）",
+        );
+        return;
       }
       this.handlers.onError?.(msg.startsWith("未配置") ? msg : `语音识别失败：${msg}`);
     }

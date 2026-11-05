@@ -4508,7 +4508,9 @@ async fn asr_transcribe(app: AppHandle, audio: String) -> Result<String, String>
     // 两个模型都失败：余额不足是最常见的一类，给一句能照着做的中文提示
     if last_err.contains("402") || last_err.contains("balance") || last_err.contains("30001") {
         return Err(format!(
-            "{last_err} —— 语音识别账号余额不足（付费模型需要余额；免费模型也失败时请到「🎤 语音识别设置」换用自己的 Key）"
+            "{last_err} —— 硅基流动的语音模型本身是免费的（¥0/千字符），报「余额不足」通常是账号的问题：\
+             欠费、未实名，或内置 Key 的免费额度已经用尽。请到「🎤 语音识别设置」换用自己的 Key（免费注册即可），\
+             或检查该账号状态"
         ));
     }
     Err(last_err)
