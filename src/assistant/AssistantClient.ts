@@ -1371,6 +1371,8 @@ export async function listModels(
   provider: AssistantProvider,
   apiKey: string,
   customBaseUrl: string,
+  /** 过滤统计回调：告诉调用方"站点返回了多少、过滤掉多少"，面板才能解释"为什么只有这么几个" */
+  onStats?: (raw: string[], kept: string[]) => void,
 ): Promise<string[]> {
   const base = resolveBase(provider, customBaseUrl);
   const useOllamaApi = provider === "ollama" || /:11434(\/|$)/.test(base);
@@ -1387,7 +1389,9 @@ export async function listModels(
         // 中转站常把图像/语音/向量模型混在同一个列表里（比如 gpt-image-2），
         // 选错就是 400。这里只留像对话模型的；万一全被过滤就原样返回，别让用户没得选。
         const chatLike = arr.filter((m) => !looksLikeNonChatModel(m));
-        return chatLike.length ? chatLike : arr;
+        const kept = chatLike.length ? chatLike : arr;
+        onStats?.(arr, kept);
+        return kept;
       }
       errors.push(`${url}：返回了空的模型列表`);
     } catch (e: unknown) {

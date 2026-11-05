@@ -3455,6 +3455,8 @@ function buildSettingsItems(engine: BehaviorEngine): MenuItemSpec[] {
 let panelChat: { role: string; content: string }[] = [];
 let panelDiaries: { date: string; text: string }[] = [];
 let panelAssistantModels: string[] = [];
+/** 模型列表的一句话说明（站点返回多少、过滤掉多少），面板上显示，解释"为什么只有这么几个" */
+let panelModelNote = "";
 let panelKeys = { assistant: false, tts: false, asr: false };
 /** 面板上直接显示出来的 Key 明文（用户明确要求「不怕泄露，贴在控制台上」） */
 /**
@@ -3592,6 +3594,7 @@ function buildPanelMeta() {
       card: getTodayDraw(),
       actionList: listActions(),
       assistantModels: panelAssistantModels,
+      modelNote: panelModelNote,
       personaTest: panelPersonaTest,
       asrModel: panelAsrModel,
       asrTest: panelAsrTest,
@@ -4121,8 +4124,17 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
           settings.assistant.provider,
           key,
           settings.assistant.customBaseUrl,
+          (raw, kept) => {
+            panelModelNote = kept.length < raw.length
+              ? `站点返回 ${raw.length} 个模型，已隐藏 ${raw.length - kept.length} 个非对话模型（图像/语音等）`
+              : `站点返回 ${raw.length} 个模型`;
+          },
         );
-        toast(`拿到 ${panelAssistantModels.length} 个模型`);
+        toast(
+          panelModelNote
+            ? `拿到 ${panelAssistantModels.length} 个模型（${panelModelNote}）`
+            : `拿到 ${panelAssistantModels.length} 个模型`,
+        );
         break;
       }
       case "plugins-open-dir": {

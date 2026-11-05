@@ -1223,7 +1223,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
         const wrap = el("div", "modelwrap");
         wrap.appendChild(row);
         if (models.length) {
+          const note = (state.meta.data || {}).modelNote || "";
           wrap.appendChild(el("div", "rdesc", `已获取 ${models.length} 个模型，点击以填入：`));
+          if (note) wrap.appendChild(el("div", "rdesc", note));
           const chips = el("div", "modelpick");
           models.forEach((mm) => {
             const on = (cur ?? "") === mm;
