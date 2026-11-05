@@ -3929,6 +3929,9 @@ async function handlePanelPresetAction(kind: string, payload: unknown): Promise<
 }
 
 /** 面板要的数据（对话记录 / 日记 / 抽卡 / 播放动作 / 反馈 / 快捷键 / 拉模型列表） */
+/** 合作中转站：一键把「自定义供应商 + 端点」填好，用户只需再粘 Key 和选模型 */
+const PARTNER_API_BASE = "https://chickener.top/v1";
+
 async function handlePanelDataAction(kind: string, payload: unknown): Promise<void> {
   const p = (payload ?? {}) as Record<string, unknown>;
   try {
@@ -3941,6 +3944,19 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
       case "website":
         await invoke("open_url", { url: "http://petra.xin/" });
         break;
+      case "use-partner-api": {
+        // 合作中转站：切到「自定义」供应商并填好端点；Key 和模型名留给用户
+        // （Key 只能在用户自己那边生成；模型名用面板的「获取模型列表」挑最省事）
+        settings.assistant.provider = "custom";
+        settings.assistant.customBaseUrl = PARTNER_API_BASE;
+        settings.assistant.activePresetId = "";
+        settings.assistant.model = "";
+        saveSettings(settings);
+        panelAssistantModels = [];
+        await pushPanelState();
+        toast("已填好合作中转站的端点，接下来粘贴 Key、再点「获取模型列表」");
+        break;
+      }
       case "check-update":
         void checkUpdate(true);
         break;

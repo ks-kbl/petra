@@ -217,6 +217,17 @@ html[data-theme="dark"] .navbar{
   padding:6px 10px; border-radius:8px; background:var(--brand-soft);
   border:1px dashed var(--line-strong); user-select:none;
 }
+.promo-link{
+  display:inline-block; margin:2px 0 12px; padding:9px 14px; border-radius:10px;
+  background:linear-gradient(135deg,var(--brand),var(--brand2)); color:#fff;
+  font-size:13px; font-weight:600; text-decoration:none;
+}
+.promo-link:hover{filter:brightness(1.06)}
+.promo-rules,.promo-steps{
+  border:1px dashed var(--line-strong); border-radius:12px; padding:10px 12px;
+  margin-bottom:10px; font-size:12.5px; color:var(--txt2); line-height:1.8;
+}
+.promo-rules .pr-title,.promo-steps .pr-title{font-weight:600; color:var(--txt); margin-bottom:4px}
 .persona-grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(min(260px,100%), 1fr)); gap:12px; margin-top:6px}
 .persona-item{
   border:1px solid var(--line); border-radius:14px; padding:14px 16px;
@@ -649,6 +660,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { type: "usage" },
           ],
         },
+        { title: "不会接 API？", desc: "", type: "promo" },
         { title: "预设", desc: "", type: "presets" },
         { title: "主动问候调度", desc: "", type: "greetstat" },
         { title: "对话记录", desc: "", type: "chat" },
@@ -1563,6 +1575,46 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     return card;
   }
 
+  /**
+   * 合作中转站：给不会配 API 的用户一个现成的去处。
+   * 只放一个明确的优惠入口 + 一键把端点填好，不替用户做选择。
+   */
+  function promoCard() {
+    const card = el("div", "card");
+    card.appendChild(el("h2", null, "不会接 API？"));
+    card.appendChild(el("p", "cd", "不知道接什么 API，看看这里 —— 合作方是 OpenAI 兼容接口，Petra 可以直接用。"));
+
+    const link = document.createElement("a");
+    link.className = "promo-link";
+    link.href = "https://chickener.top/petra";
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "👉 点这里注册（chickener.top）";
+    card.appendChild(link);
+
+    const rules = el("div", "promo-rules");
+    rules.appendChild(el("div", "pr-title", "优惠规则"));
+    rules.appendChild(el("div", null, "· 通过上面这个链接进入并注册，充值即返利 15%"));
+    rules.appendChild(el("div", null, "· 只有从这个专属链接注册的账号才能享受，直接访问官网注册不算"));
+    rules.appendChild(el("div", null, "· 返利以合作方规则为准，Petra 不参与结算"));
+    card.appendChild(rules);
+
+    const steps = el("div", "promo-steps");
+    steps.appendChild(el("div", "pr-title", "接进来的三步"));
+    steps.appendChild(el("div", null, "1. 点上面的链接注册，在后台生成一个 API Key"));
+    steps.appendChild(el("div", null, "2. 点下面的「填好这个中转站」，端点会自动填成 https://chickener.top/v1"));
+    steps.appendChild(el("div", null, "3. 把 Key 粘到上面的「API Key」，再点「获取模型列表」挑一个模型"));
+    card.appendChild(steps);
+
+    const btns = el("div", "btn-row");
+    const use = el("button", "btn btn-sm btn-primary", "填好这个中转站");
+    use.onclick = () => runAction("__data:use-partner-api", "填入合作中转站", "填入合作中转站");
+    btns.appendChild(use);
+    card.appendChild(btns);
+
+    return card;
+  }
+
   /** 内置人设：一键套用（会覆盖当前字段），也可以完全不用、自己在下面写 */
   function personasCard() {
     const card = el("div", "card wide");
@@ -2230,6 +2282,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (cardSpec.type === "chatlog") return grid.appendChild(chatLogCard());
       if (cardSpec.type === "greetstat") return grid.appendChild(greetStatNode());
       if (cardSpec.type === "personas") return grid.appendChild(personasCard());
+      if (cardSpec.type === "promo") return grid.appendChild(promoCard());
       if (cardSpec.type === "card") return grid.appendChild(cardCard());
       if (cardSpec.type === "diary") return grid.appendChild(diaryCard());
       if (cardSpec.type === "actionplay") return grid.appendChild(actionPlayCard());
