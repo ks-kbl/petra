@@ -160,6 +160,14 @@ let voicePausedByKey = false;
 let lastSentText = "";
 let lastSentAt = 0;
 let micBtn: HTMLButtonElement | null = null;
+let sendBtn: HTMLButtonElement | null = null;
+/** 正在等回复：发送按钮只做"看不见的忙碌态"，不给用户"点了没反应"的错觉 */
+function setSendBusy(on: boolean) {
+  if (!sendBtn) return;
+  sendBtn.disabled = on;
+  sendBtn.textContent = on ? "…" : "发送";
+  sendBtn.classList.toggle("as-send-busy", on);
+}
 
 /**
  * 最近生成过的图（localStorage，最多 20 条）。
@@ -193,6 +201,21 @@ function recentImageBlock(): string {
   if (!last) return "";
   if (Date.now() - last.ts > 2 * 3600_000) return "";
   return `【最近生成的图】${last.path}（提示词：${last.prompt.slice(0, 60)}，模型：${last.model}）。用户说"把图放桌面/打开那张图"指的就是它；要复制到桌面就调用 copy_to_desktop。`;
+}
+
+/** 输入框草稿：Esc 收起时保留，下次打开自动填回 */
+const DRAFT_KEY = "petra-input-draft";
+function saveDraft(text: string) {
+  try { localStorage.setItem(DRAFT_KEY, text); } catch { /* 忽略 */ }
+}
+function takeDraft(): string {
+  try {
+    const v = localStorage.getItem(DRAFT_KEY) || "";
+    localStorage.removeItem(DRAFT_KEY);
+    return v;
+  } catch {
+    return "";
+  }
 }
 
 /** 本轮要发给模型的图片（dataURL）。只在这一次请求里编码，不写进历史 */
@@ -251,15 +274,29 @@ async function shrinkImage(dataUrl: string): Promise<string> {
 function renderAttachBar(bar: HTMLDivElement) {
   bar.innerHTML = "";
   const items = [
-    ...pendingImages.map((im, i) => ({ label: `🖼 ${im.name}`, kind: "img" as const, i })),
-    ...pendingTextFiles.map((f, i) => ({ label: `📄 ${f.name}`, kind: "txt" as const, i })),
+    ...pendingImages.map((im, i) => ({ label: im.name, thumb: im.dataUrl, kind: "img" as const, i })),
+    ...pendingTextFiles.map((f, i) => ({ label: f.name, thumb: "", kind: "txt" as const, i })),
   ];
   if (!items.length) { bar.classList.add("hidden"); return; }
   bar.classList.remove("hidden");
+  // 出现时轻微闪一下，提示"东西已经挂上了"
+  bar.classList.remove("flash");
+  void bar.offsetWidth;
+  bar.classList.add("flash");
   for (const it of items) {
     const chip = document.createElement("span");
     chip.className = "as-attach-chip";
-    chip.textContent = it.label;
+    if (it.thumb) {
+      // 缩略图：选完能一眼确认是不是要的那张
+      const img = document.createElement("img");
+      img.className = "as-attach-thumb";
+      img.src = it.thumb;
+      img.alt = "";
+      chip.appendChild(img);
+    } else {
+      chip.appendChild(document.createTextNode("📄 "));
+    }
+    chip.appendChild(document.createTextNode(it.label));
     const x = document.createElement("button");
     x.type = "button";
     x.textContent = "×";
@@ -306,9 +343,15 @@ async function addFiles(files: FileList | File[]) {
         }
         if (dataUrl) pendingImages.push({ name: f.name, dataUrl });
       } else if (/^(text\/|application\/(json|xml|javascript|x-yaml|yaml))/.test(f.type) || /\.(txt|md|markdown|json|ya?ml|csv|log|ini|toml|ts|tsx|js|jsx|py|rs|go|java|c|h|cpp|css|html|xml|sql|sh|bat|ps1)$/i.test(f.name)) {
-        if (f.size > ATTACH_TEXT_MAX_BYTES) { notes.push(`${f.name} 太大（>100KB），改用说路径让我读`); continue; }
         const text = await f.text();
-        pendingTextFiles.push({ name: f.name, text });
+        // 超长不再拒收：截断 + 说清楚，避免用户"文件明明不大却发不进来"
+        if (f.size > ATTACH_TEXT_MAX_BYTES) {
+          const cut = text.slice(0, ATTACH_TEXT_MAX_BYTES);
+          pendingTextFiles.push({ name: f.name, text: cut + `\n…（文件较大，只取了前 ${Math.round(ATTACH_TEXT_MAX_BYTES / 1024)}KB；需要全文就告诉我路径，我用工具读）` });
+          notes.push(`${f.name} 较大，只取了前 ${Math.round(ATTACH_TEXT_MAX_BYTES / 1024)}KB`);
+        } else {
+          pendingTextFiles.push({ name: f.name, text });
+        }
       } else {
         notes.push(`${f.name} 是二进制文件，我读不了内容 —— 可以直接告诉我它的路径，我用工具读`);
       }
@@ -907,6 +950,12 @@ function ensureInput() {
     // Esc 直接收起输入框：用户想关掉时不用去点角落的 ✕
     if (e.key === "Escape") {
       e.preventDefault();
+      // 有内容就只收面板、不丢字：下次打开输入框还在（ESC 原本会直接把敲了一半的话扔掉）
+      const draft = input.value;
+      if (draft.trim()) {
+        saveDraft(draft);
+        toast("已收起，内容留着，下次打开还在", "info");
+      }
       closeAssistant();
       return;
     }
@@ -932,6 +981,7 @@ function ensureInput() {
   const btn = document.createElement("button");
   btn.className = "as-send";
   btn.textContent = "发送";
+  sendBtn = btn;
   btn.addEventListener("click", () => {
     const t = input.value.trim();
     if (!t) return;
@@ -1466,6 +1516,61 @@ function bubbleBody(b: HTMLElement): HTMLElement {
   return (b.querySelector(".as-bubble-body") as HTMLElement | null) ?? b;
 }
 
+/**
+ * 生成图片后，在对话里直接显示缩略图（点一下用系统看图打开）。
+ * 以前只把路径写在文字里，用户既看不到图、点 `[查看图片]` 也没反应。
+ */
+async function addImageBubble(path: string) {
+  try {
+    const dataUrl = await invoke<string>("read_image_data_url", { path });
+    ensureBubbles();
+    const b = document.createElement("div");
+    b.className = "as-bubble as-ai as-image-bubble";
+    const img = document.createElement("img");
+    img.className = "as-bubble-img";
+    img.src = dataUrl;
+    img.alt = "生成的图片";
+    img.title = "点击用系统看图打开";
+    img.addEventListener("click", () => {
+      void invoke("open_path", { path }).catch(() => toast(`图片在：${path}`, "info"));
+    });
+    b.appendChild(img);
+    attachBubbleClose(b);
+    bubbles?.appendChild(b);
+    setTimeout(() => b.scrollIntoView({ block: "nearest", behavior: "smooth" }), 50);
+  } catch { /* 预览失败不影响主流程：路径已经在文字里了 */ }
+}
+
+/**
+ * 生图期间把等待气泡换成"进度 + 取消"。
+ * 生图要 25 秒生成 + 30 秒下载，只写"正在画"用户会以为卡死。
+ */
+function startGenProgress(bubble: HTMLElement, onCancel: () => void): () => void {
+  const body = bubbleBody(bubble);
+  const started = Date.now();
+  const render = () => {
+    const sec = Math.round((Date.now() - started) / 1000);
+    body.innerHTML = "";
+    const span = document.createElement("span");
+    span.textContent = `正在画图…已 ${sec} 秒（通常 1 分钟左右）`;
+    const btn = document.createElement("button");
+    btn.className = "as-cancel-btn";
+    btn.textContent = "取消";
+    btn.onclick = () => {
+      btn.disabled = true;
+      span.textContent = "正在取消…";
+      onCancel();
+    };
+    body.append(span, btn);
+  };
+  render();
+  const timer = window.setInterval(render, 1000);
+  return () => {
+    window.clearInterval(timer);
+    body.innerHTML = "";
+  };
+}
+
 function setBubbleText(b: HTMLElement, text: string): void {
   bubbleBody(b).textContent = text;
 }
@@ -1616,6 +1721,11 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
     historyLoaded = true;
   }
   inputBar!.classList.remove("hidden");
+  // Esc 收起时留下的草稿：打开面板自动填回
+  if (input && !input.value.trim()) {
+    const draft = takeDraft();
+    if (draft) setInputValue(draft);
+  }
   // 没传 rect（语音快捷键、右键菜单唤出等）就向主进程要一份当前模型矩形，
   // 否则输入框会停在上一次的旧位置 / 屏幕角落。
   const rect = modelRect ?? modelRectProvider?.() ?? null;
@@ -2172,6 +2282,7 @@ async function send(text: string) {
     scheduleFade(loading, readingHoldMs(getBubbleText(loading), 8000));
   } finally {
     busy = false;
+    setSendBusy(false);
     resetTimer(); // 一轮对话结束 = 一次互动，空闲窗口重新开始计时
   }
 }
@@ -2461,15 +2572,27 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
               + "请如实告诉用户这一点，不要说自己正在画。",
           });
         } else {
-          const img = await generateImage({
-            provider: st.assistant.provider,
-            apiKey: key,
-            customBaseUrl: st.assistant.customBaseUrl,
-            model,
-            fallbackModels: found,
-            prompt: String(tc.args.prompt || ""),
-            size: tc.args.size ? String(tc.args.size) : undefined,
-          });
+          const ctrl = new AbortController();
+          const stopProgress = startGenProgress(loading, () => ctrl.abort());
+          let img;
+          try {
+            img = await generateImage({
+              provider: st.assistant.provider,
+              apiKey: key,
+              customBaseUrl: st.assistant.customBaseUrl,
+              model,
+              fallbackModels: found,
+              prompt: String(tc.args.prompt || ""),
+              size: tc.args.size ? String(tc.args.size) : undefined,
+              signal: ctrl.signal,
+            });
+          } finally {
+            stopProgress();
+          }
+          // 自动换过模型要说一声，否则用户不知道"我选的模型没生效"
+          if (model && img.model !== model) {
+            toast(`模型 ${model} 画不了，已自动换成 ${img.model}`, "info");
+          }
           // 记住"真正画成功"的那个模型，下次直接用，不再挨个试
           if (img.model && img.model !== st.assistant.imageModel) {
             st.assistant.imageModel = img.model;
@@ -2482,9 +2605,14 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           rememberGenImage({ path, prompt: String(tc.args.prompt || ""), model: img.model, ts: Date.now() });
           pushHistory({ role: "tool", tool_call_id: tc.id, content: `已用 ${img.model} 生成图片并保存到桌面：${path}` });
           toast(`画好了（${img.model}），已存到桌面：${path}`, "info");
+          void addImageBubble(path);
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
+        if (/abort/i.test(msg)) {
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: "用户取消了这次生图，什么都没生成。" });
+          return;
+        }
         // 端点根本没有 /images/generations：这是"能力问题"，不是临时故障
         if (/HTTP\s*(404|405)|不支持生图|not support/i.test(msg)) {
           st.assistant.imageCapable = false;
@@ -2966,6 +3094,7 @@ export async function triggerProactive(): Promise<boolean> {
   });
 
   busy = true;
+  setSendBusy(true);
   lifecycleOnOpen?.();
   const bubble = addBubble("ai", "");
   setBubbleText(bubble, "正在看看你在做什么…");
@@ -3042,6 +3171,7 @@ export async function triggerProactive(): Promise<boolean> {
     return false;
   } finally {
     busy = false;
+    setSendBusy(false);
     lifecycleOnClose?.();
   }
 }
@@ -3098,6 +3228,7 @@ export async function triggerCardCommentary(card: { rarity: string; theme: strin
     bubble.remove();
   } finally {
     busy = false;
+    setSendBusy(false);
     lifecycleOnClose?.();
   }
 }

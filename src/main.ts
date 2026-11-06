@@ -3457,6 +3457,15 @@ let panelDiaries: { date: string; text: string }[] = [];
 let panelAssistantModels: string[] = [];
 /** 站点里识别到的生图模型（面板上显示"自动识别：gpt-image-2"） */
 let panelImageModels: string[] = [];
+/** 最近生成的图（读 WebView 的 localStorage，供面板缩略图墙展示） */
+function readGenImages(): { path: string; prompt: string; model: string; ts: number }[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem("petra-generated-images") || "[]");
+    return Array.isArray(raw) ? raw.slice(0, 12) : [];
+  } catch {
+    return [];
+  }
+}
 /** 模型列表的一句话说明（站点返回多少、过滤掉多少），面板上显示，解释"为什么只有这么几个" */
 let panelModelNote = "";
 let panelKeys = { assistant: false, tts: false, asr: false };
@@ -3597,6 +3606,7 @@ function buildPanelMeta() {
       actionList: listActions(),
       assistantModels: panelAssistantModels,
       imageModels: panelImageModels,
+      genImages: readGenImages(),
       modelNote: panelModelNote,
       personaTest: panelPersonaTest,
       asrModel: panelAsrModel,
@@ -3950,6 +3960,11 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
       case "website":
         await invoke("open_url", { url: "http://petra.xin/" });
         break;
+      case "open-file": {
+        const path = String(p.path ?? "").trim();
+        if (path) await invoke("open_path", { path });
+        break;
+      }
       case "use-partner-api": {
         // 合作中转站：切到「自定义」供应商并填好端点；Key 和模型名留给用户
         // （Key 只能在用户自己那边生成；模型名用面板的「获取模型列表」挑最省事）

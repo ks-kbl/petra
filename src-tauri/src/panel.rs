@@ -428,6 +428,15 @@ pub fn ensure_started(app: &AppHandle) -> Result<String, String> {
     Ok(format!("http://127.0.0.1:{}/#t={}", port, panel.token))
 }
 
+/// 用户主目录（用于限制 /api/genimage 只能读自己家的图片）
+fn dirs_home() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    home.map(std::path::PathBuf::from)
+}
+
 fn handle_conn(mut stream: TcpStream, panel: &Panel) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -506,6 +515,42 @@ fn handle_conn(mut stream: TcpStream, panel: &Panel) -> std::io::Result<()> {
         ("GET", "/api/ping") => {
             let seq = *panel.seq.lock().unwrap();
             json_resp(&mut stream, 200, json!({"ok": true, "seq": seq}))
+        }
+        // 最近生成的图片：面板里显示缩略图用（<img> 带不了自定义头，所以走 ?t=token）
+        ("GET", "/api/genimage") => {
+            let path = query.get("path").cloned().unwrap_or_default();
+            let p = std::path::PathBuf::from(&path);
+            let ok_ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif"))
+                .unwrap_or(false);
+            if path.trim().is_empty() || !ok_ext || !p.is_file() {
+                return respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found", false);
+            }
+            // 只允许用户目录下的图片（防止被当成任意文件读取器）
+            let allowed = dirs_home().map(|h| p.starts_with(&h)).unwrap_or(false);
+            if !allowed {
+                return respond(&mut stream, 403, "text/plain; charset=utf-8", b"forbidden", false);
+            }
+            match std::fs::read(&p) {
+                Ok(bytes) => {
+                    let mime = match p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "jpg" | "jpeg" => "image/jpeg",
+                        "webp" => "image/webp",
+                        "gif" => "image/gif",
+                        _ => "image/png",
+                    };
+                    respond(&mut stream, 200, mime, &bytes, false)
+                }
+                Err(_) => respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found", false),
+            }
         }
         ("GET", "/api/state") => {
             let seq = *panel.seq.lock().unwrap();

@@ -3000,6 +3000,40 @@ async fn save_image_from_url(url: String, name_hint: String) -> Result<String, S
     write_desktop_image(&bytes, ext, &name_hint)
 }
 
+/// 读一张图片，返回可直接放进 `<img src>` 的 dataURL（聊天气泡里显示缩略图用）。
+///
+/// 为什么不直接用 file:// 或 asset://：WebView 里 file 协议默认被拦，asset 协议要额外配置
+/// 作用域；直接把字节编成 dataURL 最省事，也只在"刚生成完要显示一次"时用。
+#[tauri::command]
+fn read_image_data_url(path: String) -> Result<String, String> {
+    use base64::Engine as _;
+    let p = std::path::PathBuf::from(path.trim());
+    if !p.is_file() {
+        return Err(format!("找不到这个图片：{}", p.display()));
+    }
+    let meta = std::fs::metadata(&p).map_err(|e| format!("读取失败：{e}"))?;
+    if meta.len() > 16 * 1024 * 1024 {
+        return Err("图片太大，没法在气泡里预览".into());
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("读取失败：{e}"))?;
+    let mime = match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "image/png",
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
 /// 把任意文件复制到桌面（"把那张图放到我桌面"这种请求）。
 #[tauri::command]
 fn copy_to_desktop(path: String) -> Result<String, String> {
@@ -6052,7 +6086,7 @@ pub fn run() {
             tts_synthesize, set_tts_key, get_tts_key,
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
             register_voice_shortcut, unregister_voice_shortcut, save_desktop_image,
-            save_image_from_url, copy_to_desktop,
+            save_image_from_url, copy_to_desktop, read_image_data_url,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
             capture_screen,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,

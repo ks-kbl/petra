@@ -1540,6 +1540,8 @@ export async function generateImage(opts: {
   fallbackModels?: string[];
   prompt: string;
   size?: string;
+  /** 外部取消信号（用户在进度气泡上点"取消"） */
+  signal?: AbortSignal;
 }): Promise<GeneratedImage> {
   const base = resolveBase(opts.provider, opts.customBaseUrl);
   const candidates: string[] = [];
@@ -1555,7 +1557,7 @@ export async function generateImage(opts: {
   const tried: string[] = [];
   for (const model of candidates) {
     try {
-      const img = await requestImageOnce(base, opts.apiKey, model, prompt, opts.size);
+      const img = await requestImageOnce(base, opts.apiKey, model, prompt, opts.size, opts.signal);
       return { ...img, model };
     } catch (e) {
       tried.push(model);
@@ -1575,6 +1577,7 @@ async function requestImageOnce(
   model: string,
   prompt: string,
   size?: string,
+  signal?: AbortSignal,
 ): Promise<Omit<GeneratedImage, "model">> {
   const body: Record<string, unknown> = { model, prompt, n: 1, response_format: "b64_json" };
   if (size) body.size = size;

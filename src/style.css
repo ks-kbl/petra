@@ -524,6 +524,53 @@ body {
   transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.3, 1.25), box-shadow 0.2s ease,
     background 0.25s ease, color 0.2s ease, border-color 0.2s ease;
 }
+/* 附件小缩略图 */
+.as-attach-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  object-fit: cover;
+  flex: 0 0 auto;
+}
+/* 附件条出现时闪一下 */
+.as-attach-bar.flash { animation: as-attach-flash 0.5s ease; }
+@keyframes as-attach-flash {
+  0% { opacity: 0; transform: translateY(4px); }
+  100% { opacity: 1; transform: none; }
+}
+
+/* 生图上进度气泡里的"取消" */
+.as-cancel-btn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  font-size: 11.5px;
+  border-radius: 999px;
+  border: 1px solid rgba(150, 95, 190, 0.45);
+  background: rgba(255, 255, 255, 0.7);
+  color: #6a4a86;
+  cursor: pointer;
+}
+.as-cancel-btn:hover { background: rgba(200, 70, 110, 0.85); color: #fff; border-color: transparent; }
+.as-cancel-btn:disabled { opacity: 0.55; cursor: default; }
+
+/* 生成出来的图片气泡 */
+.as-image-bubble { padding: 6px; }
+.as-bubble-img {
+  display: block;
+  max-width: 220px;
+  max-height: 220px;
+  border-radius: 12px;
+  cursor: zoom-in;
+  box-shadow: 0 6px 18px rgba(80, 40, 110, 0.25);
+}
+
+/* 发送按钮忙碌态 */
+.as-send:disabled, .as-send.as-send-busy {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+}
+
 .as-mic svg {
   width: 15px;
   height: 15px;

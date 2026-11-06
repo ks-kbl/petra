@@ -217,6 +217,14 @@ html[data-theme="dark"] .navbar{
   padding:6px 10px; border-radius:8px; background:var(--brand-soft);
   border:1px dashed var(--line-strong); user-select:none;
 }
+.gen-wall{display:grid; grid-template-columns:repeat(auto-fill,minmax(110px,1fr)); gap:10px}
+.gen-cell{
+  display:flex; flex-direction:column; gap:4px; padding:6px; border-radius:12px; cursor:pointer;
+  border:1px solid var(--line-strong); background:rgba(255,255,255,.6); overflow:hidden;
+}
+.gen-cell:hover{border-color:var(--brand); transform:translateY(-1px)}
+.gen-cell img{width:100%; aspect-ratio:1/1; object-fit:cover; border-radius:8px; display:block}
+.gen-cap{font-size:11px; color:var(--txt2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .promo-link{
   display:inline-block; margin:2px 0 12px; padding:9px 14px; border-radius:10px;
   background:linear-gradient(135deg,var(--brand),var(--brand2)); color:#fff;
@@ -665,6 +673,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
           ],
         },
         { title: "不会接 API？", desc: "", type: "promo" },
+        { title: "最近生成的图", desc: "", type: "genimages" },
         { title: "预设", desc: "", type: "presets" },
         { title: "主动问候调度", desc: "", type: "greetstat" },
         { title: "对话记录", desc: "", type: "chat" },
@@ -1589,6 +1598,34 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     return card;
   }
 
+  /** 最近生成的图：缩略图墙，点开就用系统看图看大图 */
+  function genImagesCard() {
+    const card = el("div", "card");
+    card.appendChild(el("h2", null, "最近生成的图"));
+    const list = (state.meta.data || {}).genImages || [];
+    if (!list.length) {
+      card.appendChild(el("p", "cd", "还没有生成过图片。跟桌宠说「画一只打伞的鲸鱼」试试。"));
+      return card;
+    }
+    card.appendChild(el("p", "cd", "生成的图会自动存到桌面；点缩略图用系统看图打开。"));
+    const wall = el("div", "gen-wall");
+    list.forEach((it) => {
+      const cell = el("button", "gen-cell");
+      cell.title = `${it.prompt || ""}\n${it.path}`;
+      const img = document.createElement("img");
+      img.src = `/api/genimage?path=${encodeURIComponent(it.path)}&t=${encodeURIComponent(TOKEN)}`;
+      img.alt = it.prompt || "生成的图";
+      img.loading = "lazy";
+      cell.appendChild(img);
+      const cap = el("span", "gen-cap", (it.prompt || "（无提示词）").slice(0, 24));
+      cell.appendChild(cap);
+      cell.onclick = () => runAction("__data:open-file", { path: it.path }, "打开图片");
+      wall.appendChild(cell);
+    });
+    card.appendChild(wall);
+    return card;
+  }
+
   /**
    * 合作中转站：给不会配 API 的用户一个现成的去处。
    * 只放一个明确的优惠入口 + 一键把端点填好，不替用户做选择。
@@ -2297,6 +2334,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (cardSpec.type === "greetstat") return grid.appendChild(greetStatNode());
       if (cardSpec.type === "personas") return grid.appendChild(personasCard());
       if (cardSpec.type === "promo") return grid.appendChild(promoCard());
+      if (cardSpec.type === "genimages") return grid.appendChild(genImagesCard());
       if (cardSpec.type === "card") return grid.appendChild(cardCard());
       if (cardSpec.type === "diary") return grid.appendChild(diaryCard());
       if (cardSpec.type === "actionplay") return grid.appendChild(actionPlayCard());
