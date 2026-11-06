@@ -938,7 +938,13 @@ export async function chatStream(
     requestOptions.profileText ?? "", requestOptions.historySummary ?? "",
   );
   // 插件工具是运行时注册的：每次请求都重新拼一份，不能缓存在模块级常量里。
-  const toolDefs = enableTools ? [...TOOLS, ...(requestOptions.extraTools ?? [])] : [];
+  const off = new Set(requestOptions.disabledTools ?? []);
+  const toolDefs = enableTools
+    ? [...TOOLS, ...(requestOptions.extraTools ?? [])].filter((t) => {
+        const name = (t as { function?: { name?: string } }).function?.name ?? "";
+        return !off.has(name);
+      })
+    : [];
   // 支持流式 usage 回传的提供商白名单（其余端点可能拒绝未知字段）
   const supportsStreamUsage = USAGE_STREAM_PROVIDERS.has(provider);
 
@@ -1639,6 +1645,8 @@ export interface ChatRequestOptions {
    * 这里只放插件注册的工具，避免和内置表重复。
    */
   extraTools?: unknown[];
+  /** 本轮禁用的内置工具名（例如端点没有生图能力时禁掉 generate_image） */
+  disabledTools?: string[];
   /**
    * 用户画像块（由 userProfile.profileBlock 生成）。
    *

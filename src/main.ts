@@ -4133,6 +4133,7 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
               : `站点返回 ${raw.length} 个模型`;
             // 自动识别生图模型：用户不用再手填一遍名字
             panelImageModels = imageModels;
+            settings.assistant.imageCapable = imageModels.length > 0;
             if (imageModels.length && !(settings.assistant.imageModel || "").trim()) {
               settings.assistant.imageModel = imageModels[0];
               saveSettings(settings);

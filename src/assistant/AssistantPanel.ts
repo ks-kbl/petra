@@ -1862,7 +1862,17 @@ async function send(text: string) {
       const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
       const personaWithLang = s.assistant.persona;
-      const extraCtxWithLang = buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") + "\n\n" + langInstruction;
+      // 生图能力要和模型说清楚：不支持时**当场如实说明**，别硬调工具再报"接口没连上"
+      const imgModel = (s.assistant.imageModel || "").trim();
+      const imgCapable = s.assistant.imageCapable;
+      const imageCtx = imgCapable === false
+        ? "【生图能力】当前接入的模型/端点**不能生图**。用户让你画图时，直接用一句话说清楚：你这个模型不支持生图（或这个接口没接生图模型），并告诉他到「控制面板 → 小助手 → 获取模型列表」配一个生图模型（如 gpt-image-2）或换支持生图的供应商。不要假装在画，也不要调用 generate_image。"
+        : imgCapable === true
+          ? `【生图能力】可以生图（模型：${imgModel || "自动识别"}）。用户要画图时调用 generate_image，生成后图片会自动存到他桌面。`
+          : "【生图能力】还没确认这个端点支不支持生图。用户要画图时可以调用一次 generate_image；如果失败，就如实说明并告诉他怎么配（小助手 → 获取模型列表 / 生图模型）。";
+      const extraCtxWithLang =
+        buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") +
+        "\n\n" + imageCtx + "\n\n" + langInstruction;
 
       const res = await chatStream(
         s.assistant.provider,
@@ -1885,6 +1895,8 @@ async function send(text: string) {
         {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
           ...(imagesForTurn.length ? { userImages: imagesForTurn } : {}),
+          // 明确不支持生图时干脆不暴露这个工具，模型就不会"先调一下试试"再报错
+          ...(s.assistant.imageCapable === false ? { disabledTools: ["generate_image"] } : {}),
           extraTools: pluginRuntime.getOpenAITools(),
           // 画像 + 最近情绪只走 system prompt：模型知道"这是什么样的人、最近过得怎样"，
           // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
@@ -2335,10 +2347,16 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         const found = await listImageModels(st.assistant.provider, key, st.assistant.customBaseUrl);
         if (!model && found.length) model = found[0];
         if (!model) {
+          // 明确记下来：这个端点没有生图能力，之后的对话直接告诉用户、也不再暴露工具
+          st.assistant.imageCapable = false;
+          saveSettings(st);
           pushHistory({
             role: "tool",
             tool_call_id: tc.id,
-            content: "这个端点没有提供可用的生图模型。请在「小助手」里手动填一个生图模型名，或换一个支持 /images/generations 的供应商。",
+            content:
+              `当前对话模型（${st.assistant.model || "默认模型"}）不能生图：这个端点没有可用的生图模型。`
+              + "请到「控制面板 → 小助手 → 获取模型列表」配一个生图模型（如 gpt-image-2），或换一个支持生图的供应商。"
+              + "请如实告诉用户这一点，不要说自己正在画。",
           });
         } else {
           const img = await generateImage({
@@ -2363,7 +2381,17 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           toast(`画好了（${img.model}），已存到桌面：${path}`, "info");
         }
       } catch (e) {
-        pushHistory({ role: "tool", tool_call_id: tc.id, content: `生图失败：${e instanceof Error ? e.message : String(e)}` });
+        const msg = e instanceof Error ? e.message : String(e);
+        // 端点根本没有 /images/generations：这是"能力问题"，不是临时故障
+        if (/HTTP\s*(404|405)|不支持生图|not support/i.test(msg)) {
+          st.assistant.imageCapable = false;
+          saveSettings(st);
+        }
+        pushHistory({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: `生图失败：${msg}${/HTTP\s*(404|405)/.test(msg) ? "（这个端点没有生图接口，属于能力不支持；请如实告诉用户，并告诉他去配一个支持生图的供应商）" : ""}`,
+        });
       }
     }
     if (tc.name === "list_directory") {

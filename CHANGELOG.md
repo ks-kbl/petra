@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+- 模型不支持生图时**直接说明**，而不是硬调工具再报"接口没连上"。
+  - 新增能力标记 `assistant.imageCapable`（拉模型列表时写入：有没有生图模型）。
+  - `imageCapable === false` 时：不再向模型暴露 `generate_image` 工具，并在上下文里加一句「当前模型/端点不能生图，用户要画图就直接说明并告诉他去小助手配生图模型，不要假装在画」。
+  - 生图调用失败若是 404/405（没有该接口）或"没有可用生图模型"，会把这个能力标记写成 false，后续对话立即按"不支持"处理，不再反复试。
+  - 工具返回给模型的文案也改成可转述的人话：带上当前对话模型名 + 具体配置路径。
+
 - 修「生图画好了但下载不下来（Failed to fetch）」。
   - 根因：生图接口回的是**对象存储地址**（实测 `*.r2.cloudflarestorage.com`，2.5MB、要下 30 秒），这类地址不带 CORS 头，WebView 里 `fetch()` 直接报 `Failed to fetch` —— 图其实已经生成成功了，只是拿不回来。
   - 现在网页端不再下载：`generateImage` 把 `url` 原样带回，交给 Rust 新命令 `save_image_from_url`（reqwest，无 CORS 约束、180 秒超时）下载并直接写桌面；返回 base64 的站仍走原来的 `save_desktop_image`。

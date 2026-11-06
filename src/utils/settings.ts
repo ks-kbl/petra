@@ -105,6 +105,8 @@ export interface AssistantSettings {
   nickname: string;
   /** 生图模型名（留空 = 从 /models 自动识别，如 gpt-image-2 / kolors） */
   imageModel?: string;
+  /** 拉过模型列表后记下"这个端点有没有生图模型"；undefined = 还没确认过 */
+  imageCapable?: boolean;
   /** 语音输入快捷键（按下直接开麦说话，Tauri accelerator 字符串）；空表示未设置 */
   voiceShortcut?: string;
   /** 全局呼出快捷键（Tauri accelerator 字符串，如 "Ctrl+Shift+A"）；空表示未设置 */
