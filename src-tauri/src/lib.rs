@@ -3034,12 +3034,33 @@ fn write_desktop_image(bytes: &[u8], ext: &str, name_hint: &str) -> Result<Strin
 
 /// "桌面"或其它名字），但那要多解析一个配置文件；导出功能只在桌面上放一份文件，
 /// 退回 $HOME/Desktop 的收益/成本比更好，且与 macOS 版行为一致。
+#[cfg(windows)]
 fn desktop_dir() -> std::path::PathBuf {
-    #[cfg(windows)]
-    let home = std::env::var_os("USERPROFILE");
-    #[cfg(unix)]
-    let home = std::env::var_os("HOME");
-    home.map(std::path::PathBuf::from)
+    // 必须问系统：用户很可能把"桌面"挪到了别的盘（这台机器就是 D:\桌面）、
+    // 或者被 OneDrive 重定向成 OneDrive\\桌面。直接拼 %USERPROFILE%\\Desktop 会
+    // 写到一个**不是桌面**的目录里，用户根本看不见文件。
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Desktop, KF_FLAG_DEFAULT};
+    unsafe {
+        if let Ok(psz) = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None) {
+            let p = psz.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(psz.0 as *const _));
+            if !p.trim().is_empty() {
+                return std::path::PathBuf::from(p);
+            }
+        }
+    }
+    // 兜底：还是老办法（系统接口异常时至少能落个地方）
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("Desktop"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(not(windows))]
+fn desktop_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
         .map(|p| p.join("Desktop"))
         .unwrap_or_else(std::env::temp_dir)
 }

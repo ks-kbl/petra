@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+- 修「生成的图片没存到我的桌面」。
+  - 根因：`desktop_dir()` 直接拼 `%USERPROFILE%\\Desktop`，但用户的桌面早被挪到别的盘（这台机器是 `D:\\桌面`），于是文件写进了 `C:\\Users\\xxx\\Desktop` 这个"不是桌面"的目录。
+  - 现在 Windows 上改用 `SHGetKnownFolderPath(FOLDERID_Desktop)` 向系统要**真实桌面路径**，能正确处理"桌面移到其他盘"和"OneDrive 重定向"两种情况；系统接口异常时才退回 `%USERPROFILE%\\Desktop`。
+  - 导出类功能（聊天记录导出等）也走同一个 `desktop_dir()`，一并修好。
+
 - 模型不支持生图时**直接说明**，而不是硬调工具再报"接口没连上"。
   - 新增能力标记 `assistant.imageCapable`（拉模型列表时写入：有没有生图模型）。
   - `imageCapable === false` 时：不再向模型暴露 `generate_image` 工具，并在上下文里加一句「当前模型/端点不能生图，用户要画图就直接说明并告诉他去小助手配生图模型，不要假装在画」。
