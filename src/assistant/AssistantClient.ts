@@ -1477,8 +1477,14 @@ export async function listImageModels(
 }
 
 export interface GeneratedImage {
-  /** PNG/JPEG 的 base64（不带 data: 前缀） */
-  base64: string;
+  /** PNG/JPEG 的 base64（不带 data: 前缀）；服务端只回 url 时为空 */
+  base64?: string;
+  /**
+   * 服务端给的图片地址。
+   * **不在网页里下载**：对象存储（Cloudflare R2 等）不带 CORS 头，网页 fetch 会直接
+   * 报 Failed to fetch；交给 Rust 的 `save_image_from_url` 去下。
+   */
+  url?: string;
   /** 实际画成功的是哪个模型（自动兜底后可能与请求的不一样） */
   model: string;
   /** 服务端可能改写过的提示词 */
@@ -1497,18 +1503,6 @@ function isModelUnavailable(err: unknown): boolean {
   return /model_not_found|No available channel|HTTP\s*(404|503)|not\s*found|无可用渠道|没有可用/i.test(msg);
 }
 
-/** 把 URL 形式的图片下载回来并转成 base64（有些中转站只回 url 不回 b64_json） */
-async function urlToBase64(url: string): Promise<string> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`下载生成的图片失败：HTTP ${res.status}`);
-  const buf = new Uint8Array(await res.arrayBuffer());
-  let bin = "";
-  const CHUNK = 0x8000;
-  for (let i = 0; i < buf.length; i += CHUNK) {
-    bin += String.fromCharCode(...buf.subarray(i, i + CHUNK));
-  }
-  return btoa(bin);
-}
 
 /**
  * 调用 OpenAI 兼容的 `/images/generations` 画一张图。
@@ -1597,7 +1591,7 @@ async function requestImageOnce(
     }
     const url = typeof first.url === "string" ? first.url : "";
     if (url) {
-      return { base64: await urlToBase64(url), revisedPrompt: typeof first.revised_prompt === "string" ? first.revised_prompt : undefined };
+      return { url, revisedPrompt: typeof first.revised_prompt === "string" ? first.revised_prompt : undefined };
     }
     throw new Error(`生图返回里既没有 b64_json 也没有 url：${text.slice(0, 160)}`);
   } catch (e: unknown) {

@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+- 修「生图画好了但下载不下来（Failed to fetch）」。
+  - 根因：生图接口回的是**对象存储地址**（实测 `*.r2.cloudflarestorage.com`，2.5MB、要下 30 秒），这类地址不带 CORS 头，WebView 里 `fetch()` 直接报 `Failed to fetch` —— 图其实已经生成成功了，只是拿不回来。
+  - 现在网页端不再下载：`generateImage` 把 `url` 原样带回，交给 Rust 新命令 `save_image_from_url`（reqwest，无 CORS 约束、180 秒超时）下载并直接写桌面；返回 base64 的站仍走原来的 `save_desktop_image`。
+  - 文件扩展名按 `Content-Type` 推断（png/jpg/webp）。
+
 - 修「生图说没可用模型 / 画不出来」。
   - 根因：中转站的 `/models` 会把**没开通渠道**的模型也列出来。实测该站列了 `gpt-image-2.6-flare`，一调就 `503 model_not_found: No available channel for model ... under group default`；自动识别又恰好挑中它，于是整次生成失败。
   - 现在生图会**按候选列表逐个试**：先试用户/自动选中的，失败（`model_not_found`/`No available channel`/404/503）就换下一个，直到有一个成功；成功的那个会写回「生图模型」，下次直接用。

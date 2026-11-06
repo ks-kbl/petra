@@ -2355,7 +2355,10 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
             st.assistant.imageModel = img.model;
             saveSettings(st);
           }
-          const path = await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 });
+          // base64 直接写；只回 url 的交给 Rust 下载（网页里 fetch 对象存储会 Failed to fetch）
+          const path = img.base64
+            ? await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 })
+            : await invoke<string>("save_image_from_url", { url: img.url ?? "", nameHint: "" });
           pushHistory({ role: "tool", tool_call_id: tc.id, content: `已用 ${img.model} 生成图片并保存到桌面：${path}` });
           toast(`画好了（${img.model}），已存到桌面：${path}`, "info");
         }

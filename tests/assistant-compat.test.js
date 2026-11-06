@@ -84,7 +84,7 @@ const json = (obj, status = 200) =>
         provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1",
         model: "gpt-image-2", prompt: "一只鲸鱼",
       });
-      check("url 形式的生图结果被转成 base64", img.base64 === "AQID", img.base64);
+      check("url 形式的生图结果原样带回，不在网页里下载", img.url === "https://example.com/a.png" && !img.base64, JSON.stringify({ url: img.url, b64: img.base64 }));
     }
     // ---- 0e2) 中转站列出来的模型可能"没开通渠道"：要自动换下一个 ----
     {

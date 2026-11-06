@@ -2958,6 +2958,50 @@ fn save_desktop_image(name_hint: String, base64: String) -> Result<String, Strin
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(base64.as_bytes())
         .map_err(|e| format!("图片数据解码失败：{e}"))?;
+    write_desktop_image(&bytes, "png", &name_hint)
+}
+
+/// 从 URL 下载图片并存到桌面。
+///
+/// 为什么不放心让 WebView 去 fetch：生图返回的地址常在 Cloudflare R2 这类对象存储上，
+/// 没有 CORS 头，网页里 `fetch()` 直接报 **Failed to fetch**；而且图片动辄 2~3MB、要下
+/// 半分钟。交给 Rust（reqwest，无 CORS 约束、超时可控）最稳。
+#[tauri::command]
+async fn save_image_from_url(url: String, name_hint: String) -> Result<String, String> {
+    if url.trim().is_empty() {
+        return Err("图片地址是空的".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+    let resp = client
+        .get(url.trim())
+        .send()
+        .await
+        .map_err(|e| format!("下载图片失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("下载图片失败：HTTP {}", resp.status()));
+    }
+    let ext = match resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+    {
+        t if t.contains("jpeg") => "jpg",
+        t if t.contains("webp") => "webp",
+        _ => "png",
+    };
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取图片数据失败：{e}"))?;
+    write_desktop_image(&bytes, ext, &name_hint)
+}
+
+/// 把图片字节写到桌面（文件名 `提示-时间戳.ext`，重名自动加序号）
+fn write_desktop_image(bytes: &[u8], ext: &str, name_hint: &str) -> Result<String, String> {
     if bytes.is_empty() {
         return Err("生成的图片是空的".into());
     }
@@ -2977,10 +3021,10 @@ fn save_desktop_image(name_hint: String, base64: String) -> Result<String, Strin
     } else {
         format!("{}-{}", stem_hint, now.format("%Y%m%d-%H%M%S"))
     };
-    let mut path = dir.join(format!("{stem}.png"));
+    let mut path = dir.join(format!("{stem}.{ext}"));
     let mut n = 2;
     while path.exists() {
-        path = dir.join(format!("{stem}-{n}.png"));
+        path = dir.join(format!("{stem}-{n}.{ext}"));
         n += 1;
     }
     std::fs::write(&path, &bytes).map_err(|e| format!("写入图片失败：{e}"))?;
@@ -5966,6 +6010,7 @@ pub fn run() {
             tts_synthesize, set_tts_key, get_tts_key,
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
             register_voice_shortcut, unregister_voice_shortcut, save_desktop_image,
+            save_image_from_url,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
             capture_screen,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,
