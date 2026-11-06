@@ -437,7 +437,7 @@ body {
   align-self: flex-end;
   margin-bottom: 1px;
   width: 22px;
-  height: 36px;
+  height: 30px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -502,7 +502,7 @@ body {
   margin-bottom: 1px;
   /* 竖椭圆：比正圆更像"按钮"，也给录音时的音量条留出竖向空间 */
   width: 22px;
-  height: 36px;
+  height: 30px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
