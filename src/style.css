@@ -436,14 +436,14 @@ body {
   flex: 0 0 auto;
   align-self: flex-end;
   margin-bottom: 1px;
-  width: 26px;
-  height: 26px;
+  width: 22px;
+  height: 36px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
   border: 1px solid rgba(140, 90, 160, 0.32);
-  border-radius: 50%;
+  border-radius: 999px;
   background: rgba(255, 255, 255, 0.72);
   color: rgba(96, 60, 120, 0.9);
   cursor: pointer;
@@ -500,14 +500,15 @@ body {
   flex: 0 0 auto;
   align-self: flex-end;
   margin-bottom: 1px;
-  width: 26px;
-  height: 26px;
+  /* 竖椭圆：比正圆更像"按钮"，也给录音时的音量条留出竖向空间 */
+  width: 22px;
+  height: 36px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
   border: 1px solid rgba(140, 90, 160, 0.32);
-  border-radius: 50%;
+  border-radius: 999px;
   background: linear-gradient(160deg, rgba(255, 255, 255, 0.98), rgba(243, 234, 250, 0.92));
   color: #7a4f96;
   cursor: pointer;
@@ -574,7 +575,7 @@ body {
   content: "";
   position: absolute;
   inset: 0;
-  border-radius: 50%;
+  border-radius: 999px;
   border: 1.5px solid rgba(224, 85, 122, 0.55);
   pointer-events: none;
   animation: as-mic-halo 1.7s cubic-bezier(0.2, 0.6, 0.3, 1) infinite;
