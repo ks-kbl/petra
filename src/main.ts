@@ -3455,6 +3455,19 @@ function buildSettingsItems(engine: BehaviorEngine): MenuItemSpec[] {
 let panelChat: { role: string; content: string }[] = [];
 let panelDiaries: { date: string; text: string }[] = [];
 let panelAssistantModels: string[] = [];
+/** 站点里识别到的生图模型（面板上显示"自动识别：gpt-image-2"） */
+let panelImageModels: string[] = [];
+/** 最近生成的图（读 WebView 的 localStorage，供面板缩略图墙展示） */
+function readGenImages(): { path: string; prompt: string; model: string; ts: number }[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem("petra-generated-images") || "[]");
+    return Array.isArray(raw) ? raw.slice(0, 12) : [];
+  } catch {
+    return [];
+  }
+}
+/** 模型列表的一句话说明（站点返回多少、过滤掉多少），面板上显示，解释"为什么只有这么几个" */
+let panelModelNote = "";
 let panelKeys = { assistant: false, tts: false, asr: false };
 /** 面板上直接显示出来的 Key 明文（用户明确要求「不怕泄露，贴在控制台上」） */
 /**
@@ -3592,6 +3605,9 @@ function buildPanelMeta() {
       card: getTodayDraw(),
       actionList: listActions(),
       assistantModels: panelAssistantModels,
+      imageModels: panelImageModels,
+      genImages: readGenImages(),
+      modelNote: panelModelNote,
       personaTest: panelPersonaTest,
       asrModel: panelAsrModel,
       asrTest: panelAsrTest,
@@ -3929,6 +3945,9 @@ async function handlePanelPresetAction(kind: string, payload: unknown): Promise<
 }
 
 /** 面板要的数据（对话记录 / 日记 / 抽卡 / 播放动作 / 反馈 / 快捷键 / 拉模型列表） */
+/** 合作中转站：一键把「自定义供应商 + 端点」填好，用户只需再粘 Key 和选模型 */
+const PARTNER_API_BASE = "https://chickener.top/v1";
+
 async function handlePanelDataAction(kind: string, payload: unknown): Promise<void> {
   const p = (payload ?? {}) as Record<string, unknown>;
   try {
@@ -3941,6 +3960,24 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
       case "website":
         await invoke("open_url", { url: "http://petra.xin/" });
         break;
+      case "open-file": {
+        const path = String(p.path ?? "").trim();
+        if (path) await invoke("open_path", { path });
+        break;
+      }
+      case "use-partner-api": {
+        // 合作中转站：切到「自定义」供应商并填好端点；Key 和模型名留给用户
+        // （Key 只能在用户自己那边生成；模型名用面板的「获取模型列表」挑最省事）
+        settings.assistant.provider = "custom";
+        settings.assistant.customBaseUrl = PARTNER_API_BASE;
+        settings.assistant.activePresetId = "";
+        settings.assistant.model = "";
+        saveSettings(settings);
+        panelAssistantModels = [];
+        await pushPanelState();
+        toast("已填好合作中转站的端点，接下来粘贴 Key、再点「获取模型列表」");
+        break;
+      }
       case "check-update":
         void checkUpdate(true);
         break;
@@ -4085,13 +4122,44 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
         break;
       }
       case "models-fetch": {
+        // 面板可能刚粘贴了 Key 但还没点「保存」——这时候直接拿它去测，
+        // 比先报一个 401「无效的令牌」再让用户猜要友好得多。
+        const typed = String(p.key ?? "").trim();
+        if (typed) {
+          const scope = settings.assistant.activePresetId
+            ? presetKeyScope(settings.assistant.activePresetId)
+            : settings.assistant.provider;
+          await setApiKey(typed, scope);
+          clearApiKeyCache();
+          panelKeys = { ...panelKeys, assistant: true };
+        }
         const key = await getApiKey();
+        if (!key) {
+          toast("还没填 API Key：在上面的「API Key」里粘贴后点保存（或直接点获取模型列表，会自动保存）", "warn");
+          break;
+        }
         panelAssistantModels = await listModels(
           settings.assistant.provider,
           key,
           settings.assistant.customBaseUrl,
+          ({ raw, kept, imageModels }) => {
+            panelModelNote = kept.length < raw.length
+              ? `站点返回 ${raw.length} 个模型，其中 ${raw.length - kept.length} 个是图像/语音类（已在对话模型里隐藏）`
+              : `站点返回 ${raw.length} 个模型`;
+            // 自动识别生图模型：用户不用再手填一遍名字
+            panelImageModels = imageModels;
+            settings.assistant.imageCapable = imageModels.length > 0;
+            if (imageModels.length && !(settings.assistant.imageModel || "").trim()) {
+              settings.assistant.imageModel = imageModels[0];
+              saveSettings(settings);
+            }
+          },
         );
-        toast(`拿到 ${panelAssistantModels.length} 个模型`);
+        toast(
+          panelModelNote
+            ? `拿到 ${panelAssistantModels.length} 个模型（${panelModelNote}）`
+            : `拿到 ${panelAssistantModels.length} 个模型`,
+        );
         break;
       }
       case "plugins-open-dir": {

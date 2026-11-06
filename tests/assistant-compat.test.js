@@ -30,6 +30,92 @@ const json = (obj, status = 200) =>
 (async () => {
   const originalFetch = global.fetch;
   try {
+    // ---- 0) /models 报 401：提示必须指向"Key 无效"，不能甩锅给"站点不支持 /models" ----
+    {
+      global.fetch = async () => json({ error: { message: "无效的令牌" } }, 401);
+      let err = "";
+      try {
+        await ac.listModels("custom", "sk-bad-key", "https://example.com/v1");
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e);
+      }
+      check("401 时提示 Key 问题", /Key 的问题|重新生成/.test(err), err.slice(0, 80));
+      check("401 时不再提「不提供 /models」", !/不提供 \/models/.test(err), err.slice(0, 80));
+    }
+    // ---- 0b) /models 报 404：这时才该建议手填模型名 ----
+    {
+      global.fetch = async () => json({ error: { message: "Invalid URL" } }, 404);
+      let err = "";
+      try {
+        await ac.listModels("custom", "sk-key", "https://example.com/v1");
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e);
+      }
+      check("404 时建议手填模型名", /手填|手动填写/.test(err), err.slice(0, 80));
+    }
+
+    // ---- 0c) /models 里图像/语音模型混进来：要过滤掉，别让用户选到必 400 的模型 ----
+    {
+      global.fetch = async () =>
+        json({ data: [{ id: "gpt-image-2" }, { id: "deepseek-v4.1-flash" }, { id: "gpt-image-2.5" }] });
+      const list = await ac.listModels("custom", "sk-key", "https://example.com/v1");
+      check("过滤掉图像模型", list.length === 1 && list[0] === "deepseek-v4.1-flash", JSON.stringify(list));
+    }
+    check("能识别非对话模型名", ac.looksLikeNonChatModel("gpt-image-2") === true);
+    check("普通聊天模型不误判", ac.looksLikeNonChatModel("deepseek-v4.1-flash") === false);
+
+    // ---- 0d) 生图模型自动识别：用户不用手填模型名 ----
+    {
+      const names = ["gpt-4o", "gpt-image-2", "deepseek-v4.1-flash", "kolors", "flux-schnell", "gpt-image-2.5"];
+      const imgs = ac.detectImageModels(names);
+      check("自动识别生图模型", imgs.length === 4 && imgs[0] === "gpt-image-2", JSON.stringify(imgs));
+      check("聊天模型不算生图模型", !imgs.includes("gpt-4o") && !imgs.includes("deepseek-v4.1-flash"));
+      check("生图判断不误伤", ac.looksLikeImageModel("kimi-k3") === false);
+    }
+    // ---- 0e) /images/generations 回 url 时要能下载并转 base64 ----
+    {
+      global.fetch = async (url) => {
+        if (String(url).includes("/images/generations")) {
+          return json({ data: [{ url: "https://example.com/a.png" }] });
+        }
+        return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      };
+      const img = await ac.generateImage({
+        provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1",
+        model: "gpt-image-2", prompt: "一只鲸鱼",
+      });
+      check("url 形式的生图结果原样带回，不在网页里下载", img.url === "https://example.com/a.png" && !img.base64, JSON.stringify({ url: img.url, b64: img.base64 }));
+    }
+    // ---- 0e2) 中转站列出来的模型可能"没开通渠道"：要自动换下一个 ----
+    {
+      const calls = [];
+      global.fetch = async (url, init = {}) => {
+        if (String(url).includes("/images/generations")) {
+          const body = JSON.parse(String(init.body || "{}"));
+          calls.push(body.model);
+          if (body.model === "gpt-image-2.6-flare") {
+            return json({ error: { code: "model_not_found", message: "No available channel for model under group default" } }, 503);
+          }
+          return json({ data: [{ b64_json: "AQID" }] });
+        }
+        return new Response(new Uint8Array([1]), { status: 200 });
+      };
+      const img = await ac.generateImage({
+        provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1",
+        model: "gpt-image-2.6-flare", fallbackModels: ["gpt-image-2.6-flare", "gpt-image-2"], prompt: "鲸鱼",
+      });
+      check("没开通渠道时自动换下一个模型", img.model === "gpt-image-2" && calls.length === 2, JSON.stringify({ model: img.model, calls }));
+    }
+
+    // ---- 0f) 没配生图模型时给中文提示 ----
+    {
+      let err = "";
+      try {
+        await ac.generateImage({ provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1", model: "", prompt: "x" });
+      } catch (e) { err = e instanceof Error ? e.message : String(e); }
+      check("无生图模型时提示中文", /生图模型/.test(err), err);
+    }
+
     // ---- 1) tools 被拒 → 自动降级为无工具请求，并记住该端点 ----
     {
       const requests = [];

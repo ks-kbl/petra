@@ -43,6 +43,10 @@ export const TOOL_SPECS: Record<string, ToolSpec> = {
   edit_text_file: { required: ["path", "old_string", "new_string"], maxResultChars: 600, confirm: true },
   write_text_file: { required: ["path", "content"], maxResultChars: 600, confirm: true },
   list_directory: { required: ["path"], maxResultChars: 3000, readOnly: true },
+  // 生图：结果是"已保存到桌面的路径"，短；但要能带上失败原文
+  generate_image: { required: ["prompt"], maxResultChars: 800 },
+  // 复制到桌面：结果只有一行路径
+  copy_to_desktop: { required: ["path"], maxResultChars: 500 },
   list_installed_apps: { maxResultChars: 2000, readOnly: true },
   active_window_title: { maxResultChars: 400, readOnly: true },
   capture_screen: { readOnly: true },

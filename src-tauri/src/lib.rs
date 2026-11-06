@@ -2947,14 +2947,175 @@ fn chrono_now() -> String {
 /// 取不到时退回临时目录，保证导出不会因为环境异常而失败。
 ///
 /// Linux 理论上应读 XDG user-dirs 的 XDG_DESKTOP_DIR（桌面目录可能被本地化成
+
+/// 把一张生成的图片存到桌面，返回绝对路径。
+///
+/// 用户要求"生成的图片自动下载到桌面"，所以固定落桌面、文件名带时间戳，
+/// 重名自动加序号（同一秒生成两张也不会覆盖）。
+#[tauri::command]
+fn save_desktop_image(name_hint: String, base64: String) -> Result<String, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64.as_bytes())
+        .map_err(|e| format!("图片数据解码失败：{e}"))?;
+    write_desktop_image(&bytes, "png", &name_hint)
+}
+
+/// 从 URL 下载图片并存到桌面。
+///
+/// 为什么不放心让 WebView 去 fetch：生图返回的地址常在 Cloudflare R2 这类对象存储上，
+/// 没有 CORS 头，网页里 `fetch()` 直接报 **Failed to fetch**；而且图片动辄 2~3MB、要下
+/// 半分钟。交给 Rust（reqwest，无 CORS 约束、超时可控）最稳。
+#[tauri::command]
+async fn save_image_from_url(url: String, name_hint: String) -> Result<String, String> {
+    if url.trim().is_empty() {
+        return Err("图片地址是空的".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+    let resp = client
+        .get(url.trim())
+        .send()
+        .await
+        .map_err(|e| format!("下载图片失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("下载图片失败：HTTP {}", resp.status()));
+    }
+    let ext = match resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+    {
+        t if t.contains("jpeg") => "jpg",
+        t if t.contains("webp") => "webp",
+        _ => "png",
+    };
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取图片数据失败：{e}"))?;
+    write_desktop_image(&bytes, ext, &name_hint)
+}
+
+/// 读一张图片，返回可直接放进 `<img src>` 的 dataURL（聊天气泡里显示缩略图用）。
+///
+/// 为什么不直接用 file:// 或 asset://：WebView 里 file 协议默认被拦，asset 协议要额外配置
+/// 作用域；直接把字节编成 dataURL 最省事，也只在"刚生成完要显示一次"时用。
+#[tauri::command]
+fn read_image_data_url(path: String) -> Result<String, String> {
+    use base64::Engine as _;
+    let p = std::path::PathBuf::from(path.trim());
+    if !p.is_file() {
+        return Err(format!("找不到这个图片：{}", p.display()));
+    }
+    let meta = std::fs::metadata(&p).map_err(|e| format!("读取失败：{e}"))?;
+    if meta.len() > 16 * 1024 * 1024 {
+        return Err("图片太大，没法在气泡里预览".into());
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("读取失败：{e}"))?;
+    let mime = match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "image/png",
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
+/// 把任意文件复制到桌面（"把那张图放到我桌面"这种请求）。
+#[tauri::command]
+fn copy_to_desktop(path: String) -> Result<String, String> {
+    let src = std::path::PathBuf::from(path.trim());
+    if !src.is_file() {
+        return Err(format!("找不到这个文件：{}", src.display()));
+    }
+    let bytes = std::fs::read(&src).map_err(|e| format!("读取文件失败：{e}"))?;
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png")
+        .to_string();
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Petra")
+        .to_string();
+    write_desktop_image(&bytes, &ext, &stem)
+}
+
+/// 把图片字节写到桌面（文件名 `提示-时间戳.ext`，重名自动加序号）
+fn write_desktop_image(bytes: &[u8], ext: &str, name_hint: &str) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("生成的图片是空的".into());
+    }
+    let dir = desktop_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建桌面目录失败：{e}"))?;
+
+    // 文件名：用户给的提示（可选）+ 时间戳；去掉路径分隔符与 Windows 非法字符
+    let now = chrono::Local::now();
+    let stem_hint: String = name_hint
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .take(40)
+        .collect();
+    let stem = if stem_hint.is_empty() {
+        format!("Petra-{}", now.format("%Y%m%d-%H%M%S"))
+    } else {
+        format!("{}-{}", stem_hint, now.format("%Y%m%d-%H%M%S"))
+    };
+    let mut path = dir.join(format!("{stem}.{ext}"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{stem}-{n}.{ext}"));
+        n += 1;
+    }
+    std::fs::write(&path, &bytes).map_err(|e| format!("写入图片失败：{e}"))?;
+    log_line(&format!("[image] 已保存 {} ({} bytes)", path.display(), bytes.len()));
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// "桌面"或其它名字），但那要多解析一个配置文件；导出功能只在桌面上放一份文件，
 /// 退回 $HOME/Desktop 的收益/成本比更好，且与 macOS 版行为一致。
+#[cfg(windows)]
 fn desktop_dir() -> std::path::PathBuf {
-    #[cfg(windows)]
-    let home = std::env::var_os("USERPROFILE");
-    #[cfg(unix)]
-    let home = std::env::var_os("HOME");
-    home.map(std::path::PathBuf::from)
+    // 必须问系统：用户很可能把"桌面"挪到了别的盘（这台机器就是 D:\桌面）、
+    // 或者被 OneDrive 重定向成 OneDrive\\桌面。直接拼 %USERPROFILE%\\Desktop 会
+    // 写到一个**不是桌面**的目录里，用户根本看不见文件。
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Desktop, KF_FLAG_DEFAULT};
+    unsafe {
+        if let Ok(psz) = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None) {
+            let p = psz.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(psz.0 as *const _));
+            if !p.trim().is_empty() {
+                return std::path::PathBuf::from(p);
+            }
+        }
+    }
+    // 兜底：还是老办法（系统接口异常时至少能落个地方）
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("Desktop"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(not(windows))]
+fn desktop_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
         .map(|p| p.join("Desktop"))
         .unwrap_or_else(std::env::temp_dir)
 }
@@ -5924,7 +6085,8 @@ pub fn run() {
             register_assistant_shortcut, unregister_assistant_shortcut, capture_hotkey,
             tts_synthesize, set_tts_key, get_tts_key,
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
-            register_voice_shortcut, unregister_voice_shortcut,
+            register_voice_shortcut, unregister_voice_shortcut, save_desktop_image,
+            save_image_from_url, copy_to_desktop, read_image_data_url,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
             capture_screen,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,

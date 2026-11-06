@@ -220,6 +220,39 @@ export function stripToolData(messages: ChatMessage[]): ChatMessage[] {
 /** 模型名里明显不是对话模型的排除项（中转站的 /models 常把 embedding/tts/image 混在一起） */
 const NON_CHAT_MODEL_RE =
   /(embed|embedding|rerank|whisper|tts|speech|transcri|audio|image|dall[-_ ]?e|moderation|bge|clip|stable[-_ ]?diffusion|sdxl|flux|ocr|guard|safety)/i;
+/**
+ * 这个模型名看起来是不是"非对话模型"（图像/语音/向量/审核…）。
+ * 中转站的 /models 常把它们和聊天模型混在一起，用户很容易挑到 gpt-image-2 这种，
+ * 然后 chat/completions 直接 400 —— 给一句能读懂的解释。
+ */
+export function looksLikeNonChatModel(name: string): boolean {
+  return NON_CHAT_MODEL_RE.test(String(name || ""));
+}
+
+/** 名字像"生图模型"的特征（各家中转站叫法差别很大，尽量宽一点） */
+const IMAGE_MODEL_RE =
+  /(image|dall[-_ ]?e|flux|stable[-_ ]?diffusion|sdxl|kolors|seedream|imagen|midjourney|wanx|t2i|text2image|draw|paint|nano[-_ ]?banana)/i;
+
+/** 这个模型名看起来能不能生图 */
+export function looksLikeImageModel(name: string): boolean {
+  return IMAGE_MODEL_RE.test(String(name || ""));
+}
+
+/**
+ * 从 `/models` 列表里自动挑出生图模型。
+ *
+ * 用户的原话："生图模型不能用户填完 API、选完模型自动识别吗" —— 能：
+ * 拉模型列表时顺手把像生图的挑出来，用户不用再单独填一遍名字。
+ */
+export function detectImageModels(models: string[]): string[] {
+  const out: string[] = [];
+  for (const m of models || []) {
+    const name = String(m || "").trim();
+    if (name && looksLikeImageModel(name) && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
 /** 对话模型的常见关键词，用于在候选里优先挑一个能聊的 */
 const CHAT_MODEL_HINT_RE =
   /(chat|instruct|gpt|claude|deepseek|qwen|glm|llama|mixtral|gemini|grok|moonshot|kimi|yi-|ernie|command-r|mistral|sonnet|opus|haiku|o1|o3|o4)/i;
@@ -441,6 +474,37 @@ const TOOLS = [
           content: { type: "string", description: "新建文件时的初始内容（可选）" },
         },
         required: ["path", "is_dir"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "generate_image",
+      description:
+        "用生图模型画一张图，**生成后自动保存到用户桌面**并把文件路径返回给用户。用户说「画一张…」「生成一张…图片」「来张壁纸」时调用。prompt 要写得具体：主体、风格、构图、颜色、光线。",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "画面描述（中文即可，越具体越好）" },
+          size: { type: "string", description: "可选尺寸，如 1024x1024、1024x1536；不确定就别传" },
+        },
+        required: ["prompt"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "copy_to_desktop",
+      description:
+        "把**已经存在的**文件复制到用户桌面（例如把刚生成的图放桌面、把别的目录里的图片拿过来）。用户说「把图片放到我桌面」「把那个文件弄到桌面」时调用。只需要源文件的完整路径。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "要复制的文件完整绝对路径" },
+        },
+        required: ["path"],
       },
     },
   },
@@ -748,8 +812,9 @@ function buildMessages(
  *
  * 没有截图 / 历史里没有 user 消息时原样返回。
  */
-function attachScreenImage(messages: ChatMessage[], dataUrl?: string): unknown {
-  if (!dataUrl) return messages;
+function attachScreenImage(messages: ChatMessage[], images?: string[] | string): unknown {
+  const list = Array.isArray(images) ? images.filter(Boolean) : images ? [images] : [];
+  if (!list.length) return messages;
   let idx = -1;
   for (let n = messages.length - 1; n >= 0; n--) {
     if (messages[n].role === "user") { idx = n; break; }
@@ -762,7 +827,7 @@ function attachScreenImage(messages: ChatMessage[], dataUrl?: string): unknown {
           ...m,
           content: [
             { type: "text", text: m.content ?? "" },
-            { type: "image_url", image_url: { url: dataUrl } },
+            ...list.map((url) => ({ type: "image_url", image_url: { url } })),
           ],
         },
   );
@@ -888,7 +953,13 @@ export async function chatStream(
     requestOptions.profileText ?? "", requestOptions.historySummary ?? "",
   );
   // 插件工具是运行时注册的：每次请求都重新拼一份，不能缓存在模块级常量里。
-  const toolDefs = enableTools ? [...TOOLS, ...(requestOptions.extraTools ?? [])] : [];
+  const off = new Set(requestOptions.disabledTools ?? []);
+  const toolDefs = enableTools
+    ? [...TOOLS, ...(requestOptions.extraTools ?? [])].filter((t) => {
+        const name = (t as { function?: { name?: string } }).function?.name ?? "";
+        return !off.has(name);
+      })
+    : [];
   // 支持流式 usage 回传的提供商白名单（其余端点可能拒绝未知字段）
   const supportsStreamUsage = USAGE_STREAM_PROVIDERS.has(provider);
 
@@ -902,7 +973,10 @@ export async function chatStream(
     const messages = toolsOn ? baseMessages : stripToolData(baseMessages);
     return JSON.stringify({
       model: m,
-      messages: attachScreenImage(messages, requestOptions.screenImage),
+      messages: attachScreenImage(
+        messages,
+        [...(requestOptions.screenImage ? [requestOptions.screenImage] : []), ...(requestOptions.userImages ?? [])],
+      ),
       // 不支持工具的端点（不少本地模型/中转站/推理模型）一旦带上 tools 就会 400；
       // 降级后这里自动不带，历史里的 tool_calls 也由 stripToolData 清掉。
       ...(toolsOn && toolDefs.length ? { tools: toolDefs } : {}),
@@ -972,7 +1046,11 @@ export async function chatStream(
     const hint = provider === "custom"
       ? " (自定义/中转站端点：请确认 URL 是否带 /v1、模型名是否与中转站文档一致)"
       : "";
-    throw new Error(`API 错误 ${lastStatus || 0}${hint}: ${errText.slice(0, 300)}`);
+    // 选了图像/语音类模型时，端点只会回一句 Upstream request failed / 400 —— 这里补一句人话
+    const nonChat = looksLikeNonChatModel(m)
+      ? "（这个模型看起来是图像/语音类模型，不是对话模型，换一个聊天模型试试，比如 deepseek-chat、gpt-4o-mini）"
+      : "";
+    throw new Error(`API 错误 ${lastStatus || 0}${hint}: ${errText.slice(0, 300)}${nonChat}`);
   }
   if (!res || !res.body) {
     throw new Error(`API 错误 ${lastStatus || 0}: ${errText.slice(0, 300) || "没有收到响应"}`);
@@ -1358,28 +1436,194 @@ export async function listModels(
   provider: AssistantProvider,
   apiKey: string,
   customBaseUrl: string,
+  /** 过滤统计回调：告诉调用方"站点返回了多少、过滤掉多少"，面板才能解释"为什么只有这么几个" */
+  onStats?: (info: { raw: string[]; kept: string[]; imageModels: string[] }) => void,
 ): Promise<string[]> {
   const base = resolveBase(provider, customBaseUrl);
   const useOllamaApi = provider === "ollama" || /:11434(\/|$)/.test(base);
   const urls = useOllamaApi ? [`${ollamaOrigin(base)}/api/tags`, `${base}/models`] : [`${base}/models`];
 
   const errors: string[] = [];
+  /** 失败到底是"Key 不对"还是"这个端点没有 /models"，两者给的建议完全不同 */
+  let authFailed = false;
+  let noModelsApi = false;
   for (const url of urls) {
     try {
       const arr = await fetchModelList(url, apiKey);
-      if (arr.length) return arr;
+      if (arr.length) {
+        // 中转站常把图像/语音/向量模型混在同一个列表里（比如 gpt-image-2），
+        // 选错就是 400。这里只留像对话模型的；万一全被过滤就原样返回，别让用户没得选。
+        const chatLike = arr.filter((m) => !looksLikeNonChatModel(m));
+        const kept = chatLike.length ? chatLike : arr;
+        onStats?.({ raw: arr, kept, imageModels: detectImageModels(arr) });
+        return kept;
+      }
       errors.push(`${url}：返回了空的模型列表`);
     } catch (e: unknown) {
-      errors.push(`${url}：${e instanceof Error ? e.message : String(e)}`);
+      const msg = e instanceof Error ? e.message : String(e);
+      errors.push(`${url}：${msg}`);
+      if (/HTTP\s*(401|403)|无效的令牌|Invalid token|Unauthorized|invalid_api_key/i.test(msg)) authFailed = true;
+      if (/HTTP\s*(404|405|501)|not\s*found|不支持|Invalid URL/i.test(msg)) noModelsApi = true;
     }
   }
   const localHint = /(localhost|127\.0\.0\.1)/.test(base)
     ? "（本地服务：若报 Failed to fetch，多半是浏览器跨域被拦——给服务设 OLLAMA_ORIGINS=* 后重启即可）"
     : "";
-  const customHint = provider === "custom"
-    ? "（很多中转站不提供 /models 接口；这不代表不能用。请直接在「模型名」里手动填写中转站文档里的模型名）"
-    : "";
-  throw new Error(errors.join("；") + localHint + customHint);
+  // 按失败原因给**对应**的建议。
+  // 以前不管什么原因都追加"很多中转站不提供 /models" —— 用户 Key 填错（401）时看到
+  // 这句会以为"是站点不支持、不是我的问题"，反而找不到真正原因。
+  let hint = "";
+  if (authFailed) {
+    hint = "（这是 Key 的问题：请到中转站/供应商后台重新生成一个 API Key，粘贴时注意别带上空格或换行；换 Key 后可以再点一次「获取模型列表」）";
+  } else if (noModelsApi && provider === "custom") {
+    hint = "（这个端点没有 /models 接口，但不影响聊天：直接在「模型名」里手动填写中转站文档里写的模型名即可）";
+  } else if (provider === "custom") {
+    hint = "（若确认 Key 没错，可能就是站点不提供 /models：直接在「模型名」里手填模型名即可）";
+  }
+  throw new Error(errors.join("；") + localHint + hint);
+}
+
+/** 只拉"生图模型"清单（用于自动识别，用户不用手填模型名） */
+export async function listImageModels(
+  provider: AssistantProvider,
+  apiKey: string,
+  customBaseUrl: string,
+): Promise<string[]> {
+  const base = resolveBase(provider, customBaseUrl);
+  try {
+    return detectImageModels(await fetchModelList(`${base}/models`, apiKey));
+  } catch {
+    return [];
+  }
+}
+
+export interface GeneratedImage {
+  /** PNG/JPEG 的 base64（不带 data: 前缀）；服务端只回 url 时为空 */
+  base64?: string;
+  /**
+   * 服务端给的图片地址。
+   * **不在网页里下载**：对象存储（Cloudflare R2 等）不带 CORS 头，网页 fetch 会直接
+   * 报 Failed to fetch；交给 Rust 的 `save_image_from_url` 去下。
+   */
+  url?: string;
+  /** 实际画成功的是哪个模型（自动兜底后可能与请求的不一样） */
+  model: string;
+  /** 服务端可能改写过的提示词 */
+  revisedPrompt?: string;
+}
+
+/**
+ * 这个失败是不是"该换下一个模型试试"。
+ *
+ * 中转站的 `/models` 会列出**没开通渠道**的模型（实测某站列了 gpt-image-2.6-flare，
+ * 一调就 503 `model_not_found: No available channel for model ... under group default`）。
+ * 这类错误换个模型多半就好了，不能直接判死刑。
+ */
+function isModelUnavailable(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /model_not_found|No available channel|HTTP\s*(404|503)|not\s*found|无可用渠道|没有可用/i.test(msg);
+}
+
+
+/**
+ * 调用 OpenAI 兼容的 `/images/generations` 画一张图。
+ *
+ * 各家中转站实现差异很大：有的只回 `b64_json`、有的只回 `url`、有的把 `data`
+ * 包在别的字段里，所以这里做了两重兼容；失败时也把服务端原文带出来，别只说"失败了"。
+ */
+export async function generateImage(opts: {
+  provider: AssistantProvider;
+  apiKey: string;
+  customBaseUrl: string;
+  model: string;
+  /** 备选模型：第一个失败（没开通渠道之类）就换下一个试 */
+  fallbackModels?: string[];
+  prompt: string;
+  size?: string;
+  /** 外部取消信号（用户在进度气泡上点"取消"） */
+  signal?: AbortSignal;
+}): Promise<GeneratedImage> {
+  const base = resolveBase(opts.provider, opts.customBaseUrl);
+  const candidates: string[] = [];
+  for (const m of [opts.model, ...(opts.fallbackModels ?? [])]) {
+    const name = (m || "").trim();
+    if (name && !candidates.includes(name)) candidates.push(name);
+  }
+  if (!candidates.length) throw new Error("还没有可用的生图模型：先在「小助手 → 获取模型列表」里拉一次，或手动填写生图模型名");
+  const prompt = (opts.prompt || "").trim();
+  if (!prompt) throw new Error("要画什么？给我一句画面描述");
+
+  let lastErr: unknown = null;
+  const tried: string[] = [];
+  for (const model of candidates) {
+    try {
+      const img = await requestImageOnce(base, opts.apiKey, model, prompt, opts.size, opts.signal);
+      return { ...img, model };
+    } catch (e) {
+      tried.push(model);
+      lastErr = e;
+      if (!isModelUnavailable(e)) throw e;
+    }
+  }
+  throw new Error(
+    `${lastErr instanceof Error ? lastErr.message : String(lastErr)}（试过的模型：${tried.join("、")}；这些模型可能都没开通渠道，换一个供应商或分组试试）`,
+  );
+}
+
+/** 真正发一次生图请求（单模型） */
+async function requestImageOnce(
+  base: string,
+  apiKey: string,
+  model: string,
+  prompt: string,
+  size?: string,
+  signal?: AbortSignal,
+): Promise<Omit<GeneratedImage, "model">> {
+  const body: Record<string, unknown> = { model, prompt, n: 1, response_format: "b64_json" };
+  if (size) body.size = size;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 120000); // 生图慢，给 2 分钟
+  try {
+    const res = await fetch(`${base}/images/generations`, {
+      method: "POST",
+      headers: chatHeaders(apiKey, "application/json"),
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 405) {
+        throw new Error(
+          `这个端点不支持生图（HTTP ${res.status}）：${text.slice(0, 160)} —— 请在「小助手」里把供应商换成一个支持 /images/generations 的（比如画图专用的中转站分组）`,
+        );
+      }
+      throw new Error(`生图失败 HTTP ${res.status}: ${text.slice(0, 200)}`);
+    }
+    let json: unknown;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`生图返回的不是 JSON：${text.slice(0, 120)}`);
+    }
+    const data = (json as { data?: unknown }).data;
+    const first = Array.isArray(data) ? (data[0] as Record<string, unknown>) : undefined;
+    if (!first) throw new Error(`生图返回里没有图片数据：${text.slice(0, 160)}`);
+    const b64 = typeof first.b64_json === "string" ? first.b64_json : "";
+    if (b64) {
+      return { base64: b64, revisedPrompt: typeof first.revised_prompt === "string" ? first.revised_prompt : undefined };
+    }
+    const url = typeof first.url === "string" ? first.url : "";
+    if (url) {
+      return { url, revisedPrompt: typeof first.revised_prompt === "string" ? first.revised_prompt : undefined };
+    }
+    throw new Error(`生图返回里既没有 b64_json 也没有 url：${text.slice(0, 160)}`);
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === "AbortError") throw new Error("生图超时（2 分钟），换个小一点的尺寸或稍后再试");
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** 从 AI 自由文本中提取 CMD: <命令> 行（兜底，不用 function calling 时） */
@@ -1412,11 +1656,15 @@ export interface ChatRequestOptions {
    * 历史文件撑爆，也会让 buildMessages 的字符预算（MAX_CHARS）失真。
    */
   screenImage?: string;
+  /** 用户本轮附加的图片（dataURL）。只在本轮请求里编码，不写进历史 */
+  userImages?: string[];
   /**
    * 额外的工具定义（插件工具）。内置 TOOLS 始终会一起发；
    * 这里只放插件注册的工具，避免和内置表重复。
    */
   extraTools?: unknown[];
+  /** 本轮禁用的内置工具名（例如端点没有生图能力时禁掉 generate_image） */
+  disabledTools?: string[];
   /**
    * 用户画像块（由 userProfile.profileBlock 生成）。
    *

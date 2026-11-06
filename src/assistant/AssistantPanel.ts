@@ -42,6 +42,7 @@ import {
   type MoodSample,
 } from "./moodTrend";
 import { detectCorrection } from "./correction";
+import { generateImage, listImageModels } from "./AssistantClient";
 import {
   emptySelfState,
   normalizeSelfState,
@@ -159,8 +160,218 @@ let voicePausedByKey = false;
 let lastSentText = "";
 let lastSentAt = 0;
 let micBtn: HTMLButtonElement | null = null;
+let sendBtn: HTMLButtonElement | null = null;
+/** 正在等回复：发送按钮只做"看不见的忙碌态"，不给用户"点了没反应"的错觉 */
+function setSendBusy(on: boolean) {
+  if (!sendBtn) return;
+  sendBtn.disabled = on;
+  sendBtn.textContent = on ? "…" : "发送";
+  sendBtn.classList.toggle("as-send-busy", on);
+}
+
+/**
+ * 最近生成过的图（localStorage，最多 20 条）。
+ *
+ * 为什么需要：生成是用工具完成的，用户过一会儿说"把那张图放我桌面"，
+ * 模型手上只有一句"已保存到 xxx"，很容易答成"哪张图？我没生成过"。
+ * 把记录留在本地，上下文里就能带上"最近生成的图：<路径>"，它答得出、也搬得动。
+ */
+const GEN_IMAGES_KEY = "petra-generated-images";
+interface GenImage { path: string; prompt: string; model: string; ts: number }
+
+function loadGenImages(): GenImage[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GEN_IMAGES_KEY) || "[]");
+    return Array.isArray(raw) ? (raw as GenImage[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberGenImage(entry: GenImage) {
+  try {
+    const list = [entry, ...loadGenImages().filter((e) => e.path !== entry.path)].slice(0, 20);
+    localStorage.setItem(GEN_IMAGES_KEY, JSON.stringify(list));
+  } catch { /* 忽略 */ }
+}
+
+/** 上下文里的"最近生成的图"提示：2 小时内有效，避免一直挂着一句废话 */
+function recentImageBlock(): string {
+  const last = loadGenImages()[0];
+  if (!last) return "";
+  if (Date.now() - last.ts > 2 * 3600_000) return "";
+  return `【最近生成的图】${last.path}（提示词：${last.prompt.slice(0, 60)}，模型：${last.model}）。用户说"把图放桌面/打开那张图"指的就是它；要复制到桌面就调用 copy_to_desktop。`;
+}
+
+/** 输入框草稿：Esc 收起时保留，下次打开自动填回 */
+const DRAFT_KEY = "petra-input-draft";
+function saveDraft(text: string) {
+  try { localStorage.setItem(DRAFT_KEY, text); } catch { /* 忽略 */ }
+}
+function takeDraft(): string {
+  try {
+    const v = localStorage.getItem(DRAFT_KEY) || "";
+    localStorage.removeItem(DRAFT_KEY);
+    return v;
+  } catch {
+    return "";
+  }
+}
+
+/** 本轮要发给模型的图片（dataURL）。只在这一次请求里编码，不写进历史 */
+let pendingImages: { name: string; dataUrl: string }[] = [];
+/** 本轮附加的文本文件（读完直接并进消息正文，随历史保存） */
+let pendingTextFiles: { name: string; text: string }[] = [];
+/** 输入框上方的附件条 */
+let attachBar: HTMLDivElement | null = null;
+
+const ATTACH_TEXT_MAX_BYTES = 100 * 1024;
+const ATTACH_IMAGE_LIMIT = 6;
+/**
+ * 超过这个体积（或边长太大）的图会**自动压缩**而不是拒收。
+ *
+ * 以前是"超过 4MB 直接提示太大"，用户第一反应就是"凭什么限制我"——
+ * 而且他只是想发张截图/照片。压到 ~2048px、JPEG 0.86 之后肉眼几乎无差，
+ * 请求体也不会撑爆中转站的上限。
+ */
+const IMAGE_COMPRESS_OVER_BYTES = 3 * 1024 * 1024;
+const IMAGE_MAX_SIDE = 2048;
+
+/** 读成 dataURL */
+function readAsDataUrl(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ""));
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+}
+
+/** 压到不超过 maxSide、再按 JPEG 0.86 重编码；失败就退回原图（绝不因为压缩失败而丢图） */
+async function shrinkImage(dataUrl: string): Promise<string> {
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("图片解码失败"));
+      el.src = dataUrl;
+    });
+    const scale = Math.min(1, IMAGE_MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.round(img.naturalWidth * scale);
+    const h = Math.round(img.naturalHeight * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return dataUrl;
+    ctx.drawImage(img, 0, 0, w, h);
+    return canvas.toDataURL("image/jpeg", 0.86);
+  } catch {
+    return dataUrl;
+  }
+}
+
+function renderAttachBar(bar: HTMLDivElement) {
+  bar.innerHTML = "";
+  const items = [
+    ...pendingImages.map((im, i) => ({ label: im.name, thumb: im.dataUrl, kind: "img" as const, i })),
+    ...pendingTextFiles.map((f, i) => ({ label: f.name, thumb: "", kind: "txt" as const, i })),
+  ];
+  if (!items.length) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+  // 出现时轻微闪一下，提示"东西已经挂上了"
+  bar.classList.remove("flash");
+  void bar.offsetWidth;
+  bar.classList.add("flash");
+  for (const it of items) {
+    const chip = document.createElement("span");
+    chip.className = "as-attach-chip";
+    if (it.thumb) {
+      // 缩略图：选完能一眼确认是不是要的那张
+      const img = document.createElement("img");
+      img.className = "as-attach-thumb";
+      img.src = it.thumb;
+      img.alt = "";
+      chip.appendChild(img);
+    } else {
+      chip.appendChild(document.createTextNode("📄 "));
+    }
+    chip.appendChild(document.createTextNode(it.label));
+    const x = document.createElement("button");
+    x.type = "button";
+    x.textContent = "×";
+    x.title = "移除";
+    x.onclick = (e) => {
+      e.stopPropagation();
+      if (it.kind === "img") pendingImages.splice(it.i, 1);
+      else pendingTextFiles.splice(it.i, 1);
+      renderAttachBar(bar);
+    };
+    chip.appendChild(x);
+    bar.appendChild(chip);
+  }
+}
+
+function clearAttachments() {
+  pendingImages = [];
+  pendingTextFiles = [];
+  if (attachBar) renderAttachBar(attachBar);
+}
+
+/**
+ * 处理用户选中的文件。
+ *
+ * 图片 → 读成 dataURL，本轮作为多模态输入（历史里只留占位，避免 base64 撑爆存档）。
+ * 文本 → 直接读进正文（大文件截断），模型能立刻看到内容。
+ * 其它（pdf/docx 等二进制）→ 明确告诉用户改用"说路径 + 让我用 read_text_file 读"。
+ */
+async function addFiles(files: FileList | File[]) {
+  const list = Array.from(files);
+  const notes: string[] = [];
+  for (const f of list) {
+    try {
+      if (f.type.startsWith("image/")) {
+        if (pendingImages.length >= ATTACH_IMAGE_LIMIT) { notes.push(`最多一次 ${ATTACH_IMAGE_LIMIT} 张图片`); break; }
+        let dataUrl = await readAsDataUrl(f);
+        // 不设"最大体积"：太大就自动压到 2048px / JPEG 0.86，而不是拒收
+        if (dataUrl && f.size > IMAGE_COMPRESS_OVER_BYTES) {
+          const small = await shrinkImage(dataUrl);
+          if (small !== dataUrl) {
+            dataUrl = small;
+            notes.push(`${f.name} 已自动压缩（原始 ${(f.size / 1048576).toFixed(1)}MB）`);
+          }
+        }
+        if (dataUrl) pendingImages.push({ name: f.name, dataUrl });
+      } else if (/^(text\/|application\/(json|xml|javascript|x-yaml|yaml))/.test(f.type) || /\.(txt|md|markdown|json|ya?ml|csv|log|ini|toml|ts|tsx|js|jsx|py|rs|go|java|c|h|cpp|css|html|xml|sql|sh|bat|ps1)$/i.test(f.name)) {
+        const text = await f.text();
+        // 超长不再拒收：截断 + 说清楚，避免用户"文件明明不大却发不进来"
+        if (f.size > ATTACH_TEXT_MAX_BYTES) {
+          const cut = text.slice(0, ATTACH_TEXT_MAX_BYTES);
+          pendingTextFiles.push({ name: f.name, text: cut + `\n…（文件较大，只取了前 ${Math.round(ATTACH_TEXT_MAX_BYTES / 1024)}KB；需要全文就告诉我路径，我用工具读）` });
+          notes.push(`${f.name} 较大，只取了前 ${Math.round(ATTACH_TEXT_MAX_BYTES / 1024)}KB`);
+        } else {
+          pendingTextFiles.push({ name: f.name, text });
+        }
+      } else {
+        notes.push(`${f.name} 是二进制文件，我读不了内容 —— 可以直接告诉我它的路径，我用工具读`);
+      }
+    } catch (e) {
+      notes.push(`${f.name} 读取失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (notes.length) toast(notes.slice(0, 3).join("；"), "warn");
+  if (attachBar) renderAttachBar(attachBar);
+  resetTimer();
+}
 
 /** 麦克风图标：细描边的胶囊 + 拾音弧 + 支架，24 网格便于缩放 */
+/** 回形针图标（线性风格，跟麦克风同一套描边） */
+const ATTACH_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M20.5 11.5l-7.8 7.8a4.6 4.6 0 0 1-6.5-6.5l8.2-8.2a3.1 3.1 0 0 1 4.4 4.4l-8.2 8.2a1.6 1.6 0 0 1-2.2-2.2l7.4-7.4"/>' +
+  '</svg>';
+
 const MIC_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" ' +
   'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -739,6 +950,12 @@ function ensureInput() {
     // Esc 直接收起输入框：用户想关掉时不用去点角落的 ✕
     if (e.key === "Escape") {
       e.preventDefault();
+      // 有内容就只收面板、不丢字：下次打开输入框还在（ESC 原本会直接把敲了一半的话扔掉）
+      const draft = input.value;
+      if (draft.trim()) {
+        saveDraft(draft);
+        toast("已收起，内容留着，下次打开还在", "info");
+      }
       closeAssistant();
       return;
     }
@@ -764,6 +981,7 @@ function ensureInput() {
   const btn = document.createElement("button");
   btn.className = "as-send";
   btn.textContent = "发送";
+  sendBtn = btn;
   btn.addEventListener("click", () => {
     const t = input.value.trim();
     if (!t) return;
@@ -793,7 +1011,56 @@ function ensureInput() {
   mic.addEventListener("click", () => void toggleVoiceInput());
   micBtn = mic;
 
-  row.append(input, mic, btn);
+  // 附件按钮：图片直接给模型看，文本文件读进正文；其它类型提示改用"说路径让我读"
+  const attach = document.createElement("button");
+  attach.className = "as-attach";
+  attach.type = "button";
+  attach.title = "添加图片 / 文件（图片直接给我看，文本文件直接读进来）";
+  attach.setAttribute("aria-label", "添加图片或文件");
+  attach.innerHTML = ATTACH_ICON_SVG;
+  const filePicker = document.createElement("input");
+  filePicker.type = "file";
+  filePicker.multiple = true;
+  filePicker.accept = "image/*,.txt,.md,.json,.csv,.log,.yml,.yaml,.ini,.toml,.ts,.tsx,.js,.jsx,.py,.rs,.go,.java,.c,.h,.cpp,.css,.html,.xml,.sql,.sh,.bat,.ps1";
+  filePicker.style.display = "none";
+  filePicker.addEventListener("change", () => {
+    if (filePicker.files && filePicker.files.length) void addFiles(filePicker.files);
+    filePicker.value = ""; // 同一个文件连选两次也要能触发
+  });
+  attach.addEventListener("click", () => filePicker.click());
+
+  // Ctrl+V 直接粘贴图片（截图后顺手粘进来是最常见的用法）
+  // 注意：只在剪贴板里真有图片时拦截，否则会破坏正常的文字粘贴
+  input.addEventListener("paste", (e) => {
+    const items = Array.from(e.clipboardData?.items ?? []);
+    const files = items
+      .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+      .map((it) => it.getAsFile())
+      .filter((f): f is File => !!f);
+    if (!files.length) return;
+    e.preventDefault();
+    void addFiles(files);
+  });
+
+  // 拖拽：把图片/文件直接拖到输入框上
+  const stop = (e: DragEvent) => { e.preventDefault(); e.stopPropagation(); };
+  inputBar.addEventListener("dragover", (e) => { stop(e); inputBar!.classList.add("as-drop"); });
+  inputBar.addEventListener("dragleave", () => inputBar!.classList.remove("as-drop"));
+  inputBar.addEventListener("drop", (e) => {
+    stop(e);
+    inputBar!.classList.remove("as-drop");
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    if (files.length) void addFiles(files);
+  });
+
+  // 顺序：输入框 → 📎 → 🎤 → 发送。附件和语音都是"输入手段"，挨着放，
+  // 而且都在右侧拇指区，比塞在输入框左边顺手。
+  row.append(input, attach, filePicker, mic, btn);
+
+  // 附件条：显示本轮已挂上的图片/文件，可单个移除
+  attachBar = document.createElement("div");
+  attachBar.className = "as-attach-bar hidden";
+  inputBar.appendChild(attachBar);
 
   // 发送下面：允许所有 shell 复选框（持久化到设置，重启后保持）
   const allowRow = document.createElement("label");
@@ -1249,6 +1516,61 @@ function bubbleBody(b: HTMLElement): HTMLElement {
   return (b.querySelector(".as-bubble-body") as HTMLElement | null) ?? b;
 }
 
+/**
+ * 生成图片后，在对话里直接显示缩略图（点一下用系统看图打开）。
+ * 以前只把路径写在文字里，用户既看不到图、点 `[查看图片]` 也没反应。
+ */
+async function addImageBubble(path: string) {
+  try {
+    const dataUrl = await invoke<string>("read_image_data_url", { path });
+    ensureBubbles();
+    const b = document.createElement("div");
+    b.className = "as-bubble as-ai as-image-bubble";
+    const img = document.createElement("img");
+    img.className = "as-bubble-img";
+    img.src = dataUrl;
+    img.alt = "生成的图片";
+    img.title = "点击用系统看图打开";
+    img.addEventListener("click", () => {
+      void invoke("open_path", { path }).catch(() => toast(`图片在：${path}`, "info"));
+    });
+    b.appendChild(img);
+    attachBubbleClose(b);
+    bubbles?.appendChild(b);
+    setTimeout(() => b.scrollIntoView({ block: "nearest", behavior: "smooth" }), 50);
+  } catch { /* 预览失败不影响主流程：路径已经在文字里了 */ }
+}
+
+/**
+ * 生图期间把等待气泡换成"进度 + 取消"。
+ * 生图要 25 秒生成 + 30 秒下载，只写"正在画"用户会以为卡死。
+ */
+function startGenProgress(bubble: HTMLElement, onCancel: () => void): () => void {
+  const body = bubbleBody(bubble);
+  const started = Date.now();
+  const render = () => {
+    const sec = Math.round((Date.now() - started) / 1000);
+    body.innerHTML = "";
+    const span = document.createElement("span");
+    span.textContent = `正在画图…已 ${sec} 秒（通常 1 分钟左右）`;
+    const btn = document.createElement("button");
+    btn.className = "as-cancel-btn";
+    btn.textContent = "取消";
+    btn.onclick = () => {
+      btn.disabled = true;
+      span.textContent = "正在取消…";
+      onCancel();
+    };
+    body.append(span, btn);
+  };
+  render();
+  const timer = window.setInterval(render, 1000);
+  return () => {
+    window.clearInterval(timer);
+    body.innerHTML = "";
+  };
+}
+
 function setBubbleText(b: HTMLElement, text: string): void {
   bubbleBody(b).textContent = text;
 }
@@ -1399,6 +1721,11 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
     historyLoaded = true;
   }
   inputBar!.classList.remove("hidden");
+  // Esc 收起时留下的草稿：打开面板自动填回
+  if (input && !input.value.trim()) {
+    const draft = takeDraft();
+    if (draft) setInputValue(draft);
+  }
   // 没传 rect（语音快捷键、右键菜单唤出等）就向主进程要一份当前模型矩形，
   // 否则输入框会停在上一次的旧位置 / 屏幕角落。
   const rect = modelRect ?? modelRectProvider?.() ?? null;
@@ -1695,9 +2022,20 @@ async function send(text: string) {
     s.assistant.historyLang = outLang;
     saveSettings(s);
   }
+  // 附件：文本文件直接并进正文（模型立刻看得到）；图片只在本轮请求里编码成多模态，
+  // 历史里只留一句占位，避免 base64 把 chat-history 和请求体一起撑爆。
+  const attachText = pendingTextFiles
+    .map((f) => `【附件：${f.name}】\n${f.text}`)
+    .join("\n\n");
+  const imageNote = pendingImages.length
+    ? `（另外附图 ${pendingImages.length} 张：${pendingImages.map((i) => i.name).join("、")}）`
+    : "";
+  const imagesForTurn = pendingImages.map((i) => i.dataUrl);
+  const composed = [text, attachText, imageNote].filter(Boolean).join("\n\n");
+  clearAttachments();
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑
   const langReminder = buildLanguageReminder(outLang ?? "");
-  const userContent = langReminder ? `${text}\n${langReminder}` : text;
+  const userContent = langReminder ? `${composed}\n${langReminder}` : composed;
   // 用户在纠正我（"记错了/我没说过/别记这个"）：记下来，这轮回复完立刻跑一次记忆提取，
   // 不等攒够 6 条 —— 否则 AI 会带着错的记忆再聊好几轮。
   const correctingNow = detectCorrection(text);
@@ -1736,7 +2074,17 @@ async function send(text: string) {
       const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
       const personaWithLang = s.assistant.persona;
-      const extraCtxWithLang = buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") + "\n\n" + langInstruction;
+      // 生图能力要和模型说清楚：不支持时**当场如实说明**，别硬调工具再报"接口没连上"
+      const imgModel = (s.assistant.imageModel || "").trim();
+      const imgCapable = s.assistant.imageCapable;
+      const imageCtx = imgCapable === false
+        ? "【生图能力】当前接入的模型/端点**不能生图**。用户让你画图时，直接用一句话说清楚：你这个模型不支持生图（或这个接口没接生图模型），并告诉他到「控制面板 → 小助手 → 获取模型列表」配一个生图模型（如 gpt-image-2）或换支持生图的供应商。不要假装在画，也不要调用 generate_image。"
+        : imgCapable === true
+          ? `【生图能力】可以生图（模型：${imgModel || "自动识别"}）。用户要画图时调用 generate_image，生成后图片会自动存到他桌面。`
+          : "【生图能力】还没确认这个端点支不支持生图。用户要画图时可以调用一次 generate_image；如果失败，就如实说明并告诉他怎么配（小助手 → 获取模型列表 / 生图模型）。";
+      const extraCtxWithLang =
+        buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") +
+        "\n\n" + imageCtx + "\n\n" + recentImageBlock() + "\n\n" + langInstruction;
 
       const res = await chatStream(
         s.assistant.provider,
@@ -1758,6 +2106,9 @@ async function send(text: string) {
         // extraTools：插件在运行时注册的工具；每轮重新取，插件热重载后立即生效
         {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
+          ...(imagesForTurn.length ? { userImages: imagesForTurn } : {}),
+          // 明确不支持生图时干脆不暴露这个工具，模型就不会"先调一下试试"再报错
+          ...(s.assistant.imageCapable === false ? { disabledTools: ["generate_image"] } : {}),
           extraTools: pluginRuntime.getOpenAITools(),
           // 画像 + 最近情绪只走 system prompt：模型知道"这是什么样的人、最近过得怎样"，
           // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
@@ -1931,6 +2282,7 @@ async function send(text: string) {
     scheduleFade(loading, readingHoldMs(getBubbleText(loading), 8000));
   } finally {
     busy = false;
+    setSendBusy(false);
     resetTimer(); // 一轮对话结束 = 一次互动，空闲窗口重新开始计时
   }
 }
@@ -2195,6 +2547,86 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         maxLines: tc.args.max_lines,
         denyPaths: fileDenyPaths(),
       });
+    }
+    // ---------- 生图 ----------
+    // 模型名：用户填过就用用户的；没填就从 /models 里自动识别（并存下来，下次直接用）
+    if (tc.name === "generate_image") {
+      const st = loadSettings();
+      let model = (st.assistant.imageModel || "").trim();
+      try {
+        const key = await ensureApiKey();
+        // 不管有没有填过，都拿一份站点里的生图模型清单当备选：
+        // 中转站的 /models 会把"没开通渠道"的模型也列出来，第一个调不通就换下一个。
+        const found = await listImageModels(st.assistant.provider, key, st.assistant.customBaseUrl);
+        if (!model && found.length) model = found[0];
+        if (!model) {
+          // 明确记下来：这个端点没有生图能力，之后的对话直接告诉用户、也不再暴露工具
+          st.assistant.imageCapable = false;
+          saveSettings(st);
+          pushHistory({
+            role: "tool",
+            tool_call_id: tc.id,
+            content:
+              `当前对话模型（${st.assistant.model || "默认模型"}）不能生图：这个端点没有可用的生图模型。`
+              + "请到「控制面板 → 小助手 → 获取模型列表」配一个生图模型（如 gpt-image-2），或换一个支持生图的供应商。"
+              + "请如实告诉用户这一点，不要说自己正在画。",
+          });
+        } else {
+          const ctrl = new AbortController();
+          const stopProgress = startGenProgress(loading, () => ctrl.abort());
+          let img;
+          try {
+            img = await generateImage({
+              provider: st.assistant.provider,
+              apiKey: key,
+              customBaseUrl: st.assistant.customBaseUrl,
+              model,
+              fallbackModels: found,
+              prompt: String(tc.args.prompt || ""),
+              size: tc.args.size ? String(tc.args.size) : undefined,
+              signal: ctrl.signal,
+            });
+          } finally {
+            stopProgress();
+          }
+          // 自动换过模型要说一声，否则用户不知道"我选的模型没生效"
+          if (model && img.model !== model) {
+            toast(`模型 ${model} 画不了，已自动换成 ${img.model}`, "info");
+          }
+          // 记住"真正画成功"的那个模型，下次直接用，不再挨个试
+          if (img.model && img.model !== st.assistant.imageModel) {
+            st.assistant.imageModel = img.model;
+            saveSettings(st);
+          }
+          // base64 直接写；只回 url 的交给 Rust 下载（网页里 fetch 对象存储会 Failed to fetch）
+          const path = img.base64
+            ? await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 })
+            : await invoke<string>("save_image_from_url", { url: img.url ?? "", nameHint: "" });
+          rememberGenImage({ path, prompt: String(tc.args.prompt || ""), model: img.model, ts: Date.now() });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `已用 ${img.model} 生成图片并保存到桌面：${path}` });
+          toast(`画好了（${img.model}），已存到桌面：${path}`, "info");
+          void addImageBubble(path);
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/abort/i.test(msg)) {
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: "用户取消了这次生图，什么都没生成。" });
+          return;
+        }
+        // 端点根本没有 /images/generations：这是"能力问题"，不是临时故障
+        if (/HTTP\s*(404|405)|不支持生图|not support/i.test(msg)) {
+          st.assistant.imageCapable = false;
+          saveSettings(st);
+        }
+        pushHistory({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: `生图失败：${msg}${/HTTP\s*(404|405)/.test(msg) ? "（这个端点没有生图接口，属于能力不支持；请如实告诉用户，并告诉他去配一个支持生图的供应商）" : ""}`,
+        });
+      }
+    }
+    if (tc.name === "copy_to_desktop") {
+      await invokeTool(tc, "copy_to_desktop", { path: String(tc.args.path || "") });
     }
     if (tc.name === "list_directory") {
       await invokeTool(tc, "list_directory", {
@@ -2662,6 +3094,7 @@ export async function triggerProactive(): Promise<boolean> {
   });
 
   busy = true;
+  setSendBusy(true);
   lifecycleOnOpen?.();
   const bubble = addBubble("ai", "");
   setBubbleText(bubble, "正在看看你在做什么…");
@@ -2738,6 +3171,7 @@ export async function triggerProactive(): Promise<boolean> {
     return false;
   } finally {
     busy = false;
+    setSendBusy(false);
     lifecycleOnClose?.();
   }
 }
@@ -2794,6 +3228,7 @@ export async function triggerCardCommentary(card: { rarity: string; theme: strin
     bubble.remove();
   } finally {
     busy = false;
+    setSendBusy(false);
     lifecycleOnClose?.();
   }
 }
