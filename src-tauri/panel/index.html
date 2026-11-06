@@ -658,6 +658,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { path: "assistant.provider", label: "供应商", type: "select", options: "providers" },
             { path: "assistant.model", label: "模型", type: "text", placeholder: "留空则使用供应商默认模型" },
             { path: "assistant.customBaseUrl", label: "自定义接口地址", type: "text", placeholder: "仅选择自定义供应商时填写" },
+            { path: "assistant.imageModel", label: "生图模型", type: "text", placeholder: "留空 = 自动识别（拉一次模型列表就会自动填上）" },
             { type: "actions", items: [{ id: "__data:models-fetch", label: "获取模型列表", passKey: true }] },
             { type: "secret", key: "assistant", label: "API Key", desc: "填写时不会显示，填写后覆盖当前预设设置" },
             { type: "usage" },

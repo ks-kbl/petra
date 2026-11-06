@@ -431,6 +431,70 @@ body {
  *   悬停 —— 浮起、化成紫粉渐变、图标转白（明确的"可以按"反馈）
  *   录音 —— 玫红实心 + 两圈错开的声波光环 + 4 根律动音量条（把"在听"画出来）
  */
+.as-attach {
+  position: relative;
+  flex: 0 0 auto;
+  align-self: flex-end;
+  margin-bottom: 1px;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(140, 90, 160, 0.32);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.72);
+  color: rgba(96, 60, 120, 0.9);
+  cursor: pointer;
+  transition: transform 0.14s ease, background 0.14s ease, color 0.14s ease;
+}
+.as-attach svg { width: 15px; height: 15px; display: block; }
+.as-attach:hover {
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(150deg, #9d6fc9, #d06a9a);
+  transform: translateY(-1px) scale(1.07);
+}
+.as-attach:active { transform: scale(0.93); }
+
+/* 附件条：挂在输入框上方，显示本轮已选中的图片/文件 */
+.as-attach-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 10px 0;
+}
+.as-attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 190px;
+  padding: 3px 6px 3px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: #5b3a72;
+  background: rgba(160, 110, 200, 0.14);
+  border: 1px solid rgba(140, 90, 160, 0.25);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.as-attach-chip button {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  line-height: 13px;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(140, 90, 160, 0.18);
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.as-attach-chip button:hover { background: rgba(200, 70, 110, 0.75); color: #fff; }
+
 .as-mic {
   position: relative;
   flex: 0 0 auto;

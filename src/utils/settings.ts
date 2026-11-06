@@ -103,6 +103,8 @@ export interface AssistantSettings {
   inputIdleHideSec: number;
   /** 对用户的称呼（如"主人"），空则让 AI 自行决定 */
   nickname: string;
+  /** 生图模型名（留空 = 从 /models 自动识别，如 gpt-image-2 / kolors） */
+  imageModel?: string;
   /** 语音输入快捷键（按下直接开麦说话，Tauri accelerator 字符串）；空表示未设置 */
   voiceShortcut?: string;
   /** 全局呼出快捷键（Tauri accelerator 字符串，如 "Ctrl+Shift+A"）；空表示未设置 */
@@ -275,6 +277,7 @@ const DEFAULTS: Settings = {
     nickname: "",
     shortcut: "",
     voiceShortcut: "",
+    imageModel: "",
     outputLanguage: "",
   },
   diary: {

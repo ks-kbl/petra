@@ -42,6 +42,7 @@ import {
   type MoodSample,
 } from "./moodTrend";
 import { detectCorrection } from "./correction";
+import { generateImage, listImageModels } from "./AssistantClient";
 import {
   emptySelfState,
   normalizeSelfState,
@@ -160,7 +161,96 @@ let lastSentText = "";
 let lastSentAt = 0;
 let micBtn: HTMLButtonElement | null = null;
 
+/** 本轮要发给模型的图片（dataURL）。只在这一次请求里编码，不写进历史 */
+let pendingImages: { name: string; dataUrl: string }[] = [];
+/** 本轮附加的文本文件（读完直接并进消息正文，随历史保存） */
+let pendingTextFiles: { name: string; text: string }[] = [];
+/** 输入框上方的附件条 */
+let attachBar: HTMLDivElement | null = null;
+
+const ATTACH_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+const ATTACH_TEXT_MAX_BYTES = 100 * 1024;
+const ATTACH_IMAGE_LIMIT = 4;
+
+function renderAttachBar(bar: HTMLDivElement) {
+  bar.innerHTML = "";
+  const items = [
+    ...pendingImages.map((im, i) => ({ label: `🖼 ${im.name}`, kind: "img" as const, i })),
+    ...pendingTextFiles.map((f, i) => ({ label: `📄 ${f.name}`, kind: "txt" as const, i })),
+  ];
+  if (!items.length) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+  for (const it of items) {
+    const chip = document.createElement("span");
+    chip.className = "as-attach-chip";
+    chip.textContent = it.label;
+    const x = document.createElement("button");
+    x.type = "button";
+    x.textContent = "×";
+    x.title = "移除";
+    x.onclick = (e) => {
+      e.stopPropagation();
+      if (it.kind === "img") pendingImages.splice(it.i, 1);
+      else pendingTextFiles.splice(it.i, 1);
+      renderAttachBar(bar);
+    };
+    chip.appendChild(x);
+    bar.appendChild(chip);
+  }
+}
+
+function clearAttachments() {
+  pendingImages = [];
+  pendingTextFiles = [];
+  if (attachBar) renderAttachBar(attachBar);
+}
+
+/**
+ * 处理用户选中的文件。
+ *
+ * 图片 → 读成 dataURL，本轮作为多模态输入（历史里只留占位，避免 base64 撑爆存档）。
+ * 文本 → 直接读进正文（大文件截断），模型能立刻看到内容。
+ * 其它（pdf/docx 等二进制）→ 明确告诉用户改用"说路径 + 让我用 read_text_file 读"。
+ */
+async function addFiles(files: FileList | File[]) {
+  const list = Array.from(files);
+  const notes: string[] = [];
+  for (const f of list) {
+    try {
+      if (f.type.startsWith("image/")) {
+        if (pendingImages.length >= ATTACH_IMAGE_LIMIT) { notes.push(`最多一次 ${ATTACH_IMAGE_LIMIT} 张图片`); break; }
+        if (f.size > ATTACH_IMAGE_MAX_BYTES) { notes.push(`${f.name} 太大（>4MB）`); continue; }
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const r = new FileReader();
+          r.onload = () => resolve(String(r.result || ""));
+          r.onerror = () => reject(r.error);
+          r.readAsDataURL(f);
+        });
+        if (dataUrl) pendingImages.push({ name: f.name, dataUrl });
+      } else if (/^(text\/|application\/(json|xml|javascript|x-yaml|yaml))/.test(f.type) || /\.(txt|md|markdown|json|ya?ml|csv|log|ini|toml|ts|tsx|js|jsx|py|rs|go|java|c|h|cpp|css|html|xml|sql|sh|bat|ps1)$/i.test(f.name)) {
+        if (f.size > ATTACH_TEXT_MAX_BYTES) { notes.push(`${f.name} 太大（>100KB），改用说路径让我读`); continue; }
+        const text = await f.text();
+        pendingTextFiles.push({ name: f.name, text });
+      } else {
+        notes.push(`${f.name} 是二进制文件，我读不了内容 —— 可以直接告诉我它的路径，我用工具读`);
+      }
+    } catch (e) {
+      notes.push(`${f.name} 读取失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (notes.length) toast(notes.slice(0, 3).join("；"), "warn");
+  if (attachBar) renderAttachBar(attachBar);
+  resetTimer();
+}
+
 /** 麦克风图标：细描边的胶囊 + 拾音弧 + 支架，24 网格便于缩放 */
+/** 回形针图标（线性风格，跟麦克风同一套描边） */
+const ATTACH_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M20.5 11.5l-7.8 7.8a4.6 4.6 0 0 1-6.5-6.5l8.2-8.2a3.1 3.1 0 0 1 4.4 4.4l-8.2 8.2a1.6 1.6 0 0 1-2.2-2.2l7.4-7.4"/>' +
+  '</svg>';
+
 const MIC_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" ' +
   'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -793,7 +883,30 @@ function ensureInput() {
   mic.addEventListener("click", () => void toggleVoiceInput());
   micBtn = mic;
 
-  row.append(input, mic, btn);
+  // 附件按钮：图片直接给模型看，文本文件读进正文；其它类型提示改用"说路径让我读"
+  const attach = document.createElement("button");
+  attach.className = "as-attach";
+  attach.type = "button";
+  attach.title = "添加图片 / 文件（图片直接给我看，文本文件直接读进来）";
+  attach.setAttribute("aria-label", "添加图片或文件");
+  attach.innerHTML = ATTACH_ICON_SVG;
+  const filePicker = document.createElement("input");
+  filePicker.type = "file";
+  filePicker.multiple = true;
+  filePicker.accept = "image/*,.txt,.md,.json,.csv,.log,.yml,.yaml,.ini,.toml,.ts,.tsx,.js,.jsx,.py,.rs,.go,.java,.c,.h,.cpp,.css,.html,.xml,.sql,.sh,.bat,.ps1";
+  filePicker.style.display = "none";
+  filePicker.addEventListener("change", () => {
+    if (filePicker.files && filePicker.files.length) void addFiles(filePicker.files);
+    filePicker.value = ""; // 同一个文件连选两次也要能触发
+  });
+  attach.addEventListener("click", () => filePicker.click());
+
+  row.append(attach, filePicker, input, mic, btn);
+
+  // 附件条：显示本轮已挂上的图片/文件，可单个移除
+  attachBar = document.createElement("div");
+  attachBar.className = "as-attach-bar hidden";
+  inputBar.appendChild(attachBar);
 
   // 发送下面：允许所有 shell 复选框（持久化到设置，重启后保持）
   const allowRow = document.createElement("label");
@@ -1695,9 +1808,20 @@ async function send(text: string) {
     s.assistant.historyLang = outLang;
     saveSettings(s);
   }
+  // 附件：文本文件直接并进正文（模型立刻看得到）；图片只在本轮请求里编码成多模态，
+  // 历史里只留一句占位，避免 base64 把 chat-history 和请求体一起撑爆。
+  const attachText = pendingTextFiles
+    .map((f) => `【附件：${f.name}】\n${f.text}`)
+    .join("\n\n");
+  const imageNote = pendingImages.length
+    ? `（另外附图 ${pendingImages.length} 张：${pendingImages.map((i) => i.name).join("、")}）`
+    : "";
+  const imagesForTurn = pendingImages.map((i) => i.dataUrl);
+  const composed = [text, attachText, imageNote].filter(Boolean).join("\n\n");
+  clearAttachments();
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑
   const langReminder = buildLanguageReminder(outLang ?? "");
-  const userContent = langReminder ? `${text}\n${langReminder}` : text;
+  const userContent = langReminder ? `${composed}\n${langReminder}` : composed;
   // 用户在纠正我（"记错了/我没说过/别记这个"）：记下来，这轮回复完立刻跑一次记忆提取，
   // 不等攒够 6 条 —— 否则 AI 会带着错的记忆再聊好几轮。
   const correctingNow = detectCorrection(text);
@@ -1758,6 +1882,7 @@ async function send(text: string) {
         // extraTools：插件在运行时注册的工具；每轮重新取，插件热重载后立即生效
         {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
+          ...(imagesForTurn.length ? { userImages: imagesForTurn } : {}),
           extraTools: pluginRuntime.getOpenAITools(),
           // 画像 + 最近情绪只走 system prompt：模型知道"这是什么样的人、最近过得怎样"，
           // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
@@ -2195,6 +2320,44 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         maxLines: tc.args.max_lines,
         denyPaths: fileDenyPaths(),
       });
+    }
+    // ---------- 生图 ----------
+    // 模型名：用户填过就用用户的；没填就从 /models 里自动识别（并存下来，下次直接用）
+    if (tc.name === "generate_image") {
+      const st = loadSettings();
+      let model = (st.assistant.imageModel || "").trim();
+      try {
+        const key = await ensureApiKey();
+        if (!model) {
+          const found = await listImageModels(st.assistant.provider, key, st.assistant.customBaseUrl);
+          if (found.length) {
+            model = found[0];
+            st.assistant.imageModel = model;
+            saveSettings(st);
+          }
+        }
+        if (!model) {
+          pushHistory({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: "这个端点没有提供可用的生图模型。请在「小助手」里手动填一个生图模型名，或换一个支持 /images/generations 的供应商。",
+          });
+        } else {
+          const img = await generateImage({
+            provider: st.assistant.provider,
+            apiKey: key,
+            customBaseUrl: st.assistant.customBaseUrl,
+            model,
+            prompt: String(tc.args.prompt || ""),
+            size: tc.args.size ? String(tc.args.size) : undefined,
+          });
+          const path = await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 });
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `已生成图片并保存到桌面：${path}` });
+          toast(`画好了，已存到桌面：${path}`, "info");
+        }
+      } catch (e) {
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: `生图失败：${e instanceof Error ? e.message : String(e)}` });
+      }
     }
     if (tc.name === "list_directory") {
       await invokeTool(tc, "list_directory", {

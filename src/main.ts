@@ -3455,6 +3455,8 @@ function buildSettingsItems(engine: BehaviorEngine): MenuItemSpec[] {
 let panelChat: { role: string; content: string }[] = [];
 let panelDiaries: { date: string; text: string }[] = [];
 let panelAssistantModels: string[] = [];
+/** 站点里识别到的生图模型（面板上显示"自动识别：gpt-image-2"） */
+let panelImageModels: string[] = [];
 /** 模型列表的一句话说明（站点返回多少、过滤掉多少），面板上显示，解释"为什么只有这么几个" */
 let panelModelNote = "";
 let panelKeys = { assistant: false, tts: false, asr: false };
@@ -3594,6 +3596,7 @@ function buildPanelMeta() {
       card: getTodayDraw(),
       actionList: listActions(),
       assistantModels: panelAssistantModels,
+      imageModels: panelImageModels,
       modelNote: panelModelNote,
       personaTest: panelPersonaTest,
       asrModel: panelAsrModel,
@@ -4124,10 +4127,16 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
           settings.assistant.provider,
           key,
           settings.assistant.customBaseUrl,
-          (raw, kept) => {
+          ({ raw, kept, imageModels }) => {
             panelModelNote = kept.length < raw.length
-              ? `站点返回 ${raw.length} 个模型，已隐藏 ${raw.length - kept.length} 个非对话模型（图像/语音等）`
+              ? `站点返回 ${raw.length} 个模型，其中 ${raw.length - kept.length} 个是图像/语音类（已在对话模型里隐藏）`
               : `站点返回 ${raw.length} 个模型`;
+            // 自动识别生图模型：用户不用再手填一遍名字
+            panelImageModels = imageModels;
+            if (imageModels.length && !(settings.assistant.imageModel || "").trim()) {
+              settings.assistant.imageModel = imageModels[0];
+              saveSettings(settings);
+            }
           },
         );
         toast(

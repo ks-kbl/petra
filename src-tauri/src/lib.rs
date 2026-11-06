@@ -2947,6 +2947,47 @@ fn chrono_now() -> String {
 /// 取不到时退回临时目录，保证导出不会因为环境异常而失败。
 ///
 /// Linux 理论上应读 XDG user-dirs 的 XDG_DESKTOP_DIR（桌面目录可能被本地化成
+
+/// 把一张生成的图片存到桌面，返回绝对路径。
+///
+/// 用户要求"生成的图片自动下载到桌面"，所以固定落桌面、文件名带时间戳，
+/// 重名自动加序号（同一秒生成两张也不会覆盖）。
+#[tauri::command]
+fn save_desktop_image(name_hint: String, base64: String) -> Result<String, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64.as_bytes())
+        .map_err(|e| format!("图片数据解码失败：{e}"))?;
+    if bytes.is_empty() {
+        return Err("生成的图片是空的".into());
+    }
+    let dir = desktop_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建桌面目录失败：{e}"))?;
+
+    // 文件名：用户给的提示（可选）+ 时间戳；去掉路径分隔符与 Windows 非法字符
+    let now = chrono::Local::now();
+    let stem_hint: String = name_hint
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .take(40)
+        .collect();
+    let stem = if stem_hint.is_empty() {
+        format!("Petra-{}", now.format("%Y%m%d-%H%M%S"))
+    } else {
+        format!("{}-{}", stem_hint, now.format("%Y%m%d-%H%M%S"))
+    };
+    let mut path = dir.join(format!("{stem}.png"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{stem}-{n}.png"));
+        n += 1;
+    }
+    std::fs::write(&path, &bytes).map_err(|e| format!("写入图片失败：{e}"))?;
+    log_line(&format!("[image] 已保存 {} ({} bytes)", path.display(), bytes.len()));
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// "桌面"或其它名字），但那要多解析一个配置文件；导出功能只在桌面上放一份文件，
 /// 退回 $HOME/Desktop 的收益/成本比更好，且与 macOS 版行为一致。
 fn desktop_dir() -> std::path::PathBuf {
@@ -5924,7 +5965,7 @@ pub fn run() {
             register_assistant_shortcut, unregister_assistant_shortcut, capture_hotkey,
             tts_synthesize, set_tts_key, get_tts_key,
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
-            register_voice_shortcut, unregister_voice_shortcut,
+            register_voice_shortcut, unregister_voice_shortcut, save_desktop_image,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
             capture_screen,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,

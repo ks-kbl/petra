@@ -64,6 +64,37 @@ const json = (obj, status = 200) =>
     check("能识别非对话模型名", ac.looksLikeNonChatModel("gpt-image-2") === true);
     check("普通聊天模型不误判", ac.looksLikeNonChatModel("deepseek-v4.1-flash") === false);
 
+    // ---- 0d) 生图模型自动识别：用户不用手填模型名 ----
+    {
+      const names = ["gpt-4o", "gpt-image-2", "deepseek-v4.1-flash", "kolors", "flux-schnell", "gpt-image-2.5"];
+      const imgs = ac.detectImageModels(names);
+      check("自动识别生图模型", imgs.length === 4 && imgs[0] === "gpt-image-2", JSON.stringify(imgs));
+      check("聊天模型不算生图模型", !imgs.includes("gpt-4o") && !imgs.includes("deepseek-v4.1-flash"));
+      check("生图判断不误伤", ac.looksLikeImageModel("kimi-k3") === false);
+    }
+    // ---- 0e) /images/generations 回 url 时要能下载并转 base64 ----
+    {
+      global.fetch = async (url) => {
+        if (String(url).includes("/images/generations")) {
+          return json({ data: [{ url: "https://example.com/a.png" }] });
+        }
+        return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      };
+      const img = await ac.generateImage({
+        provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1",
+        model: "gpt-image-2", prompt: "一只鲸鱼",
+      });
+      check("url 形式的生图结果被转成 base64", img.base64 === "AQID", img.base64);
+    }
+    // ---- 0f) 没配生图模型时给中文提示 ----
+    {
+      let err = "";
+      try {
+        await ac.generateImage({ provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1", model: "", prompt: "x" });
+      } catch (e) { err = e instanceof Error ? e.message : String(e); }
+      check("无生图模型时提示中文", /生图模型/.test(err), err);
+    }
+
     // ---- 1) tools 被拒 → 自动降级为无工具请求，并记住该端点 ----
     {
       const requests = [];
