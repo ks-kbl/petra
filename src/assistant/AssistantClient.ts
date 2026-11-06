@@ -496,6 +496,21 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "copy_to_desktop",
+      description:
+        "把**已经存在的**文件复制到用户桌面（例如把刚生成的图放桌面、把别的目录里的图片拿过来）。用户说「把图片放到我桌面」「把那个文件弄到桌面」时调用。只需要源文件的完整路径。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "要复制的文件完整绝对路径" },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "read_text_file",
       description:
         "读取一个文本文件的**内容**（不是用默认程序打开，那个用 open_path）。返回带行号信息的一段内容；文件很大时只会返回一部分（truncated=true），可以再用 start_line 接着读。二进制文件会被拒绝。",

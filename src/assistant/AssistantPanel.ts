@@ -161,6 +161,40 @@ let lastSentText = "";
 let lastSentAt = 0;
 let micBtn: HTMLButtonElement | null = null;
 
+/**
+ * 最近生成过的图（localStorage，最多 20 条）。
+ *
+ * 为什么需要：生成是用工具完成的，用户过一会儿说"把那张图放我桌面"，
+ * 模型手上只有一句"已保存到 xxx"，很容易答成"哪张图？我没生成过"。
+ * 把记录留在本地，上下文里就能带上"最近生成的图：<路径>"，它答得出、也搬得动。
+ */
+const GEN_IMAGES_KEY = "petra-generated-images";
+interface GenImage { path: string; prompt: string; model: string; ts: number }
+
+function loadGenImages(): GenImage[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GEN_IMAGES_KEY) || "[]");
+    return Array.isArray(raw) ? (raw as GenImage[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberGenImage(entry: GenImage) {
+  try {
+    const list = [entry, ...loadGenImages().filter((e) => e.path !== entry.path)].slice(0, 20);
+    localStorage.setItem(GEN_IMAGES_KEY, JSON.stringify(list));
+  } catch { /* 忽略 */ }
+}
+
+/** 上下文里的"最近生成的图"提示：2 小时内有效，避免一直挂着一句废话 */
+function recentImageBlock(): string {
+  const last = loadGenImages()[0];
+  if (!last) return "";
+  if (Date.now() - last.ts > 2 * 3600_000) return "";
+  return `【最近生成的图】${last.path}（提示词：${last.prompt.slice(0, 60)}，模型：${last.model}）。用户说"把图放桌面/打开那张图"指的就是它；要复制到桌面就调用 copy_to_desktop。`;
+}
+
 /** 本轮要发给模型的图片（dataURL）。只在这一次请求里编码，不写进历史 */
 let pendingImages: { name: string; dataUrl: string }[] = [];
 /** 本轮附加的文本文件（读完直接并进消息正文，随历史保存） */
@@ -1872,7 +1906,7 @@ async function send(text: string) {
           : "【生图能力】还没确认这个端点支不支持生图。用户要画图时可以调用一次 generate_image；如果失败，就如实说明并告诉他怎么配（小助手 → 获取模型列表 / 生图模型）。";
       const extraCtxWithLang =
         buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") +
-        "\n\n" + imageCtx + "\n\n" + langInstruction;
+        "\n\n" + imageCtx + "\n\n" + recentImageBlock() + "\n\n" + langInstruction;
 
       const res = await chatStream(
         s.assistant.provider,
@@ -2377,6 +2411,7 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           const path = img.base64
             ? await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 })
             : await invoke<string>("save_image_from_url", { url: img.url ?? "", nameHint: "" });
+          rememberGenImage({ path, prompt: String(tc.args.prompt || ""), model: img.model, ts: Date.now() });
           pushHistory({ role: "tool", tool_call_id: tc.id, content: `已用 ${img.model} 生成图片并保存到桌面：${path}` });
           toast(`画好了（${img.model}），已存到桌面：${path}`, "info");
         }
@@ -2393,6 +2428,9 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           content: `生图失败：${msg}${/HTTP\s*(404|405)/.test(msg) ? "（这个端点没有生图接口，属于能力不支持；请如实告诉用户，并告诉他去配一个支持生图的供应商）" : ""}`,
         });
       }
+    }
+    if (tc.name === "copy_to_desktop") {
+      await invokeTool(tc, "copy_to_desktop", { path: String(tc.args.path || "") });
     }
     if (tc.name === "list_directory") {
       await invokeTool(tc, "list_directory", {

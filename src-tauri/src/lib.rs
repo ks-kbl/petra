@@ -3000,6 +3000,27 @@ async fn save_image_from_url(url: String, name_hint: String) -> Result<String, S
     write_desktop_image(&bytes, ext, &name_hint)
 }
 
+/// 把任意文件复制到桌面（"把那张图放到我桌面"这种请求）。
+#[tauri::command]
+fn copy_to_desktop(path: String) -> Result<String, String> {
+    let src = std::path::PathBuf::from(path.trim());
+    if !src.is_file() {
+        return Err(format!("找不到这个文件：{}", src.display()));
+    }
+    let bytes = std::fs::read(&src).map_err(|e| format!("读取文件失败：{e}"))?;
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png")
+        .to_string();
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Petra")
+        .to_string();
+    write_desktop_image(&bytes, &ext, &stem)
+}
+
 /// 把图片字节写到桌面（文件名 `提示-时间戳.ext`，重名自动加序号）
 fn write_desktop_image(bytes: &[u8], ext: &str, name_hint: &str) -> Result<String, String> {
     if bytes.is_empty() {
@@ -6031,7 +6052,7 @@ pub fn run() {
             tts_synthesize, set_tts_key, get_tts_key,
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
             register_voice_shortcut, unregister_voice_shortcut, save_desktop_image,
-            save_image_from_url,
+            save_image_from_url, copy_to_desktop,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
             capture_screen,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,
