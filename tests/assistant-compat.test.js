@@ -86,6 +86,27 @@ const json = (obj, status = 200) =>
       });
       check("url 形式的生图结果被转成 base64", img.base64 === "AQID", img.base64);
     }
+    // ---- 0e2) 中转站列出来的模型可能"没开通渠道"：要自动换下一个 ----
+    {
+      const calls = [];
+      global.fetch = async (url, init = {}) => {
+        if (String(url).includes("/images/generations")) {
+          const body = JSON.parse(String(init.body || "{}"));
+          calls.push(body.model);
+          if (body.model === "gpt-image-2.6-flare") {
+            return json({ error: { code: "model_not_found", message: "No available channel for model under group default" } }, 503);
+          }
+          return json({ data: [{ b64_json: "AQID" }] });
+        }
+        return new Response(new Uint8Array([1]), { status: 200 });
+      };
+      const img = await ac.generateImage({
+        provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1",
+        model: "gpt-image-2.6-flare", fallbackModels: ["gpt-image-2.6-flare", "gpt-image-2"], prompt: "鲸鱼",
+      });
+      check("没开通渠道时自动换下一个模型", img.model === "gpt-image-2" && calls.length === 2, JSON.stringify({ model: img.model, calls }));
+    }
+
     // ---- 0f) 没配生图模型时给中文提示 ----
     {
       let err = "";

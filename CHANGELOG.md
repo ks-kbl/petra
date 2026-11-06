@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+- 修「生图说没可用模型 / 画不出来」。
+  - 根因：中转站的 `/models` 会把**没开通渠道**的模型也列出来。实测该站列了 `gpt-image-2.6-flare`，一调就 `503 model_not_found: No available channel for model ... under group default`；自动识别又恰好挑中它，于是整次生成失败。
+  - 现在生图会**按候选列表逐个试**：先试用户/自动选中的，失败（`model_not_found`/`No available channel`/404/503）就换下一个，直到有一个成功；成功的那个会写回「生图模型」，下次直接用。
+  - 全失败时报错会列出"试过哪些模型"，不再是含糊的"没可用模型"。
+  - 顺带确认：该站 `gpt-image-2` 实测 200（约 25 秒），返回 `data[0].url`，代码会自动下载并转 base64 存桌面。
+
 - 新增**生图**与**对话附件**（用户："加生图功能，图片自动下载到桌面；再加一个添加文件/图片的按钮"）。
   - 生图工具 `generate_image`：走 OpenAI 兼容 `POST /images/generations`，同时兼容 `b64_json` 与 `url` 两种返回（url 会先下载再转 base64）。
   - **模型自动识别**：拉模型列表时顺手挑出像生图的（image/dall-e/flux/kolors/seedream/…），自动写进「生图模型」，用户不用手填；也保留输入框可覆盖。

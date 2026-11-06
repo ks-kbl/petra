@@ -2328,14 +2328,10 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       let model = (st.assistant.imageModel || "").trim();
       try {
         const key = await ensureApiKey();
-        if (!model) {
-          const found = await listImageModels(st.assistant.provider, key, st.assistant.customBaseUrl);
-          if (found.length) {
-            model = found[0];
-            st.assistant.imageModel = model;
-            saveSettings(st);
-          }
-        }
+        // 不管有没有填过，都拿一份站点里的生图模型清单当备选：
+        // 中转站的 /models 会把"没开通渠道"的模型也列出来，第一个调不通就换下一个。
+        const found = await listImageModels(st.assistant.provider, key, st.assistant.customBaseUrl);
+        if (!model && found.length) model = found[0];
         if (!model) {
           pushHistory({
             role: "tool",
@@ -2348,12 +2344,18 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
             apiKey: key,
             customBaseUrl: st.assistant.customBaseUrl,
             model,
+            fallbackModels: found,
             prompt: String(tc.args.prompt || ""),
             size: tc.args.size ? String(tc.args.size) : undefined,
           });
+          // 记住"真正画成功"的那个模型，下次直接用，不再挨个试
+          if (img.model && img.model !== st.assistant.imageModel) {
+            st.assistant.imageModel = img.model;
+            saveSettings(st);
+          }
           const path = await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 });
-          pushHistory({ role: "tool", tool_call_id: tc.id, content: `已生成图片并保存到桌面：${path}` });
-          toast(`画好了，已存到桌面：${path}`, "info");
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `已用 ${img.model} 生成图片并保存到桌面：${path}` });
+          toast(`画好了（${img.model}），已存到桌面：${path}`, "info");
         }
       } catch (e) {
         pushHistory({ role: "tool", tool_call_id: tc.id, content: `生图失败：${e instanceof Error ? e.message : String(e)}` });

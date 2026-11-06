@@ -1479,8 +1479,22 @@ export async function listImageModels(
 export interface GeneratedImage {
   /** PNG/JPEG 的 base64（不带 data: 前缀） */
   base64: string;
+  /** 实际画成功的是哪个模型（自动兜底后可能与请求的不一样） */
+  model: string;
   /** 服务端可能改写过的提示词 */
   revisedPrompt?: string;
+}
+
+/**
+ * 这个失败是不是"该换下一个模型试试"。
+ *
+ * 中转站的 `/models` 会列出**没开通渠道**的模型（实测某站列了 gpt-image-2.6-flare，
+ * 一调就 503 `model_not_found: No available channel for model ... under group default`）。
+ * 这类错误换个模型多半就好了，不能直接判死刑。
+ */
+function isModelUnavailable(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /model_not_found|No available channel|HTTP\s*(404|503)|not\s*found|无可用渠道|没有可用/i.test(msg);
 }
 
 /** 把 URL 形式的图片下载回来并转成 base64（有些中转站只回 url 不回 b64_json） */
@@ -1507,24 +1521,55 @@ export async function generateImage(opts: {
   apiKey: string;
   customBaseUrl: string;
   model: string;
+  /** 备选模型：第一个失败（没开通渠道之类）就换下一个试 */
+  fallbackModels?: string[];
   prompt: string;
   size?: string;
 }): Promise<GeneratedImage> {
   const base = resolveBase(opts.provider, opts.customBaseUrl);
-  const model = (opts.model || "").trim();
-  if (!model) throw new Error("还没有可用的生图模型：先在「小助手 → 获取模型列表」里拉一次，或手动填写生图模型名");
+  const candidates: string[] = [];
+  for (const m of [opts.model, ...(opts.fallbackModels ?? [])]) {
+    const name = (m || "").trim();
+    if (name && !candidates.includes(name)) candidates.push(name);
+  }
+  if (!candidates.length) throw new Error("还没有可用的生图模型：先在「小助手 → 获取模型列表」里拉一次，或手动填写生图模型名");
   const prompt = (opts.prompt || "").trim();
   if (!prompt) throw new Error("要画什么？给我一句画面描述");
 
+  let lastErr: unknown = null;
+  const tried: string[] = [];
+  for (const model of candidates) {
+    try {
+      const img = await requestImageOnce(base, opts.apiKey, model, prompt, opts.size);
+      return { ...img, model };
+    } catch (e) {
+      tried.push(model);
+      lastErr = e;
+      if (!isModelUnavailable(e)) throw e;
+    }
+  }
+  throw new Error(
+    `${lastErr instanceof Error ? lastErr.message : String(lastErr)}（试过的模型：${tried.join("、")}；这些模型可能都没开通渠道，换一个供应商或分组试试）`,
+  );
+}
+
+/** 真正发一次生图请求（单模型） */
+async function requestImageOnce(
+  base: string,
+  apiKey: string,
+  model: string,
+  prompt: string,
+  size?: string,
+): Promise<Omit<GeneratedImage, "model">> {
   const body: Record<string, unknown> = { model, prompt, n: 1, response_format: "b64_json" };
-  if (opts.size) body.size = opts.size;
+  if (size) body.size = size;
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 120000); // 生图慢，给 2 分钟
   try {
     const res = await fetch(`${base}/images/generations`, {
       method: "POST",
-      headers: chatHeaders(opts.apiKey, "application/json"),
+      headers: chatHeaders(apiKey, "application/json"),
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
