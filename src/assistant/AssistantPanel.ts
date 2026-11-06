@@ -901,7 +901,9 @@ function ensureInput() {
   });
   attach.addEventListener("click", () => filePicker.click());
 
-  row.append(attach, filePicker, input, mic, btn);
+  // 顺序：输入框 → 📎 → 🎤 → 发送。附件和语音都是"输入手段"，挨着放，
+  // 而且都在右侧拇指区，比塞在输入框左边顺手。
+  row.append(input, attach, filePicker, mic, btn);
 
   // 附件条：显示本轮已挂上的图片/文件，可单个移除
   attachBar = document.createElement("div");
