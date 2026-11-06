@@ -202,9 +202,51 @@ let pendingTextFiles: { name: string; text: string }[] = [];
 /** 输入框上方的附件条 */
 let attachBar: HTMLDivElement | null = null;
 
-const ATTACH_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
 const ATTACH_TEXT_MAX_BYTES = 100 * 1024;
-const ATTACH_IMAGE_LIMIT = 4;
+const ATTACH_IMAGE_LIMIT = 6;
+/**
+ * 超过这个体积（或边长太大）的图会**自动压缩**而不是拒收。
+ *
+ * 以前是"超过 4MB 直接提示太大"，用户第一反应就是"凭什么限制我"——
+ * 而且他只是想发张截图/照片。压到 ~2048px、JPEG 0.86 之后肉眼几乎无差，
+ * 请求体也不会撑爆中转站的上限。
+ */
+const IMAGE_COMPRESS_OVER_BYTES = 3 * 1024 * 1024;
+const IMAGE_MAX_SIDE = 2048;
+
+/** 读成 dataURL */
+function readAsDataUrl(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ""));
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+}
+
+/** 压到不超过 maxSide、再按 JPEG 0.86 重编码；失败就退回原图（绝不因为压缩失败而丢图） */
+async function shrinkImage(dataUrl: string): Promise<string> {
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("图片解码失败"));
+      el.src = dataUrl;
+    });
+    const scale = Math.min(1, IMAGE_MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.round(img.naturalWidth * scale);
+    const h = Math.round(img.naturalHeight * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return dataUrl;
+    ctx.drawImage(img, 0, 0, w, h);
+    return canvas.toDataURL("image/jpeg", 0.86);
+  } catch {
+    return dataUrl;
+  }
+}
 
 function renderAttachBar(bar: HTMLDivElement) {
   bar.innerHTML = "";
@@ -253,13 +295,15 @@ async function addFiles(files: FileList | File[]) {
     try {
       if (f.type.startsWith("image/")) {
         if (pendingImages.length >= ATTACH_IMAGE_LIMIT) { notes.push(`最多一次 ${ATTACH_IMAGE_LIMIT} 张图片`); break; }
-        if (f.size > ATTACH_IMAGE_MAX_BYTES) { notes.push(`${f.name} 太大（>4MB）`); continue; }
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-          const r = new FileReader();
-          r.onload = () => resolve(String(r.result || ""));
-          r.onerror = () => reject(r.error);
-          r.readAsDataURL(f);
-        });
+        let dataUrl = await readAsDataUrl(f);
+        // 不设"最大体积"：太大就自动压到 2048px / JPEG 0.86，而不是拒收
+        if (dataUrl && f.size > IMAGE_COMPRESS_OVER_BYTES) {
+          const small = await shrinkImage(dataUrl);
+          if (small !== dataUrl) {
+            dataUrl = small;
+            notes.push(`${f.name} 已自动压缩（原始 ${(f.size / 1048576).toFixed(1)}MB）`);
+          }
+        }
         if (dataUrl) pendingImages.push({ name: f.name, dataUrl });
       } else if (/^(text\/|application\/(json|xml|javascript|x-yaml|yaml))/.test(f.type) || /\.(txt|md|markdown|json|ya?ml|csv|log|ini|toml|ts|tsx|js|jsx|py|rs|go|java|c|h|cpp|css|html|xml|sql|sh|bat|ps1)$/i.test(f.name)) {
         if (f.size > ATTACH_TEXT_MAX_BYTES) { notes.push(`${f.name} 太大（>100KB），改用说路径让我读`); continue; }
@@ -934,6 +978,30 @@ function ensureInput() {
     filePicker.value = ""; // 同一个文件连选两次也要能触发
   });
   attach.addEventListener("click", () => filePicker.click());
+
+  // Ctrl+V 直接粘贴图片（截图后顺手粘进来是最常见的用法）
+  // 注意：只在剪贴板里真有图片时拦截，否则会破坏正常的文字粘贴
+  input.addEventListener("paste", (e) => {
+    const items = Array.from(e.clipboardData?.items ?? []);
+    const files = items
+      .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+      .map((it) => it.getAsFile())
+      .filter((f): f is File => !!f);
+    if (!files.length) return;
+    e.preventDefault();
+    void addFiles(files);
+  });
+
+  // 拖拽：把图片/文件直接拖到输入框上
+  const stop = (e: DragEvent) => { e.preventDefault(); e.stopPropagation(); };
+  inputBar.addEventListener("dragover", (e) => { stop(e); inputBar!.classList.add("as-drop"); });
+  inputBar.addEventListener("dragleave", () => inputBar!.classList.remove("as-drop"));
+  inputBar.addEventListener("drop", (e) => {
+    stop(e);
+    inputBar!.classList.remove("as-drop");
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    if (files.length) void addFiles(files);
+  });
 
   // 顺序：输入框 → 📎 → 🎤 → 发送。附件和语音都是"输入手段"，挨着放，
   // 而且都在右侧拇指区，比塞在输入框左边顺手。

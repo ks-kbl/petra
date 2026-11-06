@@ -458,6 +458,13 @@ body {
 }
 .as-attach:active { transform: scale(0.93); }
 
+/* 拖拽文件到输入框上时的提示态 */
+.as-inputbar.as-drop {
+  outline: 2px dashed rgba(150, 95, 200, 0.65);
+  outline-offset: -3px;
+  background: rgba(170, 120, 210, 0.08);
+}
+
 /* 附件条：挂在输入框上方，显示本轮已选中的图片/文件 */
 .as-attach-bar {
   display: flex;
