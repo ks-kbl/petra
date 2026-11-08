@@ -1448,6 +1448,122 @@ fn load_chat_history(app: AppHandle) -> Result<String, String> {
     serde_json::to_string(&all).map_err(|e| e.to_string())
 }
 
+/// 把字符串切成"去掉空白/标点后的字符二元组"，用于中文模糊搜索。
+fn search_bigrams(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().filter(|c| c.is_alphanumeric()).collect();
+    chars.windows(2).map(|w| w.iter().collect::<String>()).collect()
+}
+
+/// 搜索完整聊天历史（跨所有按天分片）。
+///
+/// 模型只拿到最近窗口 + 摘要，旧对话需要能主动检索。这里按关键词/中文二元组
+/// 匹配，并返回命中消息前后各一条做上下文；结果由前端当 tool 消息喂给模型。
+#[tauri::command]
+fn search_chat_history(
+    app: AppHandle,
+    query: String,
+    days: Option<u32>,
+    limit: Option<u32>,
+) -> Result<String, String> {
+    use chrono::TimeZone;
+    let all = read_chat_history_all(&app)?;
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Ok("检索词为空。".to_string());
+    }
+    let max = limit.unwrap_or(5).clamp(1, 10) as usize;
+    let now_ms = chrono::Local::now().timestamp_millis();
+    let cutoff = days.unwrap_or(30) as i64 * 24 * 60 * 60 * 1000;
+    let terms: Vec<String> = q.split_whitespace().map(|x| x.to_string()).collect();
+    let query_bigrams = search_bigrams(&q);
+
+    let mut hits: Vec<(i32, usize)> = Vec::new();
+    for (i, m) in all.iter().enumerate() {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let ts = m.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+        if cutoff > 0 && ts > 0 && now_ms - ts > cutoff {
+            continue;
+        }
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+        if content.trim().is_empty() {
+            continue;
+        }
+        let cleaned = content
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>();
+        let mut score = 0i32;
+        if cleaned.contains(&q) {
+            score += 60;
+        }
+        for term in &terms {
+            let t = term.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+            if !t.is_empty() && cleaned.contains(&t) {
+                score += 12;
+            }
+        }
+        for bg in &query_bigrams {
+            if cleaned.contains(bg) {
+                score += 3;
+            }
+        }
+        if score <= 0 {
+            continue;
+        }
+        if role == "user" {
+            score += 2;
+        }
+        hits.push((score, i));
+    }
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| {
+        let ta = all[a.1].get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+        let tb = all[b.1].get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+        tb.cmp(&ta)
+    }));
+    hits.truncate(max);
+    if hits.is_empty() {
+        return Ok(format!("没有找到和「{}」相关的旧对话。", query.trim()));
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("找到 {} 条和「{}」相关的旧对话：\n", hits.len(), query.trim()));
+    for (n, (_score, idx)) in hits.iter().enumerate() {
+        // 命中消息前后各带一条普通对话，避免模型只看到半句话
+        let start = idx.saturating_sub(1);
+        let end = (*idx + 2).min(all.len());
+        out.push_str(&format!("\n{}. ", n + 1));
+        let mut first = true;
+        for j in start..end {
+            let m = &all[j];
+            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role != "user" && role != "assistant" {
+                continue;
+            }
+            let ts = m.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+            let time = if ts > 0 {
+                chrono::Local
+                    .timestamp_millis_opt(ts)
+                    .single()
+                    .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "较早".to_string())
+            } else {
+                "较早".to_string()
+            };
+            let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let text: String = content.chars().take(500).collect();
+            if first {
+                out.push_str(&format!("[{}]\n", time));
+                first = false;
+            }
+            out.push_str(&format!("{}：{}\n", if role == "user" { "用户" } else { "助理" }, text));
+        }
+    }
+    Ok(out)
+}
+
 /// 读取内置模型 manifest.json（多路径尝试，适配便携版和安装版）
 #[tauri::command]
 fn read_model_manifest(app: AppHandle) -> Result<String, String> {
@@ -6058,7 +6174,92 @@ fn allow_media_permission(window: &tauri::WebviewWindow) {
     }
 }
 
+/// 固定的单实例互斥名：不随 app identifier / 版本号变化。
+///
+/// `tauri-plugin-single-instance` 的互斥名由 bundle identifier 生成；旧版本用的是
+/// 另一个 identifier（com.live2d.pet / com.wumiu.petra），于是 dev 版和安装版能同时跑。
+/// 用户明确要求"只允许一个运行"，这里再加一道跨 identifier 的固定互斥锁。
+#[cfg(windows)]
+fn acquire_single_instance_guard() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::{
+        CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_SHOW,
+    };
+
+    let focus_existing_petra = || {
+        let title: Vec<u16> = "Petra\0".encode_utf16().collect();
+        let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }) else {
+            return false;
+        };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid == 0 || pid == std::process::id() {
+            return false;
+        }
+        // 标题叫 Petra 的可能是浏览器等别的软件；只认进程名 petra.exe
+        let mut exe = String::new();
+        unsafe {
+            if let Ok(proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                let mut buf = [0u16; 1024];
+                let mut size = buf.len() as u32;
+                if QueryFullProcessImageNameW(
+                    proc,
+                    PROCESS_NAME_WIN32,
+                    windows::core::PWSTR(buf.as_mut_ptr()),
+                    &mut size,
+                )
+                .is_ok()
+                {
+                    let path = String::from_utf16_lossy(&buf[..size as usize]);
+                    exe = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                        .unwrap_or_default();
+                }
+                let _ = CloseHandle(proc);
+            }
+        }
+        if exe != "petra.exe" {
+            return false;
+        }
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        true
+    };
+
+    let name: Vec<u16> = "Petra.SingleInstance.Guard\0".encode_utf16().collect();
+    let name_ptr = PCWSTR(name.as_ptr());
+    // 句柄故意泄漏：必须持有到进程结束，第二个实例才会看到 ERROR_ALREADY_EXISTS
+    let handle = unsafe { CreateMutexW(None, true, name_ptr) };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let _ = focus_existing_petra();
+        return false;
+    }
+    // 旧版本没有这个固定互斥锁（identifier 也不同）：再按进程名/窗口标题兜底，
+    // 保证"下载版旧 Petra 正在跑时，新的 dev 版也不能再开一个"。
+    if focus_existing_petra() {
+        return false;
+    }
+    std::mem::forget(handle);
+    true
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance_guard() -> bool {
+    true
+}
+
 pub fn run() {
+    if !acquire_single_instance_guard() {
+        return;
+    }
     let builder = tauri::Builder::default();
     // updater 插件在 dev / release 都注册，使 tauri dev 下也能真实测试 check() 网络链路。
     // 开发版禁止实际安装由前端 import.meta.env.DEV 保护（见 UpdateManager.performUpdate）。
@@ -6128,7 +6329,7 @@ pub fn run() {
             set_volume, send_notification, get_weather, fetch_lyrics,
             websearch::web_search,
             list_installed_apps, open_path, lock_screen,
-            save_chat_history, load_chat_history,
+            save_chat_history, load_chat_history, search_chat_history,
             schedule_shutdown, cancel_shutdown,
             register_assistant_shortcut, unregister_assistant_shortcut, capture_hotkey,
             tts_synthesize, set_tts_key, get_tts_key,

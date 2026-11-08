@@ -152,6 +152,51 @@ export function parseSummaryResponse(
   };
 }
 
+/**
+ * 把「悬而未决」里已经完成的事项移除。
+ *
+ * 提醒到点、用户确认完成、或工具明确回报任务结束后调用。
+ * 用去空白子串匹配，兼容摘要写成「计时两分钟」「两分钟计时」这类措辞差异。
+ */
+export function completeOpenLoops(
+  summary: ChatSummary | null | undefined,
+  completed: string[],
+  dropTaskLikeFallback = false,
+): ChatSummary {
+  const base = summary ?? emptyChatSummary();
+  const targets = (completed || [])
+    .map((x) => String(x || "").replace(/\s+/g, "").toLowerCase())
+    .filter((x) => x.length >= 2);
+  if (!base.openLoops?.length) return base;
+  const matched = (text: string) => targets.some((t) => {
+    if (text === t || text.includes(t) || t.includes(text)) return true;
+    // 中文常见：摘要写「计时两分钟」，提醒事件写「两分钟到了」——按共同二元组判断
+    const a = new Set(Array.from({ length: Math.max(0, text.length - 1) }, (_, i) => text.slice(i, i + 2)));
+    const b = new Set(Array.from({ length: Math.max(0, t.length - 1) }, (_, i) => t.slice(i, i + 2)));
+    let overlap = 0;
+    for (const bg of a) if (b.has(bg)) overlap++;
+    return overlap >= 2 || (a.size > 0 && overlap / a.size >= 0.5);
+  });
+  let kept = base.openLoops.filter((loop) => {
+    const text = String(loop || "").replace(/\s+/g, "").toLowerCase();
+    if (!text) return false;
+    return !matched(text);
+  });
+  // 提醒消息常常是「时间到了」这种泛化文案，和摘要里的「计时两分钟」对不上；
+  // 这种情况下至少移除最近一条短时任务，避免到点后还留着。
+  if (dropTaskLikeFallback && kept.length === base.openLoops.length) {
+    const taskRe = /(计时|倒计时|定时|提醒|闹钟|分钟后|小时后|秒后|待办)/;
+    for (let i = kept.length - 1; i >= 0; i--) {
+      if (taskRe.test(kept[i])) {
+        kept = [...kept.slice(0, i), ...kept.slice(i + 1)];
+        break;
+      }
+    }
+  }
+  if (kept.length === base.openLoops.length) return base;
+  return { ...base, openLoops: kept.slice(0, 6), updatedAt: Date.now() };
+}
+
 /** 注入 system prompt 的文本块（无内容时返回空串） */
 export function summaryBlock(summary: ChatSummary | null | undefined): string {
   const text = summary?.text?.trim();
