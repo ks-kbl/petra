@@ -296,7 +296,13 @@ function renderAttachBar(bar: HTMLDivElement) {
     } else {
       chip.appendChild(document.createTextNode("📄 "));
     }
-    chip.appendChild(document.createTextNode(it.label));
+    // 文件名要能省略号截断，但**叉号必须始终可见**：
+    // 以前名字直接塞进 chip，长文件名把 chip 撑满、overflow:hidden 又把叉号裁掉了，
+    // 用户看着就是"加进来以后没法删"。
+    const nameEl = document.createElement("span");
+    nameEl.className = "as-attach-name";
+    nameEl.textContent = it.label;
+    chip.appendChild(nameEl);
     const x = document.createElement("button");
     x.type = "button";
     x.textContent = "×";
