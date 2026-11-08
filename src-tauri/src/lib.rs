@@ -3031,6 +3031,23 @@ async fn http_post_json(
     Ok(serde_json::json!({ "status": status, "body": text }))
 }
 
+/// 把文本文件读成纯字符串（拖拽文件到对话框时用；超过 200KB 截断）。
+#[tauri::command]
+fn read_file_text_plain(path: String) -> Result<String, String> {
+    let p = std::path::PathBuf::from(path.trim());
+    if !p.is_file() {
+        return Err(format!("找不到这个文件：{}", p.display()));
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("读取失败：{e}"))?;
+    let cap = 200 * 1024;
+    let slice = if bytes.len() > cap { &bytes[..cap] } else { &bytes[..] };
+    let mut text = String::from_utf8_lossy(slice).to_string();
+    if bytes.len() > cap {
+        text.push_str("\n…（文件较大，只读了前 200KB）");
+    }
+    Ok(text)
+}
+
 /// 读一张图片，返回可直接放进 `<img src>` 的 dataURL（聊天气泡里显示缩略图用）。
 ///
 /// 为什么不直接用 file:// 或 asset://：WebView 里 file 协议默认被拦，asset 协议要额外配置
@@ -6118,6 +6135,7 @@ pub fn run() {
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
             register_voice_shortcut, unregister_voice_shortcut, save_desktop_image,
             save_image_from_url, copy_to_desktop, read_image_data_url, http_post_json,
+            read_file_text_plain,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
             capture_screen,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,

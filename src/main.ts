@@ -1731,7 +1731,33 @@ async function boot() {
   if (settings.musicLyrics) startMusicLyrics();
 
   // ---------- 交互 ----------
-  setupTrashDrop(() => view, win, (path) => void importPsdFromPath(path));
+  setupTrashDrop(
+    () => view,
+    win,
+    (path) => void importPsdFromPath(path),
+    // 拖进输入框 → 当附件（图片/文本），发给桌宠
+    (paths) => {
+      void (async () => {
+        const { openAssistant, attachFilesFromPaths } = await import("./assistant/AssistantPanel");
+        await openAssistant();
+        await attachFilesFromPaths(paths);
+      })();
+    },
+    // 落点判定（CSS 像素）：输入框整条都算，角色本体用**不带 padding 的视觉边界**
+    (x, y) => {
+      const el = document.getElementById("as-inputbar");
+      if (!el || el.classList.contains("hidden")) return false;
+      const r = el.getBoundingClientRect();
+      return x >= r.left - 6 && x <= r.right + 6 && y >= r.top - 6 && y <= r.bottom + 6;
+    },
+    (x, y) => {
+      // 用角色实际渲染边界（getModelRect），故意不加点击区那圈 padding：
+      // 以前整窗口都算"丢给桌宠"，文件还没碰到角色就被送进回收站了。
+      const r = getModelRect();
+      const pad = 6; // 只给一点点容错，避免"明明碰到了却不算"
+      return x >= r.left - pad && x <= r.right + pad && y >= r.top - pad && y <= r.bottom + pad;
+    },
+  );
   setupReminder();
 
   setupContextMenu(
