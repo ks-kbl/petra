@@ -410,6 +410,7 @@ async function applyModelScale(s: number, record = false) {
   if (record) {
     const key = currentModel.name ?? "";
     if (key) settings.modelScales[key] = clamped;
+    saveModelProfile();
   }
   saveSettings(settings);
   const modelW = Math.round(300 * clamped); // 模型视觉大小以 300 为基准
@@ -859,6 +860,7 @@ function currentBoundsCorner(): number {
 /** 写入当前模型的点击区域圆角，并立刻重算交互区域（不然要等下一帧才生效） */
 function setCurrentBoundsCorner(radius: number) {
   settings.boundsCorners[paddingKey()] = Math.max(0, Math.min(400, Math.round(radius) || 0));
+  saveModelProfile();
   saveSettings(settings);
   requestInteractionRegionSync(true);
   updateModelBoundsCornerStyle();
@@ -871,9 +873,44 @@ function updateModelBoundsCornerStyle() {
   } catch { /* 元素还没建：下次显示时会设置 */ }
 }
 
+/**
+ * 把"当前模型的调节"整体存一份快照。
+ *
+ * 大小、边界、圆角原来是三个各自独立的 map，写入路径多、容易漏记一项；
+ * 统一在这里存一份完整快照，切换模型时整体恢复。
+ */
+function saveModelProfile() {
+  const key = paddingKey();
+  if (!key) return;
+  settings.modelProfiles = settings.modelProfiles || {};
+  settings.modelProfiles[key] = {
+    scale: settings.modelScales[key] ?? settings.modelScale,
+    padding: { ...currentBoundsPadding() },
+    corner: currentBoundsCorner(),
+  };
+}
+
+/** 切换模型后，把该模型自己的调节整体恢复上去（没有记录就用默认） */
+function applyModelProfile() {
+  const key = paddingKey();
+  const profile = settings.modelProfiles?.[key];
+  // 兼容老数据：三处零散记录里有的，优先用快照，没有再退回各自的表
+  const scale = profile?.scale ?? settings.modelScales[key] ?? 1;
+  const padding = profile?.padding ?? settings.boundsPaddings[key] ?? { ...ZERO_PADDING };
+  const corner = profile?.corner ?? settings.boundsCorners?.[key] ?? 0;
+  void applyModelScale(scale, false);
+  settings.boundsPaddings[key] = { ...padding };
+  settings.boundsCorners[key] = corner;
+  saveSettings(settings);
+  (view as any)?.setBoundsPadding?.(padding);
+  requestInteractionRegionSync(true);
+  updateModelBoundsCornerStyle();
+}
+
 /** 写入当前模型的边界松紧并立刻应用到渲染层 */
 function setCurrentBoundsPadding(p: { left: number; right: number; top: number; bottom: number }) {
   settings.boundsPaddings[paddingKey()] = p;
+  saveModelProfile();
   saveSettings(settings);
   (view as any)?.setBoundsPadding?.(p);
 }
@@ -1068,10 +1105,9 @@ function reloadView(): Promise<void> {
 async function doReloadView() {
   view.unmount();
   await mountView();
-  // 切换模型：恢复该模型自己的大小（无记录用默认 100%）
-  const key = currentModel.name ?? "";
-  const scale = settings.modelScales[key] ?? 1;
-  void applyModelScale(scale, false);
+  // 切换模型：把该模型自己的调节（大小 / 边界 / 圆角）整体恢复，
+  // 换回来就还是当初调好的样子，不用再拖一遍滑条。
+  applyModelProfile();
 }
 
 // WebGL 上下文丢失（驱动重置 / 休眠唤醒 / 远程桌面）时模型会整块消失但 UI 还在，
@@ -3717,7 +3753,8 @@ async function applyPanelPatch(patch: Record<string, unknown>): Promise<void> {
   saveSettingsRaw(settings); // 只落盘；末尾统一回推一次，别在这里触发防抖循环
   // 面板改了「输入框空闲收起」→ 落盘之后按新值重新计时（必须在 save 之后，否则读到旧值）
   if (assistantPatch && "inputIdleHideSec" in assistantPatch) rearmIdleTimer();
-  if (changed.has("modelScale")) await applyModelScale(settings.modelScale);
+  // record=true：控制面板拖大小也要按模型记下来，否则切走再切回就被重置成 100%
+  if (changed.has("modelScale")) await applyModelScale(settings.modelScale, true);
   if (changed.has("activity")) engine?.setActivityLevel(settings.activity);
   if (changed.has("mouseTrack")) {
     engine?.setTracking(settings.mouseTrack);
@@ -4558,6 +4595,12 @@ function toggleModelAdjustPanel() {
     title.className = "mp-title";
     title.textContent = "🎨 模型调节（测试）";
     p.appendChild(title);
+
+    // 说清楚"这些是按模型存的"，用户才敢放心调、也知道换模型不会串
+    const persistHint = document.createElement("div");
+    persistHint.className = "mp-hint";
+    persistHint.textContent = "以下调节都按模型分别保存：换到别的模型再换回来，会自动恢复到这里的状态。";
+    p.appendChild(persistHint);
 
     // 自动行为开关
     const autoTitle = document.createElement("div");

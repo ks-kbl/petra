@@ -153,6 +153,14 @@ export interface Settings {
   boundsPaddings: Record<string, BoundsPadding>;
   /** 点击区域圆角（按模型存，px）；0 = 直角，和绿框一样按模型独立 */
   boundsCorners: Record<string, number>;
+  /**
+   * 按模型保存的**一整套**调节（大小 + 边界 + 圆角）。
+   *
+   * 零散存了三处（modelScales / boundsPaddings / boundsCorners），切换模型时容易只恢复
+   * 其中一项、或者某个写入路径忘了记录；这里存一份完整快照，切模型时整体套用，
+   * 换回来就还是原来调好的样子，不用再拖一遍滑条。
+   */
+  modelProfiles: Record<string, { scale?: number; padding?: BoundsPadding; corner?: number }>;
   /** 旧/兜底圆角（按模型查不到时用它） */
   boundsCorner: number;
   /** 旧版的全局边界松紧：只用于首次迁移，新代码请用 boundsPaddings */
@@ -247,6 +255,7 @@ const DEFAULTS: Settings = {
   weatherBubble: true,
   boundsPaddings: {},
   boundsCorners: {},
+  modelProfiles: {},
   boundsCorner: 0,
   boundsPadding: { left: 0, right: 0, top: 0, bottom: 0 },
   passthrough: false,
