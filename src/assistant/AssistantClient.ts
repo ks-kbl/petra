@@ -7,6 +7,7 @@ import changelogRaw from "../../CHANGELOG.md?raw";
 // @ts-ignore
 import pkg from "../../package.json";
 import { normalizeOpenAIBase } from "./apiKey";
+import { invoke } from "@tauri-apps/api/core";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -931,6 +932,73 @@ export async function probeChatConnection(
   }
 }
 
+/**
+ * 网页端 fetch 彻底失败时的兜底：改用 Rust 发同一份请求（非流式）。
+ *
+ * 触发场景实测过：WebView 里报 `Failed to fetch`，而同一时刻 Rust 的天气/歌词请求
+ * 一切正常。这时把请求体改 `stream:false` 交给 Rust，能拿回完整回复，
+ * 前端一次性 push 出文字（虽然丢了逐字效果，但比"网络不可用"强得多）。
+ */
+async function chatViaRust(opts: {
+  url: string;
+  apiKey: string;
+  body: string;
+  onDelta: (t: string) => void;
+  requestOptions: ChatRequestOptions;
+}): Promise<{ text: string; toolCalls: ToolCall[]; usage: ChatUsage } | null> {
+  let parsed: { stream?: boolean; model?: string } = {};
+  try {
+    parsed = JSON.parse(opts.body);
+  } catch {
+    return null;
+  }
+  const body = JSON.stringify({ ...parsed, stream: false });
+  const res = await invoke<{ status: number; body: string }>("http_post_json", {
+    url: opts.url,
+    headers: [
+      ["Content-Type", "application/json"],
+      ["Accept", "application/json"],
+      ...(opts.apiKey.trim() ? [["Authorization", `Bearer ${opts.apiKey.trim()}`]] : []),
+    ],
+    body,
+    timeoutSecs: 180,
+  });
+  if (!res || res.status < 200 || res.status >= 300) {
+    throw new Error(`Rust 兜底也被拒：HTTP ${res?.status ?? 0} ${(res?.body ?? "").slice(0, 200)}`);
+  }
+  let json: Record<string, unknown>;
+  try {
+    json = JSON.parse(res.body) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Rust 兜底返回的不是 JSON：${res.body.slice(0, 120)}`);
+  }
+  const choices = (json as { choices?: unknown }).choices;
+  const first = Array.isArray(choices) ? (choices[0] as Record<string, unknown>) : undefined;
+  const msg = (first?.message ?? {}) as Record<string, unknown>;
+  const rawContent = msg.content;
+  const text = typeof rawContent === "string"
+    ? rawContent
+    : Array.isArray(rawContent)
+      ? rawContent.map((p) => (p as { text?: string }).text ?? "").join("")
+      : "";
+  if (text) opts.onDelta(text);
+  const rawCalls = Array.isArray(msg.tool_calls) ? (msg.tool_calls as Record<string, unknown>[]) : [];
+  const toolCalls: ToolCall[] = rawCalls
+    .map((c) => {
+      const fn = (c.function ?? {}) as { name?: string; arguments?: string };
+      const safe = parseArgsSafe(fn.arguments ?? "{}");
+      return {
+        id: String(c.id ?? `rust_${Math.random().toString(36).slice(2)}`),
+        name: String(fn.name ?? ""),
+        args: safe.args,
+        argsError: safe.error,
+      };
+    })
+    .filter((c) => c.name);
+  const usage: ChatUsage = { input: 0, output: 0, cached: 0, source: "estimated" };
+  return { text, toolCalls, usage };
+}
+
 /** OpenAI 兼容流式 chat；返回完整文本 + 工具调用。enableTools=false 时不带 tools（纯文本生成，如日记/抽卡文案） */
 export async function chatStream(
   provider: AssistantProvider,
@@ -996,6 +1064,10 @@ export async function chatStream(
   let errText = "";
   let lastStatus = 0;
   const netErrors: string[] = [];
+  /** 已经试过一次 Rust 兜底了吗（只试一次，避免死循环） */
+  let triedRust = false;
+  /** 网络层失败后是否已经退回过非流式 */
+  let triedNonStream = false;
   for (let compat = 0; compat < 3; compat++) {
     const requestBody = bodyFor(useTools, useStream);
     let attemptRes: Response | null = null;
@@ -1016,7 +1088,34 @@ export async function chatStream(
           await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
           continue;
         }
-        throw new Error(`网络错误：${netErrors[netErrors.length - 1] || "请求失败"}（已重试 ${netErrors.length} 次）`);
+        // 有些中转站的流式连接会被中间设备掐断（表现就是 Failed to fetch）：
+        // 先退回非流式在**网页端**再试一次，通了就继续走正常解析路径。
+        if (useStream && !triedNonStream) {
+          triedNonStream = true;
+          useStream = false;
+          continue;
+        }
+        // 网页端彻底连不上：换 Rust 再发一次（同一份请求体）
+        if (!triedRust) {
+          triedRust = true;
+          try {
+            const viaRust = await chatViaRust({
+              url: `${base}/chat/completions`,
+              apiKey,
+              body: bodyFor(useTools, false),
+              onDelta,
+              requestOptions,
+            });
+            if (viaRust) return viaRust;
+          } catch (rustErr) {
+            netErrors.push(`Rust 兜底也失败：${rustErr instanceof Error ? rustErr.message : String(rustErr)}`);
+          }
+        }
+        throw new Error(
+          `网络错误：${netErrors[netErrors.length - 1] || "请求失败"}`
+          + `（网页端重试 ${netErrors.length} 次仍失败，Rust 兜底也不通；`
+          + `请检查网络/代理，或确认该端点允许被跨域访问：${base}）`,
+        );
       }
       if (attemptRes.ok && attemptRes.body) break;
       lastStatus = attemptRes.status;

@@ -296,7 +296,13 @@ function renderAttachBar(bar: HTMLDivElement) {
     } else {
       chip.appendChild(document.createTextNode("📄 "));
     }
-    chip.appendChild(document.createTextNode(it.label));
+    // 文件名要能省略号截断，但**叉号必须始终可见**：
+    // 以前名字直接塞进 chip，长文件名把 chip 撑满、overflow:hidden 又把叉号裁掉了，
+    // 用户看着就是"加进来以后没法删"。
+    const nameEl = document.createElement("span");
+    nameEl.className = "as-attach-name";
+    nameEl.textContent = it.label;
+    chip.appendChild(nameEl);
     const x = document.createElement("button");
     x.type = "button";
     x.textContent = "×";
@@ -310,6 +316,36 @@ function renderAttachBar(bar: HTMLDivElement) {
     chip.appendChild(x);
     bar.appendChild(chip);
   }
+}
+
+/**
+ * 按文件路径添加附件（原生拖拽只能拿到路径，拿不到 File 对象）。
+ * 图片走 Rust 读成 dataURL，文本走 Rust 读成字符串。
+ */
+export async function attachFilesFromPaths(paths: string[]): Promise<void> {
+  const notes: string[] = [];
+  for (const path of paths) {
+    const name = path.split(/[\\/]/).pop() || path;
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    try {
+      if (["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(ext)) {
+        if (pendingImages.length >= ATTACH_IMAGE_LIMIT) { notes.push(`最多一次 ${ATTACH_IMAGE_LIMIT} 张图片`); break; }
+        const dataUrl = await invoke<string>("read_image_data_url", { path });
+        pendingImages.push({ name, dataUrl });
+      } else if (["txt", "md", "json", "csv", "log", "yml", "yaml", "ini", "toml", "ts", "tsx", "js", "jsx", "py", "rs", "go", "java", "c", "h", "cpp", "css", "html", "xml", "sql", "sh", "bat", "ps1"].includes(ext)) {
+        const text = await invoke<string>("read_file_text_plain", { path });
+        pendingTextFiles.push({ name, text });
+      } else {
+        notes.push(`${name} 不是图片或文本，拖进对话框只能发这两类`);
+      }
+    } catch (e) {
+      notes.push(`${name} 读取失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (attachBar) renderAttachBar(attachBar);
+  resetTimer();
+  if (notes.length) toast(notes.slice(0, 2).join("；"), "warn");
+  else if (pendingImages.length || pendingTextFiles.length) toast("已加到输入框，可以说点什么一起发", "info");
 }
 
 function clearAttachments() {

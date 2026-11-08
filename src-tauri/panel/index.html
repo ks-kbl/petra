@@ -217,6 +217,18 @@ html[data-theme="dark"] .navbar{
   padding:6px 10px; border-radius:8px; background:var(--brand-soft);
   border:1px dashed var(--line-strong); user-select:none;
 }
+.modal-mask{
+  position:fixed; inset:0; z-index:9999; display:flex; align-items:center; justify-content:center;
+  background:rgba(40,20,60,.42); backdrop-filter:blur(2px);
+}
+.modal-box{
+  min-width:280px; max-width:420px; padding:20px 22px 16px; border-radius:16px;
+  background:var(--card, #fff); box-shadow:0 18px 48px rgba(60,30,90,.35);
+  display:flex; flex-direction:column; gap:10px; align-items:stretch;
+}
+.modal-title{font-size:15px; font-weight:600; color:var(--txt)}
+.modal-line{font-size:13px; line-height:1.7; color:var(--txt2)}
+.modal-box .btn{align-self:flex-end; margin-top:4px}
 .gen-wall{display:grid; grid-template-columns:repeat(auto-fill,minmax(110px,1fr)); gap:10px}
 .gen-cell{
   display:flex; flex-direction:column; gap:4px; padding:6px; border-radius:12px; cursor:pointer;
@@ -1817,16 +1829,40 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     ta.placeholder = "遇到什么问题或想要什么功能…";
     card.appendChild(ta);
     const b = el("button", "btn btn-primary btn-sm", "发送反馈");
-    b.onclick = () => {
+    b.onclick = async () => {
       const text = ta.value.trim();
       if (!text) { toast("先写点什么", "err"); return; }
-      runAction("__data:feedback-send", { text });
+      await runAction("__data:feedback-send", { text });
       ta.value = "";
+      showFeedbackThanks();
     };
     const wrap = el("div", "btn-row");
     wrap.appendChild(b);
     card.appendChild(wrap);
     return card;
+  }
+
+  /** 通用小弹窗：文案 + 一个「确定」按钮（点遮罩也能关） */
+  function showModal(title, lines, okText = "确定") {
+    const mask = el("div", "modal-mask");
+    const box = el("div", "modal-box");
+    box.appendChild(el("div", "modal-title", title));
+    lines.forEach((t) => box.appendChild(el("div", "modal-line", t)));
+    const ok = el("button", "btn btn-primary btn-sm", okText);
+    ok.onclick = () => { mask.remove(); };
+    box.appendChild(ok);
+    mask.appendChild(box);
+    mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
+    document.body.appendChild(mask);
+  }
+
+  /** 反馈发出去之后的致谢 + 加群提示 */
+  function showFeedbackThanks() {
+    showModal("反馈已发送", [
+      "感谢反馈！",
+      "务必加群查看进度，群里会同步修复和更新情况。",
+      "QQ 群：908632095",
+    ]);
   }
 
   /** 关于卡：版本 / 官网 / 检查更新 */

@@ -459,6 +459,7 @@ body {
 .as-attach:active { transform: scale(0.93); }
 
 /* 拖拽文件到输入框上时的提示态 */
+/* 输入条被拖拽悬停时的提示态（拖文件进来会变成附件） */
 .as-inputbar.as-drop {
   outline: 2px dashed rgba(150, 95, 200, 0.65);
   outline-offset: -3px;
@@ -475,9 +476,9 @@ body {
 .as-attach-chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  max-width: 190px;
-  padding: 3px 6px 3px 8px;
+  gap: 6px;
+  max-width: 230px;
+  padding: 3px 4px 3px 8px;
   border-radius: 999px;
   font-size: 11.5px;
   color: #5b3a72;
@@ -485,10 +486,17 @@ body {
   border: 1px solid rgba(140, 90, 160, 0.25);
   white-space: nowrap;
   overflow: hidden;
+}
+/* 名字可省略，叉号永远留得住 */
+.as-attach-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .as-attach-chip button {
-  flex: 0 0 auto;
+  flex: 0 0 auto;   /* 不许被长文件名挤掉 */
   width: 15px;
   height: 15px;
   padding: 0;

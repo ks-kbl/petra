@@ -3000,6 +3000,54 @@ async fn save_image_from_url(url: String, name_hint: String) -> Result<String, S
     write_desktop_image(&bytes, ext, &name_hint)
 }
 
+/// 由 Rust 代替 WebView 发一次 JSON POST（聊天请求的兜底通道）。
+///
+/// 为什么要它：WebView 里的 `fetch` 偶尔会直接报 `Failed to fetch` —— 同一时刻
+/// Rust 侧的 reqwest 却能正常访问（天气、歌词都是 Rust 发的）。原因五花八门：
+/// 中转站的 CORS/证书链、Chromium 的 TLS 策略、连接被中间设备掐断…… 与其逐个排查，
+/// 不如在网页端彻底失败时用 Rust 再发一次——**同一份请求体、同一个 Key**，能通就行。
+///
+/// 返回 `{ status, body }`；HTTP 非 2xx 也算成功返回（交给前端按状态码解释）。
+#[tauri::command]
+async fn http_post_json(
+    url: String,
+    headers: Vec<Vec<String>>,
+    body: String,
+    timeout_secs: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs.unwrap_or(120)))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+    let mut req = client.post(url.trim()).body(body);
+    for pair in headers {
+        if pair.len() == 2 {
+            req = req.header(pair[0].as_str(), pair[1].as_str());
+        }
+    }
+    let resp = req.send().await.map_err(|e| format!("Rust 侧请求失败：{e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.map_err(|e| format!("读取响应失败：{e}"))?;
+    Ok(serde_json::json!({ "status": status, "body": text }))
+}
+
+/// 把文本文件读成纯字符串（拖拽文件到对话框时用；超过 200KB 截断）。
+#[tauri::command]
+fn read_file_text_plain(path: String) -> Result<String, String> {
+    let p = std::path::PathBuf::from(path.trim());
+    if !p.is_file() {
+        return Err(format!("找不到这个文件：{}", p.display()));
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("读取失败：{e}"))?;
+    let cap = 200 * 1024;
+    let slice = if bytes.len() > cap { &bytes[..cap] } else { &bytes[..] };
+    let mut text = String::from_utf8_lossy(slice).to_string();
+    if bytes.len() > cap {
+        text.push_str("\n…（文件较大，只读了前 200KB）");
+    }
+    Ok(text)
+}
+
 /// 读一张图片，返回可直接放进 `<img src>` 的 dataURL（聊天气泡里显示缩略图用）。
 ///
 /// 为什么不直接用 file:// 或 asset://：WebView 里 file 协议默认被拦，asset 协议要额外配置
@@ -6086,7 +6134,8 @@ pub fn run() {
             tts_synthesize, set_tts_key, get_tts_key,
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
             register_voice_shortcut, unregister_voice_shortcut, save_desktop_image,
-            save_image_from_url, copy_to_desktop, read_image_data_url,
+            save_image_from_url, copy_to_desktop, read_image_data_url, http_post_json,
+            read_file_text_plain,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
             capture_screen,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,
