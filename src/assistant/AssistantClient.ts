@@ -652,6 +652,23 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "search_chat_history",
+      description:
+        "搜索完整聊天历史（不受最近 120 条窗口限制）。用户问「之前/上次/以前/我说过/你让我/那个提醒/计时」等旧事，或需要确认过去约定时调用。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "检索关键词，尽量用用户提到的核心词" },
+          days: { type: "number", description: "向前搜索多少天，默认 30；填 0 表示全部历史" },
+          limit: { type: "number", description: "返回几条命中，默认 5，最多 10" },
+        },
+        required: ["query"],
+      },
+    },
+  },
 ];
 
 /** system prompt 最多注入的记忆条数（token 控制；聊天时按场景召回后再传入） */

@@ -55,6 +55,8 @@ export const TOOL_SPECS: Record<string, ToolSpec> = {
   lock_screen: {},
   daily_card: { maxResultChars: 900 },
   view_diary: { maxResultChars: 3000, readOnly: true },
+  // 旧对话检索结果带上下文，放宽上限；只读，不消耗外部 API
+  search_chat_history: { required: ["query"], maxResultChars: 5000, readOnly: true },
 };
 
 /** 没写 maxResultChars 的工具统一用这个上限 */

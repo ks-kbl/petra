@@ -14,6 +14,8 @@ const fs = require("fs");
 const path = require("path");
 const rt = require("./build/assistant/toolRuntime.js");
 const ac = require("./load-assistant-client.js");
+const cs = require("./build/assistant/chatSummary.js");
+const mn = require("./build/assistant/memoryNudge.js");
 const ak = require("./build/assistant/apiKey.js");
 const bt = require("./build/ui/bubbleTiming.js");
 const ee = require("./build/assistant/EmotionEngine.js");
@@ -26,7 +28,7 @@ const check = (name, cond, extra = "") => {
 
 // ---------- 工具清单 ----------
 check("工具清单非空", rt.toolNames().length >= 18, rt.toolNames().length + " 个");
-check("认识的工具", rt.isKnownTool("run_shell") && rt.isKnownTool("view_diary"));
+check("认识的工具", rt.isKnownTool("run_shell") && rt.isKnownTool("view_diary") && rt.isKnownTool("search_chat_history"));
 check("不认识编造的工具", !rt.isKnownTool("get_time") && !rt.isKnownTool("browse_web"));
 
 // ---------- 参数校验 ----------
@@ -281,6 +283,30 @@ check("401 不触发无工具重试", ac.shouldRetryWithoutTools(401, "tool unsu
 check("429 不触发无工具重试", ac.shouldRetryWithoutTools(429, "tools unsupported") === false);
 check("stream 不支持会触发非流式重试", ac.shouldRetryNonStream(400, "stream is not supported") === true);
 check("stream 参数无关错误不触发", ac.shouldRetryNonStream(400, "model not found") === false);
+
+// ---------- 提醒闭环 / 旧任务不冒充当前状态 ----------
+{
+  const summary = {
+    text: "聊了一会儿",
+    coveredCount: 130,
+    updatedAt: Date.now(),
+    openLoops: ["计时两分钟", "等面试结果", "帮他改接口"],
+  };
+  const done = cs.completeOpenLoops(summary, ["计时两分钟"]);
+  check("提醒完成后从 openLoops 移除", !done.openLoops.includes("计时两分钟"));
+  check("无关的悬而未决保留", done.openLoops.includes("等面试结果") && done.openLoops.includes("帮他改接口"));
+  check("没有命中时原对象不变", cs.completeOpenLoops(summary, ["完全不相关"]) === summary);
+  check("用共同二元组匹配「两分钟到了」也能清掉「计时两分钟」", !cs.completeOpenLoops(summary, ["两分钟到了"]).openLoops.includes("计时两分钟"));
+  const genericDone = cs.completeOpenLoops(summary, ["时间到了"], true);
+  check("泛化提醒完成时至少移除一条短时任务", !genericDone.openLoops.includes("计时两分钟") && genericDone.openLoops.includes("等面试结果"));
+
+  check("「你在干什么」识别为当前状态问题", mn.isCurrentStateQuestion("你在干什么") === true);
+  check("「现在几点了」识别为当前状态问题", mn.isCurrentStateQuestion("现在几点了") === true);
+  check("回忆旧事不算当前状态问题", mn.isCurrentStateQuestion("你还记得上次让我计时吗") === false);
+  check("nudge 明确禁止在问当前状态时提旧事", mn.nudgeBlock({ content: "计时两分钟" }).includes("绝对不要提这件旧事"));
+  check("短时任务不进入顺口问一句", mn.pickOpenLoop({ lastAt: 0, day: "", countToday: 0 }, ["计时两分钟", "等面试结果"]) === "等面试结果");
+  check("没有可问的旧事时返回空", mn.pickOpenLoop(null, ["计时两分钟"]) === "");
+}
 
 console.log("assistant-tools: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);
 process.exit(fail ? 1 : 0);

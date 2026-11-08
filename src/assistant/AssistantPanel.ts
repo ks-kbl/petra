@@ -67,6 +67,7 @@ import {
   pickNudgeCandidate,
   pickOpenLoop,
   nudgeBlock,
+  isCurrentStateQuestion,
   type NudgeState,
 } from "./memoryNudge";
 import {
@@ -77,6 +78,7 @@ import {
   collectSummarizable,
   buildSummaryMessages,
   parseSummaryResponse,
+  completeOpenLoops,
   type ChatSummary,
 } from "./chatSummary";
 import { ToolLoopBudget, formatToolError, toolNames, truncateToolResult, validateToolArgs } from "./toolRuntime";
@@ -140,6 +142,11 @@ let busy = false;
 let historyLoaded = false;
 /** 最近一次用户主动聊天/打开对话面板的时间：判断"问候到点时用户是不是正在聊" */
 let lastConversationActivityAt = 0;
+/** 本轮进程内还未到点的提醒；到点后自动完成 openLoop，不需要用户再确认 */
+interface ActiveReminder { id: string; message: string; dueAt: number; createdAt: number }
+const activeReminders = new Map<string, ActiveReminder>();
+/** 提醒到点若正好撞上工具调用轮次，完成记录要等本轮结束再写，避免打断 tool_calls 序列 */
+let pendingReminderNotes: string[] = [];
 let lifecycleOnOpen: (() => void) | null = null;
 let lifecycleOnClose: (() => void) | null = null;
 
@@ -746,8 +753,9 @@ function saveNudgeState() {
  * 这一轮要不要"顺口问一句"。
  * 频率受控（3 小时冷却、每天 2 次），命中就把它标记成刚用过，避免下一轮又提同一件事。
  */
-function takeTurnNudge(): string {
+function takeTurnNudge(userText = ""): string {
   try {
+    if (isCurrentStateQuestion(userText)) return "";
     if (!shouldNudge(nudgeState)) return "";
     // 先看"这次的对话留下的线头"，再退回"很久没提的旧事实"
     const loop = pickOpenLoop(nudgeState, chatSummary.openLoops);
@@ -767,6 +775,27 @@ function takeTurnNudge(): string {
       saveMemory();
     }
     return nudgeBlock(cand);
+  } catch {
+    return "";
+  }
+}
+
+/** 用户这轮可能在问旧事：自动检索一次完整历史，避免只靠摘要和最近 120 条 */
+const PAST_REFERENCE_RE =
+  /(之前|上次|以前|刚才|那天|昨天|前天|我说过|我让你|还记得|提醒|计时|待办|那个事|前面说|早先|刚刚说)/;
+
+async function autoRecallHistory(text: string): Promise<string> {
+  const t = (text || "").trim();
+  if (!t || !PAST_REFERENCE_RE.test(t)) return "";
+  try {
+    const found = await invoke<string>("search_chat_history", { query: t, days: 30, limit: 4 });
+    if (!found || found.startsWith("没有找到") || found.startsWith("检索词为空")) return "";
+    const clipped = found.length > 3000 ? `${found.slice(0, 3000)}\n…（检索结果较长，已截断）` : found;
+    return (
+      "【自动检索到的相关旧对话（供参考，不要逐条复述）】\n" +
+      clipped +
+      "\n【怎么用】如果用户问的是过去发生的事，以这段原文为准；如果用户只是问当前状态，不要提这些旧事。"
+    );
   } catch {
     return "";
   }
@@ -960,6 +989,47 @@ function recordGreeting(summary: string, greeting: string): void {
 function markGreetingRepliedByUser(): void {
   const records = loadGreetingLog();
   if (markLatestGreetingReplied(records, Date.now())) saveGreetingLog(records);
+}
+
+/**
+ * 提醒到点：任务视为完成，自动从「悬而未决」里移除，不需要用户再确认。
+ *
+ * 同时往主历史写一条内部完成记录，模型以后问"那个计时完成了吗"时能查到；
+ * 并清掉 nudge 记着的同一件事，避免下一轮又把旧任务当当前状态提。
+ */
+function completeReminderTask(message: string): void {
+  const text = (message || "").trim();
+  if (!text) return;
+  const next = completeOpenLoops(chatSummary, [text], true);
+  if (next !== chatSummary) {
+    chatSummary = next;
+    saveChatSummary();
+  }
+  if (nudgeState.lastLoop) {
+    const a = nudgeState.lastLoop.replace(/\s+/g, "").toLowerCase();
+    const b = text.replace(/\s+/g, "").toLowerCase();
+    if (a && b && (a.includes(b) || b.includes(a))) {
+      nudgeState = { ...nudgeState, lastLoop: undefined };
+      saveNudgeState();
+    }
+  }
+  // 工具调用必须保持 assistant(tool_calls) → tool(result) 紧邻；提醒到点若撞上
+  // 这一小段，先排队，等本轮结束再写，避免把历史序列写坏导致下一轮 400。
+  if (busy) {
+    pendingReminderNotes.push(text);
+  } else {
+    pushHistory({ role: "assistant", content: `【提醒完成】${text}`, ts: Date.now() });
+    saveHistory();
+  }
+}
+
+function flushPendingReminderNotes(): void {
+  if (!pendingReminderNotes.length || busy) return;
+  for (const text of pendingReminderNotes) {
+    pushHistory({ role: "assistant", content: `【提醒完成】${text}`, ts: Date.now() });
+  }
+  pendingReminderNotes = [];
+  saveHistory();
 }
 
 function ensureInput() {
@@ -2039,7 +2109,7 @@ async function send(text: string) {
     return;
   }
   // 本轮要不要顺口提起一件旧事（有频率上限，提过就冷却）
-  const turnNudge = takeTurnNudge();
+  const turnNudge = takeTurnNudge(text);
   const outLang = s.assistant.outputLanguage;
   // 换语言时清空对话历史。
   // 以前用内存变量 lastChatLang 作基准，重启后初值为空 → 第一次发送就误清历史；
@@ -2069,6 +2139,8 @@ async function send(text: string) {
   const imagesForTurn = pendingImages.map((i) => i.dataUrl);
   const composed = [text, attachText, imageNote].filter(Boolean).join("\n\n");
   clearAttachments();
+  // 用户提到"之前/上次/让你/计时"等旧事：先自动检索一次完整历史（模型也保留工具备查）
+  const historyRecall = await autoRecallHistory(composed);
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑
   const langReminder = buildLanguageReminder(outLang ?? "");
   const userContent = langReminder ? `${composed}\n${langReminder}` : composed;
@@ -2148,7 +2220,7 @@ async function send(text: string) {
           extraTools: pluginRuntime.getOpenAITools(),
           // 画像 + 最近情绪只走 system prompt：模型知道"这是什么样的人、最近过得怎样"，
           // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
-          profileText: [personaContextBlock(), turnNudge].filter(Boolean).join("\n\n"),
+          profileText: [personaContextBlock(), turnNudge, historyRecall].filter(Boolean).join("\n\n"),
           // 长聊之后补上被窗口切掉的旧对话，避免"聊到一半突然不认识你"
           historySummary: summaryBlock(chatSummary),
         },
@@ -2319,6 +2391,7 @@ async function send(text: string) {
   } finally {
     busy = false;
     setSendBusy(false);
+    flushPendingReminderNotes();
     resetTimer(); // 一轮对话结束 = 一次互动，空闲窗口重新开始计时
   }
 }
@@ -2522,11 +2595,23 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
       const minutes = Number(tc.args.minutes) || 1;
       const message = String(tc.args.message || "时间到了");
       const ms = Math.max(5000, Math.min(86400000, minutes * 60000));
+      const reminderId = `rem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+      const reminder: ActiveReminder = { id: reminderId, message, dueAt: Date.now() + ms, createdAt: Date.now() };
+      activeReminders.set(reminderId, reminder);
       setTimeout(() => {
+        // 只认还活着的提醒：避免取消/重复计时后旧回调又触发一次
+        if (!activeReminders.has(reminderId)) return;
+        activeReminders.delete(reminderId);
         boostMood("reminder_done");
         toast(`提醒：${message}`, "info");
+        // 到点 = 任务完成，自动闭环，不要求用户再点确认
+        completeReminderTask(message);
       }, ms);
-      pushHistory({ role: "tool", tool_call_id: tc.id, content: `已设定 ${minutes} 分钟后提醒：${message}` });
+      pushHistory({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: `已设定 ${minutes} 分钟后提醒：${message}（到点会自动标记完成）`,
+      });
     }
     if (tc.name === "get_weather") {
       await invokeTool(tc, "get_weather");
@@ -2788,6 +2873,18 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           const summary = diaries.map(d => `📖 ${d.date}: ${d.content.slice(0, 30)}...`).join("\n");
           pushHistory({ role: "tool", tool_call_id: tc.id, content: `最近的日记：\n${summary}` });
         }
+      }
+    }
+    if (tc.name === "search_chat_history") {
+      const query = String(tc.args.query || "").trim();
+      if (!query) {
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "检索词是空的，请带上 query 再调用一次。" });
+      } else {
+        await invokeTool(tc, "search_chat_history", {
+          query,
+          days: tc.args.days === undefined ? 30 : Number(tc.args.days) || 0,
+          limit: tc.args.limit === undefined ? 5 : Number(tc.args.limit) || 5,
+        });
       }
     }
 

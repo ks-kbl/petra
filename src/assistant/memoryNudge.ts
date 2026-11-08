@@ -47,10 +47,31 @@ export function emptyNudgeState(): NudgeState {
  * 从"悬而未决"里挑一条：这类是**这次的对话本身**留下的线头，
  * 比"很久没提的旧事实"更像熟人之间的关心（"你之前说的接口后来弄完了吗"）。
  */
+/**
+ * 明显的短时任务/提醒（"计时两分钟""30 分钟后提醒我"）不该走"顺口问一句"，
+ * 它们有明确到点时间，应该由 set_reminder 到点自动闭环；否则过几天还会被翻出来。
+ */
+export function isEphemeralTaskLoop(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
+  return /(计时|倒计时|定时|提醒|闹钟|分钟后|小时后|秒后|稍等|等一下|待办)/.test(t);
+}
+
 export function pickOpenLoop(state: NudgeState | null | undefined, openLoops: string[] | null | undefined): string {
   const last = state?.lastLoop ?? "";
   const list = (openLoops ?? []).map((x) => (x || "").trim()).filter(Boolean);
-  return list.find((x) => x !== last) ?? "";
+  return list.find((x) => x !== last && !isEphemeralTaskLoop(x)) ?? "";
+}
+
+/**
+ * 用户这轮是不是只在问"你现在在干什么/几点了"这类当前状态。
+ * 这种问题不该触发"顺口问一句旧事"——否则模型会把旧任务（如"计时两分钟"）
+ * 当成正在发生的事说出来。
+ */
+export function isCurrentStateQuestion(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
+  return /(你在干什么|你在干嘛|你在做什么|你干啥呢|干什么呢|干嘛呢|在忙吗|忙什么呢|现在在做什么|现在干什么|现在几点|几点了|今天几号|现在是什么时候)/.test(t);
 }
 
 export function normalizeNudgeState(raw: unknown): NudgeState {
@@ -129,7 +150,8 @@ export function nudgeBlock(candidate: { content: string } | null | undefined): s
   return (
     "【可以顺口问一句（不是任务）】\n" +
     `你想起他之前提过：${c}\n` +
-    "只在**这轮对话自然接得上**的时候，顺口问一句近况（「对了，你之前说的…后来怎么样了」），" +
+    "只在**这轮对话自然接得上、且用户主动提到相关话题**的时候，顺口问一句近况（「对了，你之前说的…后来怎么样了」）。" +
+    "如果用户只是问「你在干什么 / 现在几点 / 在忙吗」这类当前状态问题，绝对不要提这件旧事。" +
     "不要硬提、不要每轮都提、不要说「我记得你曾经说过」这种背诵感的话；接不上就当没看见。"
   );
 }
