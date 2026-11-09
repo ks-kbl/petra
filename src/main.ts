@@ -3585,22 +3585,29 @@ function buildMenu(engine: BehaviorEngine, opts?: { ignoreIdle?: boolean }): Men
     },
     { id: "sep", separator: true },
     {
-      id: "restart",
-      label: "重启",
-      onPick: () => {
-        // dev 模式下 app.restart() 会退出但不重新启动，改成刷新页面
-        if (import.meta.env.DEV) {
-          window.location.reload();
-        } else {
-          void invoke("restart_app");
-        }
-      },
-    },
-    {
-      id: "quit",
-      label: "退出",
-      danger: true,
-      onPick: () => void invoke("quit_app"),
+      // 重启 / 退出压成同一行的左右两个按钮，少占一行高度；
+      // 两个 id 原样保留，面板「功能清单」和自检仍按 restart / quit 找得到。
+      id: "power",
+      split: [
+        {
+          id: "restart",
+          label: "重启",
+          onPick: () => {
+            // dev 模式下 app.restart() 会退出但不重新启动，改成刷新页面
+            if (import.meta.env.DEV) {
+              window.location.reload();
+            } else {
+              void invoke("restart_app");
+            }
+          },
+        },
+        {
+          id: "quit",
+          label: "退出",
+          danger: true,
+          onPick: () => void invoke("quit_app"),
+        },
+      ],
     },
   ];
 }
@@ -3624,9 +3631,9 @@ function buildCompactMenu(engine: BehaviorEngine): MenuItemSpec[] {
   // 待机模式保持原样的迷你菜单（待机开关 + 提示），不受精简影响
   if (settings.idleMode) return all;
   const kept = all.filter((i) => COMPACT_MENU_KEEP.has(i.id));
-  // 重启 / 退出复用全量菜单里的定义（restart 在 dev 下会退化成刷新页面，逻辑不能分叉）
-  const restart = all.find((i) => i.id === "restart");
-  const quit = all.find((i) => i.id === "quit");
+  // 重启 / 退出复用全量菜单里的定义（restart 在 dev 下会退化成刷新页面，逻辑不能分叉）；
+  // 全量菜单里它俩已经并成一行（id=power），这里整行搬过来即可。
+  const power = all.find((i) => i.id === "power");
   return [
     ...kept,
     { id: "sep", separator: true },
@@ -3635,8 +3642,7 @@ function buildCompactMenu(engine: BehaviorEngine): MenuItemSpec[] {
       label: "⚙️ 控制面板",
       onPick: () => void openControlPanel(),
     },
-    ...(restart ? [restart] : []),
-    ...(quit ? [quit] : []),
+    ...(power ? [power] : []),
   ];
 }
 
@@ -3898,6 +3904,17 @@ function flattenMenuActions(): { group: string; items: { id: string; label: stri
       if (it.separator || it.hint) continue;
       if (it.submenu?.length) {
         walk(it.submenu, trail.length ? trail : [clean(it.label ?? it.id)]);
+        continue;
+      }
+      // 并排按钮行（重启 | 退出）：两个按钮各自算一个可执行项
+      if (it.split?.length) {
+        const group = trail[0] ?? "常用";
+        const arr = byGroup.get(group) ?? [];
+        for (const act of it.split) {
+          if (!act.onPick || !act.label) continue;
+          if (!arr.some((x) => x.id === act.id)) arr.push({ id: act.id, label: clean(act.label) });
+        }
+        byGroup.set(group, arr);
         continue;
       }
       // 「控制面板」自己那一项不列进去：在面板里点它只会再开一个面板标签页。
@@ -4623,7 +4640,9 @@ function runPanelAction(id: string, payload?: unknown): void {
     const walkIds = (items: MenuItemSpec[]) => {
       for (const it of items) {
         if (it.submenu?.length) walkIds(it.submenu);
-        else if (it.onPick && it.label) ids.add(it.id);
+        else if (it.split?.length) {
+          for (const act of it.split) if (act.onPick && act.label) ids.add(act.id);
+        } else if (it.onPick && it.label) ids.add(it.id);
       }
     };
     walkIds(all);
@@ -4662,6 +4681,13 @@ function runPanelAction(id: string, payload?: unknown): void {
       if (it.id === id && it.onPick) {
         found = it;
         return;
+      }
+      if (it.split?.length) {
+        const act = it.split.find((x) => x.id === id && x.onPick);
+        if (act) {
+          found = { id: act.id, label: act.label, onPick: act.onPick };
+          return;
+        }
       }
       if (it.submenu?.length) walk(it.submenu);
     }

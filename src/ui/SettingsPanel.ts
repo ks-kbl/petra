@@ -224,6 +224,26 @@ function appendRows(container: HTMLElement, rows: MenuItemSpec[], nested: boolea
 }
 
 function row(item: MenuItemSpec, child: boolean): HTMLElement {
+  // 并排按钮行（重启 | 退出）：一行两半，各点各的
+  if (item.split && item.split.length) {
+    const bar = document.createElement("div");
+    bar.className = "sw-row sw-row--split";
+    for (const act of item.split) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `sw-split-btn${act.danger ? " is-danger" : ""}`;
+      btn.textContent = act.label;
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        act.onPick?.();
+        renderAfterAction();
+      });
+      bar.appendChild(btn);
+    }
+    bar.addEventListener("click", (ev) => ev.stopPropagation());
+    return bar;
+  }
+
   const r = document.createElement("div");
   r.className = `sw-row${child ? " is-child" : ""}${item.danger ? " is-danger" : ""}`;
 
