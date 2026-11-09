@@ -300,6 +300,28 @@ check("stream 参数无关错误不触发", ac.shouldRetryNonStream(400, "model 
   const genericDone = cs.completeOpenLoops(summary, ["时间到了"], true);
   check("泛化提醒完成时至少移除一条短时任务", !genericDone.openLoops.includes("计时两分钟") && genericDone.openLoops.includes("等面试结果"));
 
+  const stale = cs.sanitizeEphemeralTaskSummary({
+    text: "用户让 Petra 倒计时两分钟。用户喜欢猫。",
+    coveredCount: 200,
+    updatedAt: 1,
+    openLoops: ["计时两分钟", "等面试结果"],
+  });
+  check("旧摘要正文里的计时任务被清掉", !stale.text.includes("计时") && stale.text.includes("用户喜欢猫"));
+  check("旧摘要 openLoops 里的计时任务被清掉", !stale.openLoops.includes("计时两分钟") && stale.openLoops.includes("等面试结果"));
+  check("摘要块明确声明不是当前任务", cs.summaryBlock({ text: "以前聊过很多", coveredCount: 1, updatedAt: 1 }).includes("不是当前正在进行的任务"));
+  const onlyTask = cs.sanitizeEphemeralTaskSummary({ text: "用户让 Petra 计时两分钟。", coveredCount: 200, updatedAt: 1, openLoops: ["计时两分钟"] });
+  check("摘要只剩旧任务时整份失效并从历史重建", onlyTask.text === "" && onlyTask.coveredCount === 0);
+
+  const now = Date.now();
+  const oldNote = cs.expiredTaskNote([
+    { role: "user", content: "给我倒计时2分钟", ts: now - 24 * 3600 * 1000 },
+    { role: "assistant", content: "好的，两分钟后提醒你", ts: now - 24 * 3600 * 1000 },
+    { role: "user", content: "今天天气怎么样", ts: now - 1000 },
+  ], now);
+  check("旧任务会被标记为过期", oldNote.includes("过期旧任务") && oldNote.includes("倒计时2分钟"));
+  check("新消息不会被误标成过期", !oldNote.includes("今天天气怎么样"));
+  check("没有旧任务时不注入提示", cs.expiredTaskNote([{ role: "user", content: "你好", ts: now - 1000 }], now) === "");
+
   check("「你在干什么」识别为当前状态问题", mn.isCurrentStateQuestion("你在干什么") === true);
   check("「现在几点了」识别为当前状态问题", mn.isCurrentStateQuestion("现在几点了") === true);
   check("回忆旧事不算当前状态问题", mn.isCurrentStateQuestion("你还记得上次让我计时吗") === false);
