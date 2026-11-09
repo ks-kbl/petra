@@ -42,6 +42,12 @@ const cut = sp.takeSpeechSegment(long, { maxChars: 40 });
 check("超长会兜底断开", !!cut && cut.segment.length <= 40);
 check("兜底切断后 rest 接得上", !!cut && cut.segment + cut.rest === long);
 
+// ---------- 换行当句末（列表/分行回复） ----------
+const line = sp.takeSpeechSegment("第一行内容足够长了吧\n第二行也足够长了呀。");
+check("换行处断开", !!line && line.segment === "第一行内容足够长了吧", JSON.stringify(line));
+check("换行后的内容接得上", !!line && line.rest === "第二行也足够长了呀。", JSON.stringify(line?.rest));
+check("太短的换行行不切", sp.takeSpeechSegment("好\n") === null);
+
 // ---------- 增量流 ----------
 let buf = "";
 const out = [];

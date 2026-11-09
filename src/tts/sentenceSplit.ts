@@ -21,7 +21,14 @@ export interface SpeechSplitOptions {
 }
 
 export const DEFAULT_MIN_CHARS = 10;
-export const DEFAULT_MAX_CHARS = 70;
+/**
+ * 单段上限。
+ *
+ * 原来 70：长句经常在逗号处被腰斩，两次合成拼起来语气是断的。
+ * 放宽到 90 后大部分整句（含两三个逗号）能一次合成，接缝明显减少；
+ * 再长就有合成超时风险（Rust 侧 15 秒超时），所以不继续往上加。
+ */
+export const DEFAULT_MAX_CHARS = 90;
 
 /** 句末标点（强断句）。刻意不含 `；;，、：` —— 那些是句中停顿 */
 const SENTENCE_END = new Set(["。", "！", "？", "!", "?", "…"]);
@@ -60,6 +67,17 @@ export function takeSpeechSegment(
         return { segment: segment.trim(), rest: text.slice(i + 1) };
       }
       // 太短：不切，继续往后攒（这就是"短句合并"）
+      continue;
+    }
+
+    // 换行：模型经常一行一句（列表/分行回复）。换行处当句末处理，
+    // 否则一行行读下来会连成一大串，或者被 maxChars 从行中间切断。
+    if (depth === 0 && (ch === "\n" || ch === "\r")) {
+      if (ch === "\r" && text[i + 1] === "\n") continue;
+      const segment = text.slice(0, i).trim();
+      if (segment.length >= minChars) {
+        return { segment, rest: text.slice(i + 1).replace(/^[\r\n]+/, "") };
+      }
       continue;
     }
 

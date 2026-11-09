@@ -808,6 +808,21 @@ body {
   color: #fff;
   font-size: 12px;
 }
+/* 「你发的」图片回显：缩略图并排，证明图已经发出去了 */
+.as-user-imgs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 4px;
+}
+.as-user-img {
+  width: 104px;
+  height: 104px;
+  object-fit: cover;
+  border-radius: 9px;
+  box-shadow: 0 3px 10px rgba(120, 60, 100, 0.22);
+}
+
 /* 你说的话（语音识别的回显）：靠右、粉色调，和桌宠的白气泡一眼分得开 */
 .as-user {
   align-self: flex-end;
