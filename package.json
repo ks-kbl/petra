@@ -19,7 +19,7 @@
     "test:app": "tsc src/utils/foregroundApp.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/foreground-app.test.js",
     "test:assistant": "tsc src/assistant/toolRuntime.ts src/assistant/AssistantClient.ts src/assistant/EmotionEngine.ts src/ui/bubbleTiming.ts src/assistant/chatSummary.ts src/assistant/memoryNudge.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/assistant-tools.test.js && node tests/screen-vision.test.js && node tests/assistant-compat.test.js",
     "test:split": "tsc src/tts/sentenceSplit.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/sentence-split.test.js",
-    "test:tts": "tsc src/tts/TTSPlayer.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/tts-mute.test.js && node tests/tts-order.test.js",
+    "test:tts": "tsc src/tts/TTSPlayer.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/tts-mute.test.js && node tests/tts-order.test.js && node tests/tts-gapless.test.js && node tests/tts-fluency.test.js",
     "test:chatlog": "node tests/chatlog-core.test.js",
     "test:panel": "node tests/panel-regressions.test.js",
     "test:asr": "tsc src/asr/asrLogic.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/asr-logic.test.js",
@@ -37,7 +37,8 @@
     "test:persona": "tsc src/assistant/builtinPersonas.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/builtin-persona.test.js",
     "test:self": "tsc src/assistant/selfModel.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/self-model.test.js",
     "test:profile": "tsc src/assistant/userProfile.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/user-profile.test.js",
-    "test:ui-text": "tsc src/utils/uiText.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/ui-text.test.js"
+    "test:ui-text": "tsc src/utils/uiText.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/ui-text.test.js",
+    "test:send": "tsc src/assistant/sendCompose.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/send-compose.test.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

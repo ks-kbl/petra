@@ -1,35 +1,143 @@
 /**
  * TTS 播放队列 - 调用豆包声音复刻 API
- * 断句 → 预加载 → 顺序播放
+ *
+ * 断句 → 预加载 → 顺序播放。
+ *
+ * 2026-11 的「更流畅」改造：
+ * 以前每一句都是独立的 `new Audio()`：句与句之间要等上一段 `onended` 再 `play()`，
+ * 而每段合成音频首尾都带着几十到几百毫秒的静音 padding —— 连起来就是明显的
+ * 「一顿一顿」。现在改成：
+ *   1. 用 Web Audio 解码，把每段首尾的静音裁掉（保留一点点自然尾音）；
+ *   2. 多段音频**提前排好时间轴**连续调度，段与段之间不再等事件回调；
+ *   3. 只在真正的句末留 ~70ms 停顿，逗号/超长兜底切开的地方只留 ~15ms；
+ *   4. 每段进出各做几毫秒淡入淡出，接缝处没有咔哒声。
+ * 浏览器不支持 Web Audio 或解码失败时，自动退回原来的 HTMLAudioElement 队列
+ * （Node 单测也走这条兜底路径，逻辑和旧版一致）。
  */
 
 import { invoke } from "@tauri-apps/api/core";
 import { takeSpeechSegment, flushSpeechSegment } from "./sentenceSplit";
+
+interface QueueItem {
+  text: string;
+  /** 合成出来的 MP3 字节（失败时为 null） */
+  bytes: Uint8Array | null;
+  /** 兜底播放用的音频元素（Web Audio 解码成功时不需要） */
+  audio: HTMLAudioElement | null;
+  blobUrl: string | null;
+  ready: boolean;
+  /** 解码后的音频 + 裁剪后的起点/时长 */
+  decoded: { buffer: AudioBuffer; offset: number; duration: number } | null;
+  /** 入队时的播放代次：stop() 之后旧请求的异步结果不能再影响新一轮 */
+  gen: number;
+  /** 这段之后该停多久（秒）：按原文结尾判断，不能看补过句号的 text */
+  pause: number;
+}
+
+/** 句末标点：只有这些结尾才值得留一个自然停顿 */
+const SENTENCE_END_RE = /[。！？!?…]$/;
+/** 句末停顿（秒）；逗号/兜底切开处只留很短的接缝 */
+const PAUSE_SENTENCE = 0.07;
+const PAUSE_SOFT = 0.015;
+/** 调度时留一点提前量，避免 `currentTime` 已经越过开始时间 */
+const SCHEDULE_LEAD = 0.035;
+/** 裁剪静音时首尾各保留的余量（秒） */
+const TRIM_HEAD_PAD = 0.015;
+const TRIM_TAIL_PAD = 0.025;
+
+/**
+ * 找出音频里「真正有声音」的区间（纯函数，方便单测）。
+ *
+ * 阈值按本段峰值自适应：安静录音不会被误判成全程静音，而轻喷麦/底噪又不会被当成语音。
+ * 整段都低于阈值时返回完整区间 —— 宁可多播一点静音，也不能把整句裁没。
+ */
+export function findSpeechBounds(
+  channels: Float32Array[],
+  sampleRate: number,
+): { offset: number; duration: number } {
+  const total = channels[0]?.length ?? 0;
+  if (!total || !sampleRate) return { offset: 0, duration: 0 };
+  let peak = 0;
+  for (const ch of channels) {
+    for (let i = 0; i < ch.length; i++) {
+      const v = Math.abs(ch[i]);
+      if (v > peak) peak = v;
+    }
+  }
+  if (peak <= 0) return { offset: 0, duration: total / sampleRate };
+  const threshold = Math.max(0.002, Math.min(0.01, peak * 0.015));
+  const loudAt = (i: number) => {
+    for (const ch of channels) {
+      if (Math.abs(ch[i]) >= threshold) return true;
+    }
+    return false;
+  };
+  let start = 0;
+  while (start < total && !loudAt(start)) start++;
+  if (start >= total) return { offset: 0, duration: total / sampleRate };
+  let end = total - 1;
+  while (end > start && !loudAt(end)) end--;
+  const headPad = Math.round(TRIM_HEAD_PAD * sampleRate);
+  const tailPad = Math.round(TRIM_TAIL_PAD * sampleRate);
+  start = Math.max(0, start - headPad);
+  end = Math.min(total, end + tailPad + 1);
+  return { offset: start / sampleRate, duration: Math.max(0.01, (end - start) / sampleRate) };
+}
+
+/**
+ * 这段文字之后该停多久。
+ *
+ * 句末 70ms（自然换气）；逗号/分号处切断只留 15ms，避免把一句话读成两截；
+ * 换行或超长兜底切开（没有标点）留 45ms，比逗号更像一个停顿，但不像句末那么重。
+ */
+export function pauseAfterSegment(text: string): number {
+  const t = text.trim();
+  if (SENTENCE_END_RE.test(t)) return PAUSE_SENTENCE;
+  if (/[，,、；;：:]$/.test(t)) return PAUSE_SOFT;
+  return 0.045;
+}
 
 class TTSPlayer {
   private enabled = false;
   private apiKey = "";
   private speakerId = "";
   private language = "";
-  private queue: { text: string; audio: HTMLAudioElement | null; ready: boolean; blobUrl: string | null }[] = [];
+  private queue: QueueItem[] = [];
   private speaking = false;
   private buffer = "";
   private stopped = false;
-  private skipSource = false;
   private idleCallbacks: (() => void)[] = [];
   /** 唤醒词监听在 TTS 播放期间要暂停，避免把自己说的话当成唤醒词 */
   private wakeResumeTimer: number | null = null;
   muted = false;
-  /**
-   * 正在播的那一段。
-   *
-   * 必须自己留引用：`new Audio()` 出来的元素**不在 DOM 里**（没 append 到任何节点），
-   * 所以 `document.querySelectorAll("audio")` 根本找不到它 —— 以前静音按钮就是靠查
-   * DOM 去改 volume 的，结果按下去对正在播的那一段毫无作用，只能等下一句。
-   */
+
+  /** 兜底播放时正在响的元素（Web Audio 路径用不到） */
   private current: HTMLAudioElement | null = null;
 
-  onIdle(cb: () => void) { this.idleCallbacks.push(cb); }
+  /** Web Audio 上下文：懒创建；创建失败/不支持时永远走兜底 */
+  private ctx: AudioContext | null = null;
+  private ctxBroken = false;
+  /** 主音量节点：静音开关直接改它，正在播的每一段立刻生效 */
+  private masterGain: GainNode | null = null;
+  /** 已经排进时间轴、还没播完的 source */
+  private scheduled = new Set<AudioBufferSourceNode>();
+  /** 下一段应该从 ctx 的哪个时间点开始 */
+  private nextStartAt = 0;
+  /** 只要有一段解码失败，就当这个端点给的格式 Web Audio 处理不了，后续全走兜底 */
+  private decodeBroken = false;
+  /** 播放代次：每次 stop() 自增，用来丢弃上一轮还在路上的合成/解码结果 */
+  private generation = 0;
+
+  /**
+   * 注册「这段说完」回调。
+   *
+   * 如果注册的时候已经不在播、队列也空了（短回复在气泡挂回调之前就播完了），
+   * 直接回调一次 —— 否则调用方只能等 120 秒兜底，气泡会一直赖在屏幕上。
+   */
+  onIdle(cb: () => void) {
+    if (!this.isSpeaking() && this.queue.length === 0) { cb(); return; }
+    this.idleCallbacks.push(cb);
+  }
 
   /**
    * 播报期间暂停本地唤醒词监听（播完再等 300ms 恢复，躲开混响尾音）。
@@ -56,16 +164,17 @@ class TTSPlayer {
    * 语音输入要用它做「抢话」判断：麦克风开着的同时 TTS 在响，识别会把桌宠
    * 自己的声音也听进去（回声），必须先停掉再开麦。
    */
-  isSpeaking(): boolean { return this.speaking; }
+  isSpeaking(): boolean { return this.speaking || this.scheduled.size > 0; }
 
   /**
    * 实时静音开关：立刻作用于**正在播的这一段**，不用等下一句。
    *
-   * 用 volume=0 而不是 pause()：静音期间队列要继续走完（气泡的消失时机、
+   * 用音量 0 而不是 pause()：静音期间队列要继续走完（气泡的消失时机、
    * onIdle 回调都挂在"播完"上），暂停会让整条链卡住。
    */
   setMuted(muted: boolean) {
     this.muted = muted;
+    if (this.masterGain) this.masterGain.gain.value = muted ? 0 : 1;
     if (this.current) this.current.volume = muted ? 0 : 1;
   }
 
@@ -113,37 +222,89 @@ class TTSPlayer {
     }
     this.buffer = "";
     this.stopped = false;
-    this.skipSource = false;
   }
 
   stop() {
+    this.generation++;
     this.queue = [];
     this.buffer = "";
     this.speaking = false;
     this.stopped = false;
-    // 同样因为音频元素不在 DOM 里，以前这里 querySelector("audio.tts-current")
-    // 永远查不到东西 → 关掉语音输出时当前这句其实还在响。改成停自己持有的引用。
+    // 每次新回复都重新试一次 Web Audio：上一段解码失败可能只是偶发的坏包，
+    // 不该让整个进程以后都退化成有缝的兜底播放。
+    this.decodeBroken = false;
+    // 停掉所有已经排进时间轴的音频（Web Audio 不能靠 pause()，必须 stop()）
+    for (const src of this.scheduled) {
+      try { src.stop(); } catch { /* 已经结束的 source stop() 会抛，忽略 */ }
+    }
+    this.scheduled.clear();
+    this.nextStartAt = 0;
+    // 兜底路径：音频元素不在 DOM 里，只能停自己持有的引用
     this.current?.pause();
     this.current = null;
+    // 播报途中被 stop（关语音/发新消息）时唤醒监听本来会一直保持暂停，
+    // 这里恢复一次；真要继续播的话下一次开播会再pause，不会误唤醒。
+    this.setWakePaused(false);
   }
 
   private enqueue(text: string) {
+    const original = text.trim();
+    const pause = pauseAfterSegment(original);
     let clean = text
+      // 括号里的动作/旁白不读（"（笑）""(小声)"），否则会念出来很出戏
       .replace(/[（(][^）)]*[）)]/g, "")
       .replace(/[*_`#~|]/g, "")
+      // 分隔线/引用符号不读：否则 TTS 会把 "---" 念成"减号减号减号"
+      .replace(/^\s*[-=]{3,}\s*$/gm, "")
+      .replace(/^\s*>+\s?/gm, "")
+      // Markdown 列表符号/序号不读："- 第一点" → "第一点"
+      .replace(/^\s*[-*+]\s+/gm, "")
+      .replace(/^\s*\d+[.)、]\s*/gm, "")
       .replace(/\n---\n[\s\S]*$/, "")
       .replace(/\s+/g, " ")
       .trim();
     // 补一个句末标点：没有收尾标点时 TTS 的语调会"悬着"，听起来就是断在半句上
     if (clean && !/[。！？!?…]$/.test(clean)) clean += "。";
     if (!clean || clean.length < 2) return;
-    const item = { text: clean, audio: null as HTMLAudioElement | null, ready: false, blobUrl: null as string | null };
+    const item: QueueItem = {
+      text: clean,
+      bytes: null,
+      audio: null,
+      blobUrl: null,
+      ready: false,
+      decoded: null,
+      gen: this.generation,
+      pause,
+    };
     this.queue.push(item);
     this.preload(item);
     this.pump();
   }
 
-  private async preload(item: { text: string; audio: HTMLAudioElement | null; ready: boolean; blobUrl: string | null }) {
+  /** 懒创建 Web Audio 上下文；返回 false 表示只能走 HTMLAudioElement 兜底 */
+  private ensureContext(): boolean {
+    if (this.ctx) return true;
+    if (this.ctxBroken) return false;
+    try {
+      const w = window as unknown as { AudioContext?: typeof AudioContext; webkitAudioContext?: typeof AudioContext };
+      const Ctor = w.AudioContext ?? w.webkitAudioContext;
+      if (!Ctor) { this.ctxBroken = true; return false; }
+      const ctx = new Ctor();
+      const gain = ctx.createGain();
+      gain.gain.value = this.muted ? 0 : 1;
+      gain.connect(ctx.destination);
+      this.ctx = ctx;
+      this.masterGain = gain;
+      return true;
+    } catch (e) {
+      console.warn("[TTS] WebAudio unavailable, fallback:", e);
+      this.ctxBroken = true;
+      return false;
+    }
+  }
+
+  private async preload(item: QueueItem) {
+    const gen = item.gen;
     try {
       const base64 = await invoke<string>("tts_synthesize", {
         apiKey: this.apiKey,
@@ -151,15 +312,39 @@ class TTSPlayer {
         text: item.text,
         language: this.language || undefined,
       });
+      // 这期间用户已经发了新消息/关了语音：这段音频已经没人要了，别往新一轮的队列里塞
+      if (gen !== this.generation) return;
       const binary = atob(base64);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      item.bytes = bytes;
       const blob = new Blob([bytes], { type: "audio/mp3" });
       item.blobUrl = URL.createObjectURL(blob);
-      item.audio = new Audio(item.blobUrl);
+
+      if (!this.decodeBroken && this.ensureContext() && this.ctx) {
+        try {
+          // decodeAudioData 会接管传入的 ArrayBuffer，复制一份避免影响兜底用的 bytes
+          const copy = bytes.slice().buffer;
+          const buffer = await this.ctx.decodeAudioData(copy);
+          if (gen !== this.generation) return;
+          const channels: Float32Array[] = [];
+          for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
+          const bounds = findSpeechBounds(channels, buffer.sampleRate);
+          item.decoded = { buffer, offset: bounds.offset, duration: bounds.duration };
+        } catch (e) {
+          if (gen !== this.generation) return;
+          // 不懂这个格式/解码失败：这个端点后续都走兜底，别再每句都白试一次
+          console.warn("[TTS] decode failed, fallback:", e);
+          this.decodeBroken = true;
+        }
+      }
+      if (!item.decoded) item.audio = new Audio(item.blobUrl);
       item.ready = true;
-      if (!this.speaking) this.pump();
+      // 即使当前已经在播，也要再 pump 一次：Web Audio 路径要把后面这句**提前排进时间轴**，
+      // 等前一句播完才排的话，两段之间会多出一次 onended→start 的空隙（又变回一顿一顿）。
+      this.pump();
     } catch (e) {
+      if (gen !== this.generation) return;
       console.warn("[TTS] failed:", e);
       // 失败也要标记 ready 并推进队列：以前只置 ready 不 pump()，若失败的是**队首**
       // 那一句（长句最容易超时），整条队列会停在"ready 但 audio=null"的队首不动，
@@ -170,37 +355,101 @@ class TTSPlayer {
   }
 
   private pump() {
-    if (this.speaking || !this.enabled) return;
+    if (!this.enabled) return;
+    if (this.ensureContext() && !this.decodeBroken) this.pumpWebAudio();
+    else this.pumpLegacy();
+  }
 
-    // 队列空了 → 通知"这一段说完了"（气泡的消失时机挂在这里）
-    if (this.queue.length === 0) {
-      this.setWakePaused(false);
-      if (this.idleCallbacks.length > 0) {
-        const cbs = this.idleCallbacks;
-        this.idleCallbacks = [];
-        cbs.forEach(cb => cb());
+  /**
+   * Web Audio 路径：把已经解码好的段按文字顺序排进时间轴。
+   * 关键是**提前排队**——上一段还在播的时候就把下一段 `start()` 定好时间，
+   * 不再等 `onended` 再起播，接缝处自然没有空隙。
+   */
+  private pumpWebAudio() {
+    const ctx = this.ctx;
+    const master = this.masterGain;
+    if (!ctx || !master) { this.pumpLegacy(); return; }
+    if (ctx.state === "suspended") void ctx.resume().catch(() => {});
+
+    while (this.queue.length > 0) {
+      const next = this.queue[0];
+      if (!next.ready) break;
+      this.queue.shift();
+      if (!next.decoded) {
+        // 解码失败且后面还有已排队的段：等它们播完，onended 会再回来走兜底
+        if (this.scheduled.size > 0) { this.queue.unshift(next); return; }
+        // 混用两条播放链路会叠音：先让兜底元素播完，它的 onended 会再回来排后面的
+        this.playLegacyItem(next);
+        return;
       }
-      return;
+
+      const src = ctx.createBufferSource();
+      src.buffer = next.decoded.buffer;
+      const gen = next.gen;
+      const fadeIn = 0.006;
+      const fadeOut = 0.012;
+      const dur = next.decoded.duration;
+      const local = ctx.createGain();
+      const start = Math.max(ctx.currentTime + SCHEDULE_LEAD, this.nextStartAt);
+      const end = start + dur;
+      local.gain.setValueAtTime(0, start);
+      local.gain.linearRampToValueAtTime(1, start + Math.min(fadeIn, dur / 4));
+      local.gain.setValueAtTime(1, Math.max(start + fadeIn, end - fadeOut));
+      local.gain.linearRampToValueAtTime(0, end);
+      src.connect(local);
+      local.connect(master);
+      src.start(start, next.decoded.offset, dur);
+      this.nextStartAt = end + next.pause;
+      this.speaking = true;
+      this.setWakePaused(true);
+      this.scheduled.add(src);
+      const done = () => {
+        this.scheduled.delete(src);
+        try { local.disconnect(); } catch { /* 忽略 */ }
+        // stop() 之后旧 source 的 onended 迟到：不能让它触发新一轮的 idle/气泡淡出
+        if (gen !== this.generation) return;
+        if (this.scheduled.size > 0) return;
+        this.speaking = false;
+        this.nextStartAt = 0;
+        if (this.queue.length > 0) this.pump();
+        else this.fireIdle();
+      };
+      src.onended = done;
     }
 
+    // 队列空、也没有任何已排队的音频：说明这次真的没东西可播
+    if (this.queue.length === 0 && this.scheduled.size === 0 && !this.speaking) this.fireIdle();
+  }
+
+  /** 兜底路径：原来的 HTMLAudioElement 队列（Web Audio 不可用/解码失败时） */
+  private pumpLegacy() {
+    if (this.speaking) return;
+
+    // 队列空了 → 通知"这一段说完了"（气泡的消失时机挂在这里）
+    if (this.queue.length === 0) { this.fireIdle(); return; }
+
     // **只认队首**：合成是并发预取的（谁先返回不一定，第一句慢、第二句快很常见），
-    // 但"播"必须按文字顺序。以前这里取的是"第一个已经合成好的"（findIndex(i => i.ready)），
-    // 于是第二句先合成完就先播 —— 听起来就是"先说下面的，再说上面的"。
-    // 队首还没好就等着：它 preload 完成时会再调一次 pump。
+    // 但"播"必须按文字顺序；队首没好就等它，preload 完成时会再调 pump。
     const next = this.queue[0];
     if (!next.ready) return;
 
     this.queue.shift();
+    this.playLegacyItem(next);
+  }
+
+  private playLegacyItem(next: QueueItem) {
     const audio = next.audio;
-    // 合成失败的那句（catch 里也标了 ready）：跳过它，接着按顺序往下播
+    // 合成失败/解码失败且没有兜底元素的那句：跳过，接着按顺序往下播
     if (!audio) { this.pump(); return; }
 
     this.setWakePaused(true);
     this.speaking = true;
     this.current = audio;
     audio.volume = this.muted ? 0 : 1;
+    const gen = next.gen;
     // 收尾时清掉引用：只有"还是当前这段"时才清，避免把下一段的引用误清掉
     const done = () => {
+      if (gen !== this.generation) return;
       if (this.current === audio) this.current = null;
       this.speaking = false;
       this.pump();
@@ -208,6 +457,17 @@ class TTSPlayer {
     audio.onended = done;
     audio.onerror = done;
     audio.play().catch(done);
+  }
+
+  /** 队列空了才通知：气泡淡出、唤醒恢复都挂在这里 */
+  private fireIdle() {
+    if (this.queue.length > 0 || this.scheduled.size > 0) return;
+    this.setWakePaused(false);
+    if (this.idleCallbacks.length > 0) {
+      const cbs = this.idleCallbacks;
+      this.idleCallbacks = [];
+      cbs.forEach((cb) => cb());
+    }
   }
 }
 

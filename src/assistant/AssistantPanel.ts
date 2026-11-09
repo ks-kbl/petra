@@ -43,6 +43,7 @@ import {
 } from "./moodTrend";
 import { detectCorrection } from "./correction";
 import { generateImage, listImageModels } from "./AssistantClient";
+import { hasSendableContent, composeUserMessage } from "./sendCompose";
 import {
   emptySelfState,
   normalizeSelfState,
@@ -354,7 +355,7 @@ export async function attachFilesFromPaths(paths: string[]): Promise<void> {
   if (attachBar) renderAttachBar(attachBar);
   resetTimer();
   if (notes.length) toast(notes.slice(0, 2).join("；"), "warn");
-  else if (pendingImages.length || pendingTextFiles.length) toast("已加到输入框，可以说点什么一起发", "info");
+  else if (pendingImages.length || pendingTextFiles.length) toast("已加到输入框：想说的话可以一起打，不想说直接点发送也行", "info");
 }
 
 function clearAttachments() {
@@ -1078,7 +1079,9 @@ function ensureInput() {
       if (e.isComposing || (e as KeyboardEvent & { keyCode?: number }).keyCode === 229) return;
       e.preventDefault();
       const t = input.value.trim();
-      if (!t) return;
+      // 只挂了图片/文件、没打字也算有内容。以前这里直接 `if (!t) return`，
+      // 结果就是「发图片必须先配一句话」——用户报的正是这个。
+      if (!hasSendableContent(t, pendingImages.length, pendingTextFiles.length)) return;
       // busy 时 send() 会直接 return；先清空输入框就等于把这句话丢了。
       // 和语音路径保持一致：留在输入框里并提示，别让用户以为发出去了。
       if (busy) {
@@ -1096,7 +1099,8 @@ function ensureInput() {
   sendBtn = btn;
   btn.addEventListener("click", () => {
     const t = input.value.trim();
-    if (!t) return;
+    // 同回车：只看文字会把「只发了一张图」挡在门外
+    if (!hasSendableContent(t, pendingImages.length, pendingTextFiles.length)) return;
     if (busy) {
       setInputValue(t);
       toast("上一句还没答完，先放进输入框了", "info");
@@ -1713,6 +1717,43 @@ function attachBubbleClose(b: HTMLElement): void {
   b.appendChild(x);
 }
 
+/**
+ * 「你发的」图片回显。
+ *
+ * 附件条在发送后会被清空，如果只发图片、没有文字，屏幕上就一点痕迹都没有，
+ * 用户会怀疑「到底发出去了吗」。这里把缩略图留在用户气泡里，下一轮 AI 气泡进来时
+ * 再由 trimBubbles 按「保留最近一条 user」的规则收掉。
+ */
+function addUserAttachmentBubble(text: string, images: string[]) {
+  if (!images.length) return;
+  ensureBubbles();
+  const b = document.createElement("div");
+  b.className = "as-bubble as-user as-user-attach";
+  const body = document.createElement("div");
+  body.className = "as-bubble-body";
+  if (text) {
+    const p = document.createElement("div");
+    p.textContent = text;
+    body.appendChild(p);
+  }
+  const grid = document.createElement("div");
+  grid.className = "as-user-imgs";
+  images.forEach((src, i) => {
+    const img = document.createElement("img");
+    img.className = "as-user-img";
+    img.src = src;
+    img.alt = images.length > 1 ? `发送的图片 ${i + 1}` : "发送的图片";
+    grid.appendChild(img);
+  });
+  body.appendChild(grid);
+  b.appendChild(body);
+  attachBubbleClose(b);
+  trimBubbles(false);
+  bubbles!.appendChild(b);
+  positionBubbles();
+  window.setTimeout(() => b.scrollIntoView({ block: "nearest", behavior: "smooth" }), 30);
+}
+
 function addBubble(kind: "ai" | "sys" | "confirm" | "user", text: string): HTMLElement {
   ensureBubbles();
   const b = document.createElement("div");
@@ -2150,12 +2191,14 @@ async function send(text: string) {
   const attachText = pendingTextFiles
     .map((f) => `【附件：${f.name}】\n${f.text}`)
     .join("\n\n");
-  const imageNote = pendingImages.length
-    ? `（另外附图 ${pendingImages.length} 张：${pendingImages.map((i) => i.name).join("、")}）`
-    : "";
+  // 图片只在本轮请求里编码；历史里留占位。只发图片时提示语要说得更明确，
+  // 否则模型会回一句「你想让我做什么」，用户体感就是「发了图还得再打字」。
   const imagesForTurn = pendingImages.map((i) => i.dataUrl);
-  const composed = [text, attachText, imageNote].filter(Boolean).join("\n\n");
+  const sentImages = pendingImages.slice();
+  const composed = composeUserMessage(text, attachText, pendingImages);
   clearAttachments();
+  // 带图片就回显一条「你发的」气泡：附件条清空后，用户看不到自己到底发了哪张图。
+  if (sentImages.length) addUserAttachmentBubble(text.trim(), sentImages.map((i) => i.dataUrl));
   // 用户提到"之前/上次/让你/计时"等旧事：先自动检索一次完整历史（模型也保留工具备查）
   const historyRecall = await autoRecallHistory(composed);
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑
@@ -2333,7 +2376,7 @@ async function send(text: string) {
       };
       loading.appendChild(muteBtn);
       // 记录对话事件（日记系统）：记用户说的话（tracker 内部 safeSlice 截到 80 字）
-      trackEvent({ type: "chat", summary: text });
+      trackEvent({ type: "chat", summary: text || (sentImages.length ? "（发了一张图片）" : "") });
       // CMD 兜底（非 function calling provider）
       const cmd = extractCommand(mainText);
       if (cmd) {
