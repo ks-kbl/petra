@@ -44,6 +44,8 @@ struct Engine {
 }
 
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
+/// 正在启动中：防止超时后用户再点一次又spawn一个引擎（两个线程抢同一个麦克风）
+static STARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 模型目录：开发期用仓库里的 resources/kws，安装后用资源目录。
 pub fn model_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -296,6 +298,9 @@ pub fn wake_start(app: AppHandle, words: Vec<String>, threshold: Option<f32>) ->
     if guard.is_some() {
         return Ok(());
     }
+    if STARTING.swap(true, Ordering::SeqCst) {
+        return Err("唤醒引擎正在启动中，请稍等两秒".into());
+    }
     let dir = ascii_model_dir(&app)?;
     let kw = write_keywords(&dir, &words)?;
     let threshold = threshold.unwrap_or(0.15);
@@ -325,13 +330,21 @@ pub fn wake_start(app: AppHandle, words: Vec<String>, threshold: Option<f32>) ->
         }
     });
 
-    match rx.recv_timeout(Duration::from_secs(8)) {
+    // 首次启动要加载 ONNX 模型 + 枚举音频设备，冷启动可能几秒；
+    // 蓝牙设备枚举偶尔更慢，所以给到 25 秒，别让用户以为坏了。
+    let result = rx.recv_timeout(Duration::from_secs(25));
+    STARTING.store(false, Ordering::SeqCst);
+    match result {
         Ok(Ok(())) => {
             *guard = Some(Engine { stop, paused });
             Ok(())
         }
         Ok(Err(e)) => Err(e),
-        Err(_) => Err("唤醒引擎启动超时（麦克风或模型初始化卡住）".into()),
+        Err(_) => {
+            // 超时不代表后台线程失败了——但它可能稍后成功，留着会变成第二个引擎抢麦克风
+            stop.store(true, Ordering::SeqCst);
+            Err("唤醒引擎启动超时（25 秒）。模型首次加载或蓝牙设备枚举可能较慢，请再试一次".into())
+        }
     }
 }
 
@@ -441,13 +454,18 @@ fn build_engine(
     kw: PathBuf,
     threshold: f32,
 ) -> Result<(Spotter, KwStream, AudioHandle, Arc<Mutex<Vec<f32>>>, String), String> {
+    let t0 = std::time::Instant::now();
     let (spotter, stream) = unsafe { create_spotter(&dir, &kw, threshold)? };
+    wlog(&format!("[wake] spotter ready in {}ms", t0.elapsed().as_millis()));
 
     let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let host = cpal::default_host();
+    let t1 = std::time::Instant::now();
     let (name, device) = pick_input_device(&host).ok_or("没有可用的麦克风")?;
-    wlog(&format!("[wake] using device={name}"));
+    wlog(&format!("[wake] device picked in {}ms: {name}", t1.elapsed().as_millis()));
+    let t2 = std::time::Instant::now();
     let audio = start_capture(&device, buffer.clone())?;
+    wlog(&format!("[wake] capture ready in {}ms", t2.elapsed().as_millis()));
     Ok((spotter, stream, AudioHandle(audio), buffer, name))
 }
 
