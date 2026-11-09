@@ -79,6 +79,8 @@ import {
   buildSummaryMessages,
   parseSummaryResponse,
   completeOpenLoops,
+  sanitizeEphemeralTaskSummary,
+  expiredTaskNote,
   type ChatSummary,
 } from "./chatSummary";
 import { ToolLoopBudget, formatToolError, toolNames, truncateToolResult, validateToolArgs } from "./toolRuntime";
@@ -836,7 +838,11 @@ function personaContextBlock(): string {
 
 function loadChatSummary() {
   try {
-    chatSummary = normalizeChatSummary(JSON.parse(localStorage.getItem(SUMMARY_KEY) || "null"));
+    const raw = normalizeChatSummary(JSON.parse(localStorage.getItem(SUMMARY_KEY) || "null"));
+    // 迁移旧存档：几天前的「计时两分钟」如果还留在摘要正文/openLoops 里，会每轮
+    // 被注入 system prompt，模型就会反复把它当当前状态。加载时一次性清掉并落盘。
+    chatSummary = sanitizeEphemeralTaskSummary(raw);
+    if (chatSummary !== raw) saveChatSummary();
   } catch {
     chatSummary = emptyChatSummary();
   }
@@ -1928,6 +1934,17 @@ function cancelPendingConfirms() {
 }
 
 /** 清空左上角气泡区（关闭小助手模式时用） */
+/**
+ * 唤醒应答气泡：只弹一个 AI 气泡并自动淡出，**不写进聊天记录**。
+ * 唤醒是"她应你一声"，不该污染对话历史，也不该进入上下文。
+ */
+export function showWakeBubble(text: string, ms = 4000): void {
+  const b = addBubble("ai", text);
+  scheduleFade(b, ms);
+  positionBubbles();
+  repositionAssistantBubbles();
+}
+
 export function clearBubbles() {
   void invoke("debug_mark", { msg: `[bubble] clearBubbles from ${new Error().stack?.split("\n")[2]?.trim() ?? "?"}` }).catch(() => {});
   cancelPendingConfirms();
@@ -2190,9 +2207,12 @@ async function send(text: string) {
         : imgCapable === true
           ? `【生图能力】可以生图（模型：${imgModel || "自动识别"}）。用户要画图时调用 generate_image，生成后图片会自动存到他桌面。`
           : "【生图能力】还没确认这个端点支不支持生图。用户要画图时可以调用一次 generate_image；如果失败，就如实说明并告诉他怎么配（小助手 → 获取模型列表 / 生图模型）。";
+      const expiredNote = expiredTaskNote(history, Date.now());
       const extraCtxWithLang =
         buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") +
-        "\n\n" + imageCtx + "\n\n" + recentImageBlock() + "\n\n" + langInstruction;
+        "\n\n" + imageCtx + "\n\n" + recentImageBlock() +
+        (expiredNote ? "\n\n" + expiredNote : "") +
+        "\n\n" + langInstruction;
 
       const res = await chatStream(
         s.assistant.provider,

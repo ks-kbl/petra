@@ -55,6 +55,9 @@ release-package/
 # Tauri 打包资源（构建产物）
 src-tauri/resources/
 
+# sherpa-onnx 的运行时 DLL（体积大，用 scripts/fetch-sherpa.ps1 拉取）
+src-tauri/dlls/
+
 # release/ 目录只入库 latest.json（更新元数据），其余为构建产物
 release/*
 !release/latest.json

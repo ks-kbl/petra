@@ -238,6 +238,16 @@ export interface Settings {
      */
     micAllowed: boolean;
   };
+
+  /** 语音唤醒（本地 KWS，离线、不联网） */
+  wake: {
+    /** 总开关 */
+    enabled: boolean;
+    /** 唤醒词，多个用逗号/空格分隔（中英都行） */
+    words: string;
+    /** 触发阈值：0.1 最灵敏、0.9 最严格（默认 0.25） */
+    threshold: number;
+  };
 }
 
 const DEFAULTS: Settings = {
@@ -318,6 +328,11 @@ const DEFAULTS: Settings = {
     denoise: false,
     prefsV: 2,
     micAllowed: true,
+  },
+  wake: {
+    enabled: false,
+    words: "小肥鱼",
+    threshold: 0.15,
   },
 };
 
