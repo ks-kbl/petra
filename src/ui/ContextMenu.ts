@@ -15,6 +15,11 @@ export interface MenuItemSpec {
   control?: (row: HTMLElement) => void;
   /** 纯提示行：灰色小字、不可点击、不关闭菜单（例如待机时的"睡着啦，喊我起来吧"） */
   hint?: boolean;
+  /**
+   * 行内并排按钮组：整行切成左右两半，各自是一个独立按钮（例如「重启 | 退出」）。
+   * 用来把两个轻量动作压进一行，省一行高度；点哪个执行哪个，执行后菜单照常收起。
+   */
+  split?: { id: string; label: string; danger?: boolean; onPick?: () => void }[];
 }
 
 /**
@@ -72,6 +77,28 @@ export function setupContextMenu(
         container.appendChild(hint);
         continue;
       }
+      // 并排按钮行：一行放两个按钮（重启 | 退出），省掉一行的高度
+      if (item.split && item.split.length) {
+        const bar = document.createElement("div");
+        bar.className = "mi mi-split";
+        for (const act of item.split) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = `mi-split-btn${act.danger ? " is-danger" : ""}`;
+          btn.textContent = act.label;
+          btn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            hide("split");
+            act.onPick?.();
+          });
+          bar.appendChild(btn);
+        }
+        // 行本身不关菜单、不触发任何动作：只有两个按钮各自响应
+        bar.addEventListener("click", (ev) => ev.stopPropagation());
+        container.appendChild(bar);
+        continue;
+      }
+
       const row = document.createElement("div");
       row.className = `mi${item.danger ? " danger" : ""}${depth > 0 ? " mi-nested" : ""}`;
       if (depth > 0) row.style.paddingLeft = `${10 + depth * 12}px`;
