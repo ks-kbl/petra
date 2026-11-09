@@ -1,0 +1,5 @@
+
+# 唤醒词模型的词表/音素表必须是 LF：CRLF 会让 sherpa 解析 tokens.txt 失败
+src-tauri/kws-model/*.txt text eol=lf
+src-tauri/kws-model/en.phone text eol=lf
+src-tauri/kws-model/*.onnx binary

@@ -81,7 +81,12 @@ export function normalizeNudgeState(raw: unknown): NudgeState {
     lastAt: Number.isFinite(r.lastAt) ? Number(r.lastAt) : 0,
     day: typeof r.day === "string" ? r.day : "",
     countToday: Number.isFinite(r.countToday) ? Math.max(0, Number(r.countToday)) : 0,
-    lastLoop: typeof r.lastLoop === "string" ? r.lastLoop : undefined,
+    // 旧存档里的 lastLoop 可能正是「计时两分钟」这类短时任务：加载时清掉，
+    // 避免下一次 nudge 又把它当旧事提出来。
+    lastLoop:
+      typeof r.lastLoop === "string" && !isEphemeralTaskLoop(r.lastLoop)
+        ? r.lastLoop
+        : undefined,
   };
 }
 

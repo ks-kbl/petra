@@ -50,6 +50,7 @@ export function normalizeChatSummary(raw: unknown): ChatSummary {
 export interface MinimalMessage {
   role: string;
   content?: string | null;
+  ts?: number;
 }
 
 /**
@@ -144,12 +145,12 @@ export function parseSummaryResponse(
   body = lines.join("\n").trim();
   if (body.length < 10) return null;
   if (body.length > 600) body = body.slice(0, 600) + "…";
-  return {
+  return sanitizeEphemeralTaskSummary({
     text: body,
     coveredCount,
     updatedAt: now,
     openLoops: openLoops.slice(0, 6),
-  };
+  });
 }
 
 /**
@@ -197,6 +198,69 @@ export function completeOpenLoops(
   return { ...base, openLoops: kept.slice(0, 6), updatedAt: Date.now() };
 }
 
+/**
+ * 扫一遍近期历史，给模型一条"这些旧任务已经过期"的提示。
+ *
+ * 只靠摘要清理还不够：如果几天前的「倒计时两分钟」仍落在最近 120 条窗口里，
+ * 模型会直接读到原文并继续提。这里把超过 6 小时的任务类消息摘出来，明确告诉模型
+ * 它们不是当前任务；用户明确问起时仍可通过 search_chat_history 查原文。
+ */
+export function expiredTaskNote(
+  messages: MinimalMessage[],
+  now: number = Date.now(),
+  maxAgeMs: number = 6 * 60 * 60 * 1000,
+): string {
+  const taskRe = /(计时|倒计时|定时|提醒|闹钟|分钟后|小时后|秒后|时间到了|待办)/;
+  const cutoff = now - Math.max(0, maxAgeMs);
+  const hits: string[] = [];
+  for (const m of messages || []) {
+    if (m.role !== "user" && m.role !== "assistant") continue;
+    const text = (m.content || "").trim();
+    if (!text || !taskRe.test(text)) continue;
+    const ts = Number(m.ts) || 0;
+    // ts=0 是旧版无时间戳数据，按"很久以前"处理
+    if (ts > 0 && ts >= cutoff) continue;
+    const brief = text.replace(/\s+/g, " ").slice(0, 60);
+    if (!hits.includes(brief)) hits.push(brief);
+    if (hits.length >= 3) break;
+  }
+  if (!hits.length) return "";
+  return (
+    "【过期旧任务，不是当前状态】\n" +
+    hits.map((h, i) => `${i + 1}. ${h}`).join("\n") +
+    "\n这些是历史里已经结束/过期的任务。除非用户明确问起旧事，否则不要把它们当成当前正在做的事，也不要主动复述。"
+  );
+}
+
+/**
+ * 清掉摘要里已经过期的短时任务（计时/提醒/闹钟/待办）。
+ *
+ * 用户实测：几天前让它「倒计时两分钟」，之后每次聊天模型还在说这件事。
+ * 原因是旧摘要的正文里一直留着这句话，而不是只存在 openLoops 里。
+ * 这里做一次迁移：删掉含短时任务词的句子和 openLoops；如果删空了就整份摘要失效，
+ * 让后续从完整历史重新生成，避免旧任务永久污染上下文。
+ */
+export function sanitizeEphemeralTaskSummary(summary: ChatSummary | null | undefined): ChatSummary {
+  const base = summary ?? emptyChatSummary();
+  const taskRe = /(计时|倒计时|定时|提醒|闹钟|分钟后|小时后|秒后|时间到了|待办)/;
+  const loops = (base.openLoops ?? []).filter((x) => x && !taskRe.test(x));
+  let text = base.text || "";
+  let removed = false;
+  if (taskRe.test(text)) {
+    const parts = text.split(/(?<=[。！？!?；;\n])/);
+    const kept = parts.filter((p) => !taskRe.test(p));
+    const next = kept.join("").trim();
+    removed = next !== text;
+    text = next;
+  }
+  if (removed && text.length < 4) {
+    // 整份摘要几乎只剩旧任务：直接失效，让 updateChatSummary 从历史重建
+    return { ...emptyChatSummary(), updatedAt: Date.now() };
+  }
+  if (!removed && loops.length === (base.openLoops ?? []).length) return base;
+  return { ...base, text, openLoops: loops.slice(0, 6), updatedAt: Date.now() };
+}
+
 /** 注入 system prompt 的文本块（无内容时返回空串） */
 export function summaryBlock(summary: ChatSummary | null | undefined): string {
   const text = summary?.text?.trim();
@@ -204,6 +268,7 @@ export function summaryBlock(summary: ChatSummary | null | undefined): string {
   return (
     "【更早的对话（你们之前聊过，细节你已经记不清了）】\n" +
     text +
-    "\n【怎么用】需要的时候自然接上（「你之前说…」），不要提「摘要」「记录」这类说法，也不要逐条复述。"
+    "\n【怎么用】需要的时候自然接上（「你之前说…」），不要提「摘要」「记录」这类说法，也不要逐条复述。" +
+    "\n【重要】这只是历史摘要，不是当前正在进行的任务。里面提到计时、提醒、待办、几分钟后之类的内容时，一律按已经过期的旧事处理；除非用户明确问起，否则不要把它当成当前状态说出来。"
   );
 }

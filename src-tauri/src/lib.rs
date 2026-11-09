@@ -91,6 +91,9 @@ mod files;
 // 页面本体是 src-tauri/panel/index.html，用 include_str! 编进二进制。
 mod panel;
 
+// 唤醒词（KWS）：本地监听 + 命中后 emit petra://wake。模型在 resources/kws。
+mod wake;
+
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -6334,6 +6337,7 @@ pub fn run() {
             register_assistant_shortcut, unregister_assistant_shortcut, capture_hotkey,
             tts_synthesize, set_tts_key, get_tts_key,
             asr_transcribe, set_asr_key, get_asr_key, asr_key_ready, asr_model_name, asr_key_info,
+            wake::wake_selftest, wake::wake_encode, wake::wake_start, wake::wake_stop, wake::wake_set_paused,
             register_voice_shortcut, unregister_voice_shortcut, save_desktop_image,
             save_image_from_url, copy_to_desktop, read_image_data_url, http_post_json,
             read_file_text_plain,

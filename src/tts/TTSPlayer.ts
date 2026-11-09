@@ -17,6 +17,8 @@ class TTSPlayer {
   private stopped = false;
   private skipSource = false;
   private idleCallbacks: (() => void)[] = [];
+  /** 唤醒词监听在 TTS 播放期间要暂停，避免把自己说的话当成唤醒词 */
+  private wakeResumeTimer: number | null = null;
   muted = false;
   /**
    * 正在播的那一段。
@@ -28,6 +30,25 @@ class TTSPlayer {
   private current: HTMLAudioElement | null = null;
 
   onIdle(cb: () => void) { this.idleCallbacks.push(cb); }
+
+  /**
+   * 播报期间暂停本地唤醒词监听（播完再等 300ms 恢复，躲开混响尾音）。
+   * 只调 Rust 的开关，不碰音频链路；唤醒没开时这两个 invoke 也是空转，无副作用。
+   */
+  private setWakePaused(paused: boolean) {
+    try {
+      if (paused) {
+        if (this.wakeResumeTimer) { window.clearTimeout(this.wakeResumeTimer); this.wakeResumeTimer = null; }
+        void invoke("wake_set_paused", { paused: true }).catch(() => {});
+      } else {
+        if (this.wakeResumeTimer) window.clearTimeout(this.wakeResumeTimer);
+        this.wakeResumeTimer = window.setTimeout(() => {
+          this.wakeResumeTimer = null;
+          void invoke("wake_set_paused", { paused: false }).catch(() => {});
+        }, 300);
+      }
+    } catch { /* 忽略：唤醒功能没启用时不影响朗读 */ }
+  }
 
   /**
    * 现在有没有声音正在播。
@@ -153,6 +174,7 @@ class TTSPlayer {
 
     // 队列空了 → 通知"这一段说完了"（气泡的消失时机挂在这里）
     if (this.queue.length === 0) {
+      this.setWakePaused(false);
       if (this.idleCallbacks.length > 0) {
         const cbs = this.idleCallbacks;
         this.idleCallbacks = [];
@@ -173,6 +195,7 @@ class TTSPlayer {
     // 合成失败的那句（catch 里也标了 ready）：跳过它，接着按顺序往下播
     if (!audio) { this.pump(); return; }
 
+    this.setWakePaused(true);
     this.speaking = true;
     this.current = audio;
     audio.volume = this.muted ? 0 : 1;

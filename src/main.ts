@@ -123,7 +123,7 @@ import { loadSettings, saveSettings as saveSettingsRaw, composePersona, type Set
 import { OUTPUT_LANGUAGE_OPTIONS } from "./utils/outputLanguage";
 import { ACTIVITY_LABEL, nextActivity, type ActivityLevel } from "./utils/settings";
 import { astrobotOn } from "./bridges/astrobot";
-import { openAssistant, repositionAssistantBubbles } from "./assistant/AssistantPanel";
+import { openAssistant, repositionAssistantBubbles, showWakeBubble } from "./assistant/AssistantPanel";
 import { pluginRuntime, configurePluginHost } from "./plugins/runtime";
 import { setLifecycle, triggerProactive, closeAssistant, clearBubbles, clearApiKeyCache, clearHistory, isAssistantBusy, sayPetLine, setModelRectProvider, fitBubbleHeights, rearmIdleTimer } from "./assistant/AssistantPanel";
 import { getSpeechRecognizer } from "./asr/SpeechRecognizer";
@@ -1303,6 +1303,12 @@ async function setupAssistantHotkeyListener() {
     await registerAssistantHotkey(saved);
   }
 
+  // ===== 语音唤醒（本地 KWS，离线）=====
+  // 需求：喊一声就把桌宠叫出来，第一时间回「我在」（本地合成，不调 API），
+  // 临时置顶但**不抢键盘焦点**；播语音期间暂停 KWS，避免自己唤醒自己。
+  await listen<string>("petra://wake", () => { void onWakeWord(); });
+  void applyWakeSettings();
+
   // 语音输入快捷键：按下直接在麦克风上说话，说完自动发送
   await listen("voice-hotkey", async () => {
     const s = loadSettings();
@@ -1689,6 +1695,7 @@ async function boot() {
   // 控制面板改参数 → Rust 深合并后 emit 回来，这里应用到运行中的桌宠
   void listen<{ patch: Record<string, unknown> }>("panel:apply", (e) => {
     void applyPanelPatch(e.payload?.patch ?? {});
+    void applyWakeSettings();
   });
   // 控制面板点功能按钮 → 直接跑右键菜单里同一个 onPick
   void listen<{ id: string; payload?: unknown }>("panel:action", (e) =>
@@ -2223,6 +2230,181 @@ function showAnnouncement(title: string, lines: string[], version: string) {
       if (w.__tickMs.length > 400) w.__tickMs.shift();
     }
   });
+}
+
+// ===== 语音唤醒实现 =====
+/** 自检进行中：只统计命中，不触发真正的唤醒动作 */
+let wakeTestRunning = false;
+
+/** 20 秒自检：数命中次数，给出「阈值该往哪调」的建议。 */
+async function runWakeSelfTest(): Promise<void> {
+  const s = loadSettings();
+  const words = (s.wake?.words || "")
+    .split(/[,，\s]+/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+  if (!s.wake?.enabled) {
+    toast("先打开「开启语音唤醒」再测试", "warn");
+    return;
+  }
+  if (words.length === 0) {
+    toast("先在设置里填唤醒词", "warn");
+    return;
+  }
+  wakeTestRunning = true;
+  let hits = 0;
+  let lastAt = 0;
+  const off = await listen<string>("petra://wake", () => {
+    const now = Date.now();
+    if (now - lastAt > 800) {
+      lastAt = now;
+      hits += 1;
+    }
+  });
+  toast("测试开始：20 秒内自然念 5 次唤醒词", "info");
+  await new Promise((r) => setTimeout(r, 20000));
+  off();
+  wakeTestRunning = false;
+  const advice =
+    hits >= 4
+      ? "很稳，不用调"
+      : hits >= 2
+        ? "偏少：灵敏度往低调 0.05（更灵敏）再试"
+        : "太少：调到 0.10~0.15；还不行就检查麦克风是否被静音";
+  toast(`20 秒内命中 ${hits} 次 —— ${advice}`, hits >= 4 ? "info" : "warn");
+}
+
+const WAKE_REPLIES = ["我在", "嗯？在呢", "叫我？"];
+let wakeRestoreTimer: number | null = null;
+
+/** 按设置启动/停止本地唤醒词监听。 */
+async function applyWakeSettings(): Promise<void> {
+  const s = loadSettings();
+  const words = (s.wake?.words || "")
+    .split(/[,，\s]+/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+  if (!s.wake?.enabled || !s.assistant?.enabled || words.length === 0) {
+    void invoke("wake_stop").catch(() => {});
+    return;
+  }
+  try {
+    await invoke("wake_start", { words, threshold: s.wake.threshold });
+    // 把编码结果打到控制台，方便排查「词编不进词表」这类问题
+    void invoke<string>("wake_encode", { words })
+      .then((enc) => console.info("[wake] 关键词编码：\n" + enc))
+      .catch(() => {});
+    toast(`语音唤醒已开启：${words.join(" / ")}`, "info");
+    void prepareWakeAudio();
+  } catch (e) {
+    toast(`语音唤醒启动失败：${String(e)}`, "warn");
+  }
+}
+
+/** 唤醒语缓存：用用户自己的火山音色预生成，唤醒时直接播本地音频，0 网络延迟。 */
+function wakeCacheKey(voiceId: string, text: string): string {
+  return `petra-wake-audio:${voiceId}:${text}`;
+}
+
+/** 后台把所有唤醒语用专属音色合成一遍并落到 localStorage（失败静默，回头用系统音兜底）。 */
+async function prepareWakeAudio(): Promise<void> {
+  const s = loadSettings();
+  if (!s.tts?.enabled || !s.tts.speakerId) return;
+  const voice = s.tts.speakerId;
+  const apiKey = await invoke<string>("get_tts_key").catch(() => "");
+  for (const text of WAKE_REPLIES) {
+    if (localStorage.getItem(wakeCacheKey(voice, text))) continue;
+    try {
+      const base64 = await invoke<string>("tts_synthesize", {
+        apiKey,
+        speaker: voice,
+        text,
+        language: s.assistant.outputLanguage || undefined,
+      });
+      if (base64) localStorage.setItem(wakeCacheKey(voice, text), base64);
+    } catch (e) {
+      console.warn("[wake] 预生成唤醒语失败，先用系统音兜底:", e);
+      return;
+    }
+  }
+}
+
+/** 播一条缓存好的唤醒语；没有缓存就返回 false 交给系统音兜底。 */
+function playCachedWakeReply(text: string): boolean {
+  const s = loadSettings();
+  const voice = s.tts?.speakerId || "";
+  const base64 = voice ? localStorage.getItem(wakeCacheKey(voice, text)) : null;
+  if (!base64) return false;
+  try {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mp3" }));
+    const audio = new Audio(url);
+    void invoke("wake_set_paused", { paused: true }).catch(() => {});
+    const resume = () => {
+      URL.revokeObjectURL(url);
+      window.setTimeout(() => void invoke("wake_set_paused", { paused: false }).catch(() => {}), 300);
+    };
+    audio.onended = resume;
+    void audio.play().catch(resume);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 本地合成一句短回应：不联网、不走火山，几十毫秒出声。 */
+function speakLocal(text: string): void {
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "zh-CN";
+    u.rate = 1.05;
+    window.speechSynthesis.cancel();
+    void invoke("wake_set_paused", { paused: true }).catch(() => {});
+    u.onend = () => window.setTimeout(() => void invoke("wake_set_paused", { paused: false }).catch(() => {}), 300);
+    window.speechSynthesis.speak(u);
+  } catch {
+    /* 系统没有语音合成时静默跳过，气泡照常显示 */
+  }
+}
+
+/** 唤醒：显示 + 临时置顶（不抢焦点）+ 立刻回应 + 打开输入框。 */
+async function onWakeWord(): Promise<void> {
+  if (wakeTestRunning) return; // 自检期间只计数，不弹面板
+  const s = loadSettings();
+  if (!s.assistant.enabled) return;
+  const win = getCurrentWindow();
+  try {
+    // ① 从「隐藏」恢复：菜单里的隐藏走 Rust 的 hide_pet，单纯 win.show() 不一定能还原
+    await invoke("show_pet").catch(() => {});
+    // ② 待机模式（沉到屏幕边缘）要先醒过来，否则人在这儿但看不见
+    if (loadSettings().idleMode) {
+      const st = loadSettings();
+      st.idleMode = false;
+      saveSettings(st);
+      await applyIdleState();
+    }
+    // ③ 显示 + 临时置顶 + 保证在屏幕内（复用「把桌宠叫到前面」那套逻辑）
+    await win.show().catch(() => {});
+    await ensurePetVisible();
+    const wasTop = await win.isAlwaysOnTop().catch(() => false);
+    if (!wasTop) {
+      if (wakeRestoreTimer) window.clearTimeout(wakeRestoreTimer);
+      wakeRestoreTimer = window.setTimeout(() => {
+        void invoke("set_topmost", { on: false, persist: false }).catch(() => {});
+        wakeRestoreTimer = null;
+      }, 8000);
+    }
+  } catch {
+    /* 显示/置顶失败不影响唤醒回应 */
+  }
+  // 只出声、不弹文字气泡：优先用用户自己的音色（预生成缓存），没有才退回系统音
+  const reply = WAKE_REPLIES[Math.floor(Math.random() * WAKE_REPLIES.length)];
+  // 文字气泡和语音同时出现（气泡不写入聊天记录，只是"应一声"）
+  showWakeBubble(reply);
+  if (!playCachedWakeReply(reply)) speakLocal(reply);
+  void openAssistant(getModelRect());
 }
 
 async function currentLogicalPos(win: Awaited<ReturnType<typeof getCurrentWindow>>) {
@@ -3220,6 +3402,13 @@ function buildMenu(engine: BehaviorEngine, opts?: { ignoreIdle?: boolean }): Men
       onPick: async () => {
         const savedKey = await invoke<string>("get_tts_key").catch(() => "");
         showTtsDialog(savedKey);
+      },
+    },
+    {
+      id: "wake-test",
+      label: "测试唤醒",
+      onPick: () => {
+        void runWakeSelfTest();
       },
     },
     {
