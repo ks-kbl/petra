@@ -42,7 +42,8 @@ import {
   type MoodSample,
 } from "./moodTrend";
 import { detectCorrection } from "./correction";
-import { generateImage, listImageModels } from "./AssistantClient";
+import { generateImage, listImageModelsSafe } from "./AssistantClient";
+import { resolveImageBase, imageKeyScope, imagePresetKeyScope, currentImageKeyScope, defaultImageModels, isImageConfigured } from "./imageProviders";
 import { hasSendableContent, composeUserMessage } from "./sendCompose";
 import {
   emptySelfState,
@@ -503,6 +504,53 @@ export function clearApiKeyCache() {
   apiKeyLoaded = false;
   apiKeyCache = "";
   apiKeyScope = "";
+}
+
+/**
+ * 生图接入的 Key：走**独立槽位** `image:<provider>`，和对话模型的 Key 互不覆盖。
+ * 缓存按槽位名区分，换了生图供应商要重新取。
+ */
+let imageKeyCache = "";
+let imageKeySlot = "";
+async function ensureImageKey(): Promise<string> {
+  const img = loadSettings().assistant.image;
+  if (!img || !img.provider) return "";
+  const slot = currentImageKeyScope(img);
+  if (imageKeySlot === slot) return imageKeyCache;
+  imageKeyCache = await getApiKey(slot);
+  // 预设刚建好、Key 还挂在旧的按供应商槽位上：回读一次，用户就不用重贴
+  if (!imageKeyCache && img.activePresetId) {
+    imageKeyCache = await getApiKey(imageKeyScope(img.provider));
+    if (imageKeyCache) {
+      await invoke("set_api_key", { scope: imagePresetKeyScope(img.activePresetId), apiKey: imageKeyCache }).catch(() => {});
+    }
+  }
+  imageKeySlot = slot;
+  return imageKeyCache;
+}
+
+/** 面板/设置改了生图 Key 之后调用，保证下次取到新的 */
+export function clearImageKeyCache() {
+  imageKeyCache = "";
+  imageKeySlot = "";
+}
+
+/**
+ * 这套生图配置现在能不能真的画。
+ * 和旧的 imageCapable 不同：不是"猜端点有没有生图模型"，而是"有没有配独立的生图接入 + 有没有 Key"。
+ */
+async function imageReadyState(): Promise<{ ready: boolean; model: string; reason: string }> {
+  const st = loadSettings();
+  // 总开关优先：关掉了就当作"没有生图能力"，哪怕配置还在
+  if (st.assistant.imageEnabled === false) return { ready: false, model: "", reason: "disabled" };
+  const img = st.assistant.image;
+  if (!isImageConfigured(img)) return { ready: false, model: "", reason: "unconfigured" };
+  const key = await ensureImageKey();
+  const cfg = img!;
+  // 自定义端点必须自己填 Key 吗？指向本机的端点也允许空 Key（与对话那边一致）
+  const lookLocal = cfg.provider === "custom" && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:\/]|$)/i.test(cfg.customBaseUrl || "");
+  if (!key && !lookLocal) return { ready: false, model: cfg.model || "", reason: "nokey" };
+  return { ready: true, model: cfg.model || defaultImageModels(cfg.provider)[0] || "", reason: "ok" };
 }
 
 /** 小助手是否正在对话中（麻将 AI 点评用：正忙就跳过，避免抢话） */
@@ -2234,6 +2282,8 @@ async function send(text: string) {
     // **不设轮数/次数上限**（用户要求取消工具调用上限）：靠"模型不再发起工具调用"自然结束。
     // 仍保留同参数重复调用的提醒（ToolLoopBudget.noteCall），那是提示，不拦执行。
     const budget = new ToolLoopBudget({ maxRounds: Infinity, maxCalls: Infinity });
+    // 生图是否就绪（独立接入 + Key）只在这一轮开始时查一次，别每轮重复打 IPC
+    const imgState = await imageReadyState();
     let finished = false;
     let streamEmo: EmotionTag = "neutral";
     while (budget.nextRound()) {
@@ -2242,14 +2292,15 @@ async function send(text: string) {
       const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
       const personaWithLang = s.assistant.persona;
-      // 生图能力要和模型说清楚：不支持时**当场如实说明**，别硬调工具再报"接口没连上"
-      const imgModel = (s.assistant.imageModel || "").trim();
-      const imgCapable = s.assistant.imageCapable;
-      const imageCtx = imgCapable === false
-        ? "【生图能力】当前接入的模型/端点**不能生图**。用户让你画图时，直接用一句话说清楚：你这个模型不支持生图（或这个接口没接生图模型），并告诉他到「控制面板 → 小助手 → 获取模型列表」配一个生图模型（如 gpt-image-2）或换支持生图的供应商。不要假装在画，也不要调用 generate_image。"
-        : imgCapable === true
-          ? `【生图能力】可以生图（模型：${imgModel || "自动识别"}）。用户要画图时调用 generate_image，生成后图片会自动存到他桌面。`
-          : "【生图能力】还没确认这个端点支不支持生图。用户要画图时可以调用一次 generate_image；如果失败，就如实说明并告诉他怎么配（小助手 → 获取模型列表 / 生图模型）。";
+      // 生图能力要和模型说清楚：没配生图接入就**当场如实说明**，别硬调工具再报"接口没连上"。
+      // 生图现在是独立接入（自己的供应商/端点/Key），不再看对话端点"像不像能画图"。
+      const imageCtx = imgState.ready
+        ? `【生图能力】可以生图（生图模型：${imgState.model || "未指定"}）。用户要画图时调用 generate_image，生成后图片会自动存到他桌面；prompt 要写得具体（主体/风格/构图/光线）。`
+        : imgState.reason === "disabled"
+          ? "【生图能力】用户**把生图功能关掉了**（总开关）。用户让你画图时，直接用一句话说清楚：生图功能现在是关着的，想画的话去「控制面板 → 小助手 → 生图模型接入」把开关打开。不要假装在画，也不要调用 generate_image。"
+          : imgState.reason === "nokey"
+          ? "【生图能力】生图接入已选好供应商，但**还没填生图模型的 Key**。用户让你画图时，直接用一句话说清楚：生图还没配 Key，让他去「控制面板 → 小助手 → 生图模型接入」粘贴 Key。不要假装在画，也不要调用 generate_image。"
+          : "【生图能力】**没有接入生图模型**（生图是独立接入，和对话模型分开）。用户让你画图时，直接用一句话说清楚：现在还不能画图，让他去「控制面板 → 小助手 → 生图模型接入」选个供应商、填 Key、获取模型列表。不要假装在画，也不要调用 generate_image。";
       const expiredNote = expiredTaskNote(history, Date.now());
       const extraCtxWithLang =
         buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") +
@@ -2278,8 +2329,8 @@ async function send(text: string) {
         {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
           ...(imagesForTurn.length ? { userImages: imagesForTurn } : {}),
-          // 明确不支持生图时干脆不暴露这个工具，模型就不会"先调一下试试"再报错
-          ...(s.assistant.imageCapable === false ? { disabledTools: ["generate_image"] } : {}),
+          // 没接入生图（或没填 Key）时干脆不暴露这个工具，模型就不会"先调一下试试"再报错
+          ...(imgState.ready ? {} : { disabledTools: ["generate_image"] }),
           extraTools: pluginRuntime.getOpenAITools(),
           // 画像 + 最近情绪只走 system prompt：模型知道"这是什么样的人、最近过得怎样"，
           // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
@@ -2736,76 +2787,86 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     // 模型名：用户填过就用用户的；没填就从 /models 里自动识别（并存下来，下次直接用）
     if (tc.name === "generate_image") {
       const st = loadSettings();
-      let model = (st.assistant.imageModel || "").trim();
+      const cfg = st.assistant.image;
+      // 生图是独立接入：用自己的供应商 / 端点 / Key / 模型，和对话模型完全分开
+      const noImageHint = "请到「控制面板 → 小助手 → 生图模型接入」选一个生图供应商、粘贴 Key、点「获取生图模型列表」。";
+      if (!isImageConfigured(cfg)) {
+        pushHistory({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: `现在还没接入生图模型（生图和对话是分开配的），不能画图。${noImageHint}请如实告诉用户，不要说自己正在画。`,
+        });
+        return;
+      }
+      const imgCfg = cfg!;
       try {
-        const key = await ensureApiKey();
-        // 不管有没有填过，都拿一份站点里的生图模型清单当备选：
-        // 中转站的 /models 会把"没开通渠道"的模型也列出来，第一个调不通就换下一个。
-        const found = await listImageModels(st.assistant.provider, key, st.assistant.customBaseUrl);
-        if (!model && found.length) model = found[0];
+        const key = await getApiKey(currentImageKeyScope(imgCfg));
+        const base = resolveImageBase(imgCfg.provider, imgCfg.customBaseUrl);
+        // 站点里真实存在的生图模型当备选（中转站会把"没开通渠道"的也列出来，
+        // 第一个调不通就换下一个）；拉不到就用该供应商的内置默认清单。
+        const listed = await listImageModelsSafe(base, key);
+        const defaults = defaultImageModels(imgCfg.provider);
+        let model = (imgCfg.model || "").trim() || listed[0] || defaults[0] || "";
         if (!model) {
-          // 明确记下来：这个端点没有生图能力，之后的对话直接告诉用户、也不再暴露工具
-          st.assistant.imageCapable = false;
-          saveSettings(st);
           pushHistory({
             role: "tool",
             tool_call_id: tc.id,
-            content:
-              `当前对话模型（${st.assistant.model || "默认模型"}）不能生图：这个端点没有可用的生图模型。`
-              + "请到「控制面板 → 小助手 → 获取模型列表」配一个生图模型（如 gpt-image-2），或换一个支持生图的供应商。"
-              + "请如实告诉用户这一点，不要说自己正在画。",
+            content: `生图接入还没有可用的模型名：这个站点没返回生图模型列表。${noImageHint}请如实告诉用户，不要假装在画。`,
           });
-        } else {
-          const ctrl = new AbortController();
-          const stopProgress = startGenProgress(loading, () => ctrl.abort());
-          let img;
-          try {
-            img = await generateImage({
-              provider: st.assistant.provider,
-              apiKey: key,
-              customBaseUrl: st.assistant.customBaseUrl,
-              model,
-              fallbackModels: found,
-              prompt: String(tc.args.prompt || ""),
-              size: tc.args.size ? String(tc.args.size) : undefined,
-              signal: ctrl.signal,
-            });
-          } finally {
-            stopProgress();
-          }
-          // 自动换过模型要说一声，否则用户不知道"我选的模型没生效"
-          if (model && img.model !== model) {
-            toast(`模型 ${model} 画不了，已自动换成 ${img.model}`, "info");
-          }
-          // 记住"真正画成功"的那个模型，下次直接用，不再挨个试
-          if (img.model && img.model !== st.assistant.imageModel) {
-            st.assistant.imageModel = img.model;
-            saveSettings(st);
-          }
-          // base64 直接写；只回 url 的交给 Rust 下载（网页里 fetch 对象存储会 Failed to fetch）
-          const path = img.base64
-            ? await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 })
-            : await invoke<string>("save_image_from_url", { url: img.url ?? "", nameHint: "" });
-          rememberGenImage({ path, prompt: String(tc.args.prompt || ""), model: img.model, ts: Date.now() });
-          pushHistory({ role: "tool", tool_call_id: tc.id, content: `已用 ${img.model} 生成图片并保存到桌面：${path}` });
-          toast(`画好了（${img.model}），已存到桌面：${path}`, "info");
-          void addImageBubble(path);
+          return;
         }
+        const fallback = [...new Set([...listed, ...defaults])].filter((m) => m && m !== model);
+        const ctrl = new AbortController();
+        const stopProgress = startGenProgress(loading, () => ctrl.abort());
+        let img;
+        try {
+          img = await generateImage({
+            base,
+            apiKey: key,
+            model,
+            fallbackModels: fallback,
+            prompt: String(tc.args.prompt || ""),
+            size: tc.args.size ? String(tc.args.size) : undefined,
+            signal: ctrl.signal,
+          });
+        } finally {
+          stopProgress();
+        }
+        // 自动换过模型要说一声，否则用户不知道"我选的模型没生效"
+        if (model && img.model !== model) {
+          toast(`模型 ${model} 画不了，已自动换成 ${img.model}`, "info");
+        }
+        // 记住"真正画成功"的那个模型，下次直接用，不再挨个试
+        if (img.model && img.model !== imgCfg.model) {
+          const fresh = loadSettings();
+          fresh.assistant.image = { ...(fresh.assistant.image ?? imgCfg), model: img.model };
+          saveSettings(fresh);
+        }
+        // base64 直接写；只回 url 的交给 Rust 下载（网页里 fetch 对象存储会 Failed to fetch）
+        const path = img.base64
+          ? await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 })
+          : await invoke<string>("save_image_from_url", { url: img.url ?? "", nameHint: "" });
+        rememberGenImage({ path, prompt: String(tc.args.prompt || ""), model: img.model, ts: Date.now() });
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: `已用 ${img.model} 生成图片并保存到桌面：${path}` });
+        toast(`画好了（${img.model}），已存到桌面：${path}`, "info");
+        void addImageBubble(path);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         if (/abort/i.test(msg)) {
           pushHistory({ role: "tool", tool_call_id: tc.id, content: "用户取消了这次生图，什么都没生成。" });
           return;
         }
-        // 端点根本没有 /images/generations：这是"能力问题"，不是临时故障
-        if (/HTTP\s*(404|405)|不支持生图|not support/i.test(msg)) {
-          st.assistant.imageCapable = false;
-          saveSettings(st);
-        }
+        // 401/403 是 Key 问题、404/405 是端点没有生图接口 —— 两种给的建议不一样
+        const isAuth = /HTTP\s*(401|403)|无效的令牌|Unauthorized|invalid_api_key/i.test(msg);
+        const isNoApi = /HTTP\s*(404|405)|不支持生图|not support/i.test(msg);
         pushHistory({
           role: "tool",
           tool_call_id: tc.id,
-          content: `生图失败：${msg}${/HTTP\s*(404|405)/.test(msg) ? "（这个端点没有生图接口，属于能力不支持；请如实告诉用户，并告诉他去配一个支持生图的供应商）" : ""}`,
+          content:
+            `生图失败：${msg}`
+            + (isAuth ? "（这是生图 Key 的问题：去「控制面板 → 小助手 → 生图模型接入」重新粘贴 Key）" : "")
+            + (isNoApi ? "（这个端点没有 /images/generations，属于生图接入配错了；请让用户换一个生图供应商或中转站）" : "")
+            + "请如实告诉用户，不要假装画出来了。",
         });
       }
     }

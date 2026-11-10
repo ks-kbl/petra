@@ -514,6 +514,8 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
 
   // 面板上 assistant 的 Key 输入框（用户常粘完直接点「获取模型列表」，没点保存）
   let pendingAssistantKeyInput = null;
+  /** 生图接入的 Key 输入框（「获取生图模型列表」会把它带到桌宠那边） */
+  let pendingImageKeyInput = null;
 
   const params = new URLSearchParams(location.search);
   const state = { settings: {}, meta: {}, seq: 0, online: false, section: params.get("s") || "overview", timer: null, lastCommitAt: 0 };
@@ -678,12 +680,12 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { path: "assistant.provider", label: "供应商", type: "select", options: "providers" },
             { path: "assistant.model", label: "模型", type: "text", placeholder: "留空则使用供应商默认模型" },
             { path: "assistant.customBaseUrl", label: "自定义接口地址", type: "text", placeholder: "仅选择自定义供应商时填写" },
-            { path: "assistant.imageModel", label: "生图模型", type: "text", placeholder: "留空 = 自动识别（拉一次模型列表就会自动填上）" },
             { type: "actions", items: [{ id: "__data:models-fetch", label: "获取模型列表", passKey: true }] },
             { type: "secret", key: "assistant", label: "API Key", desc: "填写时不会显示，填写后覆盖当前预设设置" },
             { type: "usage" },
           ],
         },
+        { title: "生图模型接入", desc: "", type: "imageaccess" },
         { title: "不会接 API？", desc: "", type: "promo" },
         { title: "最近生成的图", desc: "", type: "genimages" },
         { title: "预设", desc: "", type: "presets" },
@@ -858,6 +860,10 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     if (spec.options === "providers") {
       const ps = (state.meta.providers || []);
       return ps.map((p) => [p.id, p.label]);
+    }
+    // 生图供应商是另一张表（和对话分开选）
+    if (spec.options === "imageProviders") {
+      return (state.meta.imageProviders || []).map((p) => [p.id, p.label]);
     }
     if (spec.options === "languages") {
       return [["", "自动（中文）"], ...((state.meta.languages || []))];
@@ -1103,6 +1109,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       inputRow.appendChild(inp);
       // 记住输入框：面板上的「获取模型列表」会把它带过去（用户常常粘完 Key 直接点获取）
       if (spec.key === "assistant") pendingAssistantKeyInput = inp;
+      if (spec.key === "image") pendingImageKeyInput = inp;
       const save = el("button", "btn btn-sm btn-primary", configured ? "更新" : "保存");
       save.onclick = () => runAction(`__key:${spec.key}`, { value: inp.value });
       inputRow.appendChild(save);
@@ -1192,8 +1199,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
         const b = el("button", "btn btn-sm" + (it.primary ? " btn-primary" : ""), it.label);
         b.onclick = () => {
           // passKey：把 Key 输入框里**还没保存**的内容一起带过去（常见操作：粘完直接点获取）
-          const payload = it.passKey && pendingAssistantKeyInput
-            ? { key: pendingAssistantKeyInput.value.trim() }
+          const keyInput = it.passKeyImage ? pendingImageKeyInput : pendingAssistantKeyInput;
+          const payload = it.passKey && keyInput
+            ? { key: keyInput.value.trim() }
             : it.label;
           runAction(it.id, payload);
         };
@@ -1269,6 +1277,27 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
         }
         return wrap;
       }
+      // 生图模型这一栏同理：拉过一次后点芯片直接填
+      if (spec.path === "assistant.image.model") {
+        const models = ((state.meta.image || {}).models) || [];
+        const wrap = el("div", "modelwrap");
+        wrap.appendChild(row);
+        if (models.length) {
+          wrap.appendChild(el("div", "rdesc", `已获取 ${models.length} 个生图模型，点击以填入：`));
+          const chips = el("div", "modelpick");
+          models.forEach((mm) => {
+            const chip = el("button", "mchip" + ((cur ?? "") === mm ? " on" : ""), mm);
+            chip.onclick = () => {
+              inp.value = mm;
+              commit(spec.path, mm, 0);
+              renderSection();
+            };
+            chips.appendChild(chip);
+          });
+          wrap.appendChild(chips);
+        }
+        return wrap;
+      }
     } else if (spec.type === "textarea") {
       const ta = document.createElement("textarea");
       ta.rows = spec.rows || 5;
@@ -1301,10 +1330,15 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       const opts = optionsOf(spec);
       // 存档里的值可能已经不在候选里（比如换过供应商），补一个当前值，别让选择框显示成空白
       if (cur != null && cur !== "" && !opts.some(([v]) => String(v) === String(cur))) opts.unshift([String(cur), String(cur)]);
-      if (cur === "" || cur == null) sel.appendChild(new Option("自动", ""));
+      if (cur === "" || cur == null) sel.appendChild(new Option(spec.emptyLabel || "自动", ""));
       opts.forEach(([v, lab]) => sel.appendChild(new Option(lab, String(v))));
       sel.value = cur == null ? "" : String(cur);
-      sel.onchange = () => commit(spec.path, sel.value, 0);
+      sel.onchange = () => {
+        commit(spec.path, sel.value, 0);
+        // 生图供应商决定"要不要显示接口地址"这类联动：改了就地重画一次，
+        // 否则新字段要等下一次 refresh（用户反馈过"选了自定义还得点刷新才看到地址框"）
+        if (spec.path === "assistant.image.provider") renderSection();
+      };
       ctl.appendChild(sel);
     }
     return row;
@@ -1358,6 +1392,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       nameInput.type = "text";
       nameInput.value = p.name;
       nameInput.style.width = "min(120px, 28vw)";
+      // .row .rctl input 有 flex:1 1 120px，会盖掉 width；这里显式改成不伸缩，
+      // 否则输入框吃掉整行，后面的按钮全被挤到下一行
+      nameInput.style.flex = "0 0 min(120px, 28vw)";
       nameInput.title = "改名后点「改名」";
       const btnApply = el("button", "btn btn-sm" + (p.id === activeId ? "" : " btn-primary"), p.id === activeId ? "使用中" : "应用");
       btnApply.onclick = () => { runAction(`__preset:apply:${p.id}`, "应用预设"); };
@@ -1377,6 +1414,58 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     save.onclick = () => runAction("__preset:save", "保存预设");
     btns.appendChild(save);
     card.appendChild(btns);
+
+    // ---- 生图预设（和对话预设放同一张卡：都是"一套配置，一键切换"） ----
+    const sep = el("div", "sw-sep");
+    sep.style.cssText = "height:1px;margin:14px 2px 10px;background:rgba(90,60,110,0.14)";
+    card.appendChild(sep);
+    const imgTitle = el("div", "rlabel", "生图预设");
+    imgTitle.style.marginBottom = "4px";
+    card.appendChild(imgTitle);
+    card.appendChild(el("div", "rdesc",
+      "生图也有自己的一套预设，Key 各自独立存在预设槽位里。不配生图也不影响聊天。"));
+    const imgMeta = state.meta.image || {};
+    const imgList = imgMeta.presets || [];
+    const imgActive = imgMeta.activePresetId || "";
+    if (!imgMeta.configured) {
+      card.appendChild(el("div", "empty", "先在「生图模型接入」里填好一套配置，才能存生图预设"));
+    } else if (!imgList.length) {
+      card.appendChild(el("div", "empty", "还没有生图预设"));
+    }
+    imgList.forEach((p) => {
+      const row = el("div", "row");
+      const txt = el("div", "rtext");
+      txt.appendChild(el("div", "rlabel", p.name + (p.id === imgActive ? "（使用中）" : "")));
+      txt.appendChild(el("div", "rdesc",
+        `${(imgMeta.provider ? p.provider : p.provider)} · ${p.model || "默认模型"}${p.customBaseUrl ? " · " + p.customBaseUrl : ""}`));
+      row.appendChild(txt);
+      const ctl = el("div", "rctl");
+      const nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.value = p.name;
+      nameInput.style.width = "min(88px, 22vw)";
+      nameInput.style.flex = "0 0 min(88px, 22vw)";
+      nameInput.title = "改名后点「改名」";
+      const btnUse = el("button", "btn btn-sm" + (p.id === imgActive ? "" : " btn-primary"), p.id === imgActive ? "使用中" : "应用");
+      btnUse.onclick = () => runAction(`__imgpreset:apply:${p.id}`, "应用生图预设");
+      const btnRename = el("button", "btn btn-sm", "改名");
+      btnRename.onclick = () => runAction(`__imgpreset:rename:${p.id}`, { name: nameInput.value }, "改名");
+      const btnDel = el("button", "btn btn-sm btn-danger", "删除");
+      btnDel.onclick = () => {
+        if (!confirm(`删除生图预设「${p.name}」？它的 Key 会被同时清除。`)) return;
+        runAction(`__imgpreset:delete:${p.id}`, "删除生图预设");
+      };
+      ctl.append(nameInput, btnUse, btnRename, btnDel);
+      row.appendChild(ctl);
+      card.appendChild(row);
+    });
+    if (imgMeta.configured) {
+      const imgBtns = el("div", "btn-row");
+      const imgSave = el("button", "btn btn-primary btn-sm", "＋ 把当前生图配置存为预设");
+      imgSave.onclick = () => runAction("__imgpreset:save", "保存生图预设");
+      imgBtns.appendChild(imgSave);
+      card.appendChild(imgBtns);
+    }
     return card;
   }
 
@@ -1646,6 +1735,97 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
    * 合作中转站：给不会配 API 的用户一个现成的去处。
    * 只放一个明确的优惠入口 + 一键把端点填好，不替用户做选择。
    */
+  /**
+   * 生图模型接入。
+   *
+   * 生图和对话是**两套独立配置**：自己的供应商、自己的 Key（槽位 image:<provider>）、自己的模型。
+   * 不配也能正常聊天，只是 AI 会让你"去配一下"而不是假装在画。
+   */
+  function imageAccessCard() {
+    // 普通卡（不是 wide）：和左边的「API设置」并排成两列，一屏内就能对照着配
+    const card = el("div", "card");
+    card.appendChild(el("h2", null, "生图模型接入"));
+    card.appendChild(el("p", "cd", "生图和对话是两套独立配置：自己的供应商、Key、模型。不配也能聊天，只是不能画图。"));
+
+    const meta = state.meta.image || {};
+    const providers = state.meta.imageProviders || [];
+    // **以表单里的当前值优先**：用户刚在下拉框里换了供应商，meta 还是上一次拉取的结果，
+    // 只看 meta 就会"换了自定义却要等刷新才出现接口地址输入框"。
+    const curImg = (state.settings.assistant && state.settings.assistant.image) || {};
+    const provider = curImg.provider || meta.provider || "";
+    const info = providers.find((p) => p.id === provider);
+
+    // 状态行：告诉用户"现在到底能不能画"
+    const status = el("div", "rdesc");
+    if (!meta.enabled) {
+      status.textContent = "状态：生图已关闭（打开上面的「启用生图」才会画）";
+    } else if (!provider) {
+      status.textContent = "状态：未接入（选供应商 → 填 Key → 获取模型）";
+    } else if (!meta.hasKey) {
+      status.textContent = `状态：已选 ${info ? info.label : provider}，还没填 Key`;
+    } else {
+      status.textContent = `状态：可用（${info ? info.label : provider}${curImg.model ? " · " + curImg.model : ""}）`;
+    }
+    card.appendChild(status);
+
+    // 生图总开关：关掉后即使配置齐全也不会画（和"没配置"是两回事，提示语不一样）
+    card.appendChild(fieldNode({
+      path: "assistant.imageEnabled",
+      label: "启用生图",
+      type: "switch",
+      desc: "关掉后 AI 会直接说「生图功能关了」，不会再调用生图",
+    }));
+
+    // 供应商：**永远显示**（以前只在选了之后才显示其余字段，用户会以为"只有一个下拉框，没法接"）
+    card.appendChild(fieldNode({
+      path: "assistant.image.provider",
+      label: "生图供应商",
+      type: "select",
+      options: "imageProviders",
+      emptyLabel: "请选择供应商…",
+    }));
+
+    if (info && info.note) card.appendChild(el("div", "rdesc", info.note));
+    if (!provider) {
+      card.appendChild(el("div", "rdesc", "接别家就选「自定义 / 中转站」，填自己的 OpenAI 兼容地址（要支持 /images/generations）。"));
+    }
+
+    // 接口地址：自定义必填；其余厂商用内置 base，不显示（免得用户以为要自己填）
+    if (provider === "custom") {
+      card.appendChild(fieldNode({
+        path: "assistant.image.customBaseUrl",
+        label: "生图接口地址",
+        type: "text",
+        placeholder: "https://your-proxy.com/v1（要支持 /images/generations）",
+      }));
+    }
+
+    // 模型 + 获取清单：即使还没选供应商也显示，用户可以先看清楚要填什么
+    card.appendChild(fieldNode({
+      path: "assistant.image.model",
+      label: "生图模型",
+      type: "text",
+      placeholder: info && info.models && info.models.length
+        ? `留空用默认：${info.models[0]}`
+        : "如 gpt-image-2、cogview-4、Kwai-Kolors/Kolors；留空则用该供应商默认模型",
+    }));
+    card.appendChild(fieldNode({
+      type: "actions",
+      items: [{ id: "__data:image-models-fetch", label: "获取生图模型列表", passKey: true, passKeyImage: true }],
+    }));
+
+    // Key：走 secret 组件 —— 只显示「已配置/未配置」，明文永不回显
+    card.appendChild(fieldNode({
+      type: "secret",
+      key: "image",
+      label: "生图 API Key",
+      desc: provider
+        ? `存在独立槽位（${curImg.activePresetId ? "imagePreset:" + curImg.activePresetId : "image:" + provider}），不会覆盖对话模型的 Key`
+        : "先在上面选好供应商，再粘贴这个供应商的 Key（和对话模型的 Key 分开存）",
+    }));
+    return card;
+  }
+
   function promoCard() {
     const card = el("div", "card");
     card.appendChild(el("h2", null, "不会接 API？"));
@@ -2373,6 +2553,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (cardSpec.type === "chatlog") return grid.appendChild(chatLogCard());
       if (cardSpec.type === "greetstat") return grid.appendChild(greetStatNode());
       if (cardSpec.type === "personas") return grid.appendChild(personasCard());
+      if (cardSpec.type === "imageaccess") return grid.appendChild(imageAccessCard());
       if (cardSpec.type === "promo") return grid.appendChild(promoCard());
       if (cardSpec.type === "genimages") return grid.appendChild(genImagesCard());
       if (cardSpec.type === "card") return grid.appendChild(cardCard());

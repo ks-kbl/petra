@@ -1600,15 +1600,22 @@ export async function listModels(
   throw new Error(errors.join("；") + localHint + hint);
 }
 
-/** 只拉"生图模型"清单（用于自动识别，用户不用手填模型名） */
-export async function listImageModels(
-  provider: AssistantProvider,
-  apiKey: string,
-  customBaseUrl: string,
-): Promise<string[]> {
-  const base = resolveBase(provider, customBaseUrl);
+/**
+ * 只拉"生图模型"清单。
+ *
+ * 生图有自己独立的端点（生图接入的 base），所以这里直接收 base 而不是对话用的 provider。
+ * 失败时抛错：面板要能告诉用户"是 Key 错了还是这个站没有 /models"；
+ * 工具调用那边用 listImageModelsSafe() 包一层，失败就当没有清单。
+ */
+export async function listImageModels(base: string, apiKey: string): Promise<string[]> {
+  if (!base) return [];
+  return detectImageModels(await fetchModelList(`${base}/models`, apiKey));
+}
+
+/** 工具调用用的静默版：拿不到就返回空清单，不打断生图（还有兜底模型可选） */
+export async function listImageModelsSafe(base: string, apiKey: string): Promise<string[]> {
   try {
-    return detectImageModels(await fetchModelList(`${base}/models`, apiKey));
+    return await listImageModels(base, apiKey);
   } catch {
     return [];
   }
@@ -1649,9 +1656,9 @@ function isModelUnavailable(err: unknown): boolean {
  * 包在别的字段里，所以这里做了两重兼容；失败时也把服务端原文带出来，别只说"失败了"。
  */
 export async function generateImage(opts: {
-  provider: AssistantProvider;
+  /** 生图接入解析出来的 base（已经是 …/v1 这种形态） */
+  base: string;
   apiKey: string;
-  customBaseUrl: string;
   model: string;
   /** 备选模型：第一个失败（没开通渠道之类）就换下一个试 */
   fallbackModels?: string[];
@@ -1660,13 +1667,14 @@ export async function generateImage(opts: {
   /** 外部取消信号（用户在进度气泡上点"取消"） */
   signal?: AbortSignal;
 }): Promise<GeneratedImage> {
-  const base = resolveBase(opts.provider, opts.customBaseUrl);
+  const base = String(opts.base || "").replace(/\/+$/, "");
+  if (!base) throw new Error("还没有配置生图接入：控制面板 → 小助手 → 生图模型接入");
   const candidates: string[] = [];
   for (const m of [opts.model, ...(opts.fallbackModels ?? [])]) {
     const name = (m || "").trim();
     if (name && !candidates.includes(name)) candidates.push(name);
   }
-  if (!candidates.length) throw new Error("还没有可用的生图模型：先在「小助手 → 获取模型列表」里拉一次，或手动填写生图模型名");
+  if (!candidates.length) throw new Error("还没有可用的生图模型：去「控制面板 → 小助手 → 生图模型接入」里获取一次模型列表，或手动填一个模型名");
   const prompt = (opts.prompt || "").trim();
   if (!prompt) throw new Error("要画什么？给我一句画面描述");
 
@@ -1712,7 +1720,7 @@ async function requestImageOnce(
     if (!res.ok) {
       if (res.status === 404 || res.status === 405) {
         throw new Error(
-          `这个端点不支持生图（HTTP ${res.status}）：${text.slice(0, 160)} —— 请在「小助手」里把供应商换成一个支持 /images/generations 的（比如画图专用的中转站分组）`,
+          `这个生图端点不支持 /images/generations（HTTP ${res.status}）：${text.slice(0, 160)} —— 请在「控制面板 → 小助手 → 生图模型接入」里换一个供应商，或填一个支持生图的中转站`,
         );
       }
       throw new Error(`生图失败 HTTP ${res.status}: ${text.slice(0, 200)}`);
