@@ -2319,6 +2319,8 @@ async function send(text: string) {
         (delta) => {
           streamed = true;
           colorHook.push(delta);
+          // 情绪标签通常在开头几字就出现：先喂给 TTS，后面合成的句子就能带上语气
+          ttsPlayer.setEmotion(colorHook.lastEmotion());
           ttsPlayer.pushDelta(delta);
         },
         true,

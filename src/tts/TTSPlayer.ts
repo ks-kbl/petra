@@ -16,6 +16,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { loadSettings } from "../utils/settings";
 import { takeSpeechSegment, flushSpeechSegment } from "./sentenceSplit";
 
 interface QueueItem {
@@ -97,6 +98,73 @@ export function pauseAfterSegment(text: string): number {
   return 0.045;
 }
 
+/**
+ * 情绪 → 中文语气口令（火山「声音复刻 2.0」的 context_texts）。
+ *
+ * 为什么用自然语言而不是 emotion 枚举：官方的 `audio_params.emotion` 只对**部分音色**生效，
+ * 而声音复刻的自定义音色基本不在那批里；`context_texts` 是对话式合成的语气指令，
+ * 明确支持"声音复刻大模型 2.0 的表现力增强版"，而且这段文字不计费。
+ */
+const EMOTION_TONE: Record<string, string> = {
+  happy: "用轻快、开心的语气说，尾音稍微往上扬一点",
+  shy: "用有点害羞、声音小一点、略带撒娇的语气说",
+  sad: "用低落、轻一点、稍微慢一点的语气说",
+  angry: "带着不满和嫌弃的语气说，语速稍快一点",
+  surprised: "带着惊讶的语气说，语气起伏大一点",
+  neutral: "用日常聊天、轻松自然的语气说",
+};
+
+/**
+ * 情绪 → 语速/音调偏移（AI 自己判断，不给用户调）。
+ * 幅度都压得很小：语速 ±8 已经能听出情绪，再大就像在演话剧。
+ */
+const EMOTION_VOICE: Record<string, { rate: number; pitch: number }> = {
+  happy: { rate: 6, pitch: 1 },
+  shy: { rate: -4, pitch: 2 },
+  sad: { rate: -8, pitch: -2 },
+  angry: { rate: 8, pitch: 1 },
+  surprised: { rate: 4, pitch: 3 },
+  neutral: { rate: 0, pitch: 0 },
+};
+
+/** CoT 语音标签里用的短标签（太长会把单句撑过 64 字限制） */
+const EMOTION_TAG_TEXT: Record<string, string> = {
+  happy: "开心",
+  shy: "害羞",
+  sad: "低落",
+  angry: "不满",
+  surprised: "惊讶",
+  neutral: "平静",
+};
+
+/**
+ * 把一段话按情绪包成 CoT 语音标签（火山的行为标签，需配合 use_tag_parser）。
+ * 导出成纯函数是为了能单测"太长就不包"这条规则。
+ */
+export function wrapCotTag(text: string, emotion: string, maxChars = 60): string | null {
+  const tag = EMOTION_TAG_TEXT[emotion] ?? EMOTION_TAG_TEXT.neutral;
+  const wrapped = `<cot text=${tag}>${text}</cot>`;
+  return wrapped.length <= maxChars ? wrapped : null;
+}
+
+/** 情绪 → 中文语气口令（导出给单测与调试用） */
+export function emotionToneInstruction(emotion: string): string {
+  return EMOTION_TONE[emotion] ?? EMOTION_TONE.neutral;
+}
+
+/** 火山一次请求里的语气参数（与 Rust 侧 TtsTone 同构，camelCase） */
+interface TtsTonePayload {
+  model?: string;
+  contextText?: string;
+  useTagParser?: boolean;
+  speechRate?: number;
+  pitch?: number;
+  sectionId?: string;
+}
+
+/** 单句文本 + 标签后最好别超过 64 字（官方建议，标签也计入） */
+const COT_MAX_CHARS = 60;
+
 class TTSPlayer {
   private enabled = false;
   private apiKey = "";
@@ -109,6 +177,10 @@ class TTSPlayer {
   private idleCallbacks: (() => void)[] = [];
   /** 唤醒词监听在 TTS 播放期间要暂停，避免把自己说的话当成唤醒词 */
   private wakeResumeTimer: number | null = null;
+  /** 当前这段回复的情绪（由 AssistantPanel 在流式解析出情绪标签时喂进来） */
+  private emotionTag = "neutral";
+  /** 多轮上下文 id：同一段回复共用，让几句之间的语气连贯 */
+  private sectionId = "";
   muted = false;
 
   /** 兜底播放时正在响的元素（Web Audio 路径用不到） */
@@ -178,6 +250,15 @@ class TTSPlayer {
     if (this.current) this.current.volume = muted ? 0 : 1;
   }
 
+  /**
+   * 设置当前回复的情绪（happy / shy / sad / angry / surprised / neutral）。
+   * 只影响**之后**合成的句子：情绪标签通常出现在回复开头，所以整段基本都能带上。
+   */
+  setEmotion(tag: string) {
+    const t = (tag || "neutral").trim();
+    if (t !== this.emotionTag) this.emotionTag = t;
+  }
+
   setConfig(enabled: boolean, apiKey: string, speakerId: string, language = "") {
     this.enabled = enabled;
     this.apiKey = apiKey;
@@ -226,6 +307,9 @@ class TTSPlayer {
 
   stop() {
     this.generation++;
+    // 新一段回复 = 新的语气上下文，section_id 重新生成
+    this.sectionId = "";
+    this.emotionTag = "neutral";
     this.queue = [];
     this.buffer = "";
     this.speaking = false;
@@ -261,6 +345,18 @@ class TTSPlayer {
       .replace(/^\s*[-*+]\s+/gm, "")
       .replace(/^\s*\d+[.)、]\s*/gm, "")
       .replace(/\n---\n[\s\S]*$/, "")
+      // 语音标签：正常情况由服务端解析掉；万一这次请求退回了标准参数，
+      // 标签会被**原样念出来**（"cot text 开心"），所以这里再兜一层
+      .replace(/<\/?cot[^>]*>/gi, "")
+      // 代码块整段不读：念出来全是符号和变量名，气泡里看着是代码，耳朵里是乱码
+      .replace(/```[\s\S]*?```/g, "（这段是代码）")
+      .replace(/`([^`]+)`/g, "$1")
+      // 链接只读文字，不念 URL
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+      .replace(/https?:\/\/\S+/g, "（链接）")
+      // 表格竖线/分隔行不读
+      .replace(/^\s*\|?[\s:|-]{4,}\|?\s*$/gm, "")
+      .replace(/\|/g, " ")
       .replace(/\s+/g, " ")
       .trim();
     // 补一个句末标点：没有收尾标点时 TTS 的语调会"悬着"，听起来就是断在半句上
@@ -303,14 +399,48 @@ class TTSPlayer {
     }
   }
 
+  /**
+   * 拼出这次的语气参数，并按需把句子包成 `<cot text=…>` 标签。
+   *
+   * **语气全部由 AI 决定，用户只有一个「增强语气」开关**：
+   * 用的是它这条回复的情绪标签（happy / shy / sad / angry / surprised / neutral），
+   * 由情绪决定语气口令、语速音调偏移；句子够短就用逐句语音标签（更精确），
+   * 太长就退回自然语言口令。用户不需要也不应该去调这些细节。
+   */
+  private buildTone(text: string): { text: string; tone?: TtsTonePayload } {
+    const t = loadSettings().tts;
+    if (!t.enhanced) return { text };
+    const emo = EMOTION_TONE[this.emotionTag] ? this.emotionTag : "neutral";
+    const voice = EMOTION_VOICE[emo] ?? EMOTION_VOICE.neutral;
+    const base: TtsTonePayload = { model: "seed-tts-2.0-expressive" };
+    if (voice.rate) base.speechRate = voice.rate;
+    if (voice.pitch) base.pitch = voice.pitch;
+    // 同一段回复共用一个 section_id：几句之间语气接得上，不用用户操心
+    if (!this.sectionId) {
+      this.sectionId = `petra-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+    base.sectionId = this.sectionId;
+
+    // 句子够短就逐句打标签（更贴合这一句的情绪），否则用整段口令
+    const wrapped = wrapCotTag(text, emo, COT_MAX_CHARS);
+    if (wrapped) return { text: wrapped, tone: { ...base, useTagParser: true } };
+    return { text, tone: { ...base, contextText: emotionToneInstruction(emo) } };
+  }
+
   private async preload(item: QueueItem) {
     const gen = item.gen;
     try {
+      const { text: speakText, tone } = this.buildTone(item.text);
+      // 排障用：把真正送进合成的文本打出来（下次"念出奇怪东西"能直接看到原文）
+      if (typeof location !== "undefined" && (location.hostname === "127.0.0.1" || location.hostname === "localhost")) {
+        console.debug("[TTS] 送合成：", speakText, tone ?? "(无语气参数)");
+      }
       const base64 = await invoke<string>("tts_synthesize", {
         apiKey: this.apiKey,
         speaker: this.speakerId,
-        text: item.text,
+        text: speakText,
         language: this.language || undefined,
+        tone,
       });
       // 这期间用户已经发了新消息/关了语音：这段音频已经没人要了，别往新一轮的队列里塞
       if (gen !== this.generation) return;

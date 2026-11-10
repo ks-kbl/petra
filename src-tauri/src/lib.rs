@@ -4329,47 +4329,119 @@ fn list_installed_apps() -> String {
     format!("开始菜单里可启动的软件共 {total} 个{tail}：{}", names.join("、"))
 }
 
-#[tauri::command]
-async fn tts_synthesize(
-    api_key: String,
-    speaker: String,
-    text: String,
-    language: Option<String>,
-) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("HTTP client: {e}"))?;
+/// 火山「声音复刻 2.0」的语气参数（都可选）。
+///
+/// 只有 `model = seed-tts-2.0-expressive`（表现力增强版）才真的吃这些字段；
+/// 标准版会把语音指令/语音标签**直接过滤掉**，所以前端不开增强语气时这里全部为空。
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct TtsTone {
+    /// seed-tts-2.0-standard / seed-tts-2.0-expressive；空 = 服务端默认（standard）
+    model: Option<String>,
+    /// 自然语言语气口令（context_texts，只取第一个值，不计费）
+    context_text: Option<String>,
+    /// 是否解析 <cot text=…> 语音标签
+    use_tag_parser: Option<bool>,
+    speech_rate: Option<f64>,
+    loudness_rate: Option<f64>,
+    /// 音调 -12～12（additions.post_process.pitch）
+    pitch: Option<f64>,
+    /// 多轮上下文 id：同一段回复共用，语气更连贯
+    section_id: Option<String>,
+}
 
-    let mut req = serde_json::json!({
-        "req_params": {
-            "text": text,
-            "speaker": speaker,
-            "audio_params": { "format": "mp3", "sample_rate": 24000 }
+/// 去掉 CoT 语音标签（`<cot text=开心>句子</cot>` 只保留句子）。
+///
+/// 为什么必须去掉：标签是给"表现力增强版 + use_tag_parser"解析用的，
+/// 一旦这次请求退回标准参数（音色不支持 / 服务端拒了参数），标签就会**被直接念出来**，
+/// 用户听到的是"cot text 开心 …… cot"这种莫名其妙的东西，而气泡里根本没有这段。
+fn strip_cot_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        let Some(close_rel) = rest[open..].find('>') else { break };
+        let close = open + close_rel;
+        let tag = &rest[open + 1..close];
+        let lower = tag.to_ascii_lowercase();
+        if lower.starts_with("cot") || lower == "/cot" {
+            out.push_str(&rest[..open]);
+            rest = &rest[close + 1..];
+        } else {
+            // 其它尖括号内容按原样保留（可能真的是文本里的数学/代码）
+            out.push_str(&rest[..=close]);
+            rest = &rest[close + 1..];
         }
-    });
-    if let Some(lang) = language.filter(|l| !l.is_empty()) {
-        req["req_params"]["explicit_language"] = serde_json::Value::String(lang);
     }
+    out.push_str(rest);
+    out
+}
 
+/// 拼一次请求体：`tone` 为空就是原来那套最小参数
+fn build_tts_body(speaker: &str, text: &str, language: Option<&str>, tone: Option<&TtsTone>) -> serde_json::Value {
+    // 只有真的开了标签解析才保留 <cot>；否则一律剥掉，绝不能让标签被念出来
+    let tag_parser = tone.and_then(|t| t.use_tag_parser) == Some(true);
+    let text: String = if tag_parser { text.to_string() } else { strip_cot_tags(text) };
+    let text = text.as_str();
+
+    let mut audio = serde_json::json!({ "format": "mp3", "sample_rate": 24000 });
+    let mut additions = serde_json::Map::new();
+    let mut req = serde_json::Map::new();
+    req.insert("text".into(), serde_json::Value::String(text.to_string()));
+    req.insert("speaker".into(), serde_json::Value::String(speaker.to_string()));
+
+    if let Some(t) = tone {
+        if let Some(m) = t.model.as_deref().filter(|m| !m.is_empty()) {
+            req.insert("model".into(), serde_json::Value::String(m.to_string()));
+        }
+        if let Some(ctx) = t.context_text.as_deref().filter(|c| !c.trim().is_empty()) {
+            additions.insert("context_texts".into(), serde_json::json!([ctx]));
+        }
+        if tag_parser {
+            additions.insert("use_tag_parser".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(v) = t.speech_rate {
+            audio["speech_rate"] = serde_json::json!(v);
+        }
+        if let Some(v) = t.loudness_rate {
+            audio["loudness_rate"] = serde_json::json!(v);
+        }
+        if let Some(p) = t.pitch.filter(|p| *p != 0.0) {
+            additions.insert("post_process".into(), serde_json::json!({ "pitch": p }));
+        }
+        if let Some(id) = t.section_id.as_deref().filter(|s| !s.is_empty()) {
+            additions.insert("section_id".into(), serde_json::Value::String(id.to_string()));
+        }
+    }
+    if let Some(lang) = language.filter(|l| !l.is_empty()) {
+        req.insert("explicit_language".into(), serde_json::Value::String(lang.to_string()));
+    }
+    req.insert("audio_params".into(), audio);
+    if !additions.is_empty() {
+        req.insert("additions".into(), serde_json::Value::Object(additions));
+    }
+    serde_json::json!({ "req_params": serde_json::Value::Object(req) })
+}
+
+async fn post_tts(client: &reqwest::Client, api_key: &str, resource_id: &str, body: &serde_json::Value) -> Result<String, String> {
     let resp = client
         .post("https://openspeech.bytedance.com/api/v3/tts/unidirectional")
-        .header("X-Api-Key", &api_key)
-        .header("X-Api-Resource-Id", "seed-icl-2.0")
+        .header("X-Api-Key", api_key)
+        .header("X-Api-Resource-Id", resource_id)
         .header("X-Api-Request-Id", &format!("{:x}{:x}{:x}{:x}",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
             std::process::id()))
         .header("Content-Type", "application/json")
-        .json(&req)
+        .json(body)
         .send()
         .await
         .map_err(|e| format!("TTS request: {e}"))?;
 
-    let body = resp.text().await.map_err(|e| format!("TTS read: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("TTS read: {e}"))?;
     let mut combined = String::new();
-    for line in body.lines() {
+    for line in text.lines() {
         let t = line.trim();
         if t.is_empty() { continue; }
         if let Ok(j) = serde_json::from_str::<serde_json::Value>(t) {
@@ -4379,9 +4451,65 @@ async fn tts_synthesize(
         }
     }
     if combined.is_empty() {
-        return Err(format!("TTS no audio: {}", body));
+        return Err(format!("TTS no audio (HTTP {}): {}", status.as_u16(), text.chars().take(300).collect::<String>()));
     }
     Ok(combined)
+}
+
+#[tauri::command]
+async fn tts_synthesize(
+    api_key: String,
+    speaker: String,
+    text: String,
+    language: Option<String>,
+    tone: Option<TtsTone>,
+) -> Result<String, String> {
+    if speaker.trim().is_empty() {
+        return Err("还没填「音色 ID」：语音朗读必须指定一个音色（火山控制台 → 声音复刻 → 音色管理里的 Speaker ID），留空不会出声".into());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+
+    // 资源 ID 必须和音色所属的资源匹配，否则服务端回 55000000
+    // 「resource ID is mismatched with speaker related resource」。
+    // 用户手里的音色可能是复刻 1.0 或官方大模型音色，所以按顺序试：
+    // 复刻 2.0 → 复刻 1.0 → 官方音色 2.0。第一个成功就停。
+    const RESOURCE_IDS: [&str; 3] = ["seed-icl-2.0", "seed-icl-1.0", "seed-tts-2.0"];
+    let body = build_tts_body(&speaker, &text, language.as_deref(), tone.as_ref());
+    let mut last_err = String::new();
+    for (i, rid) in RESOURCE_IDS.iter().enumerate() {
+        match post_tts(&client, &api_key, rid, &body).await {
+            Ok(audio) => {
+                if i > 0 {
+                    log_verbose(&format!("[tts] 音色匹配到资源 {rid}（默认的 seed-icl-2.0 不适用）"));
+                }
+                return Ok(audio);
+            }
+            Err(e) => {
+                last_err = e;
+                // 只有"资源不匹配"才值得换一个资源 ID 再试；
+                // Key 无效 / 余额不足 / 文本为空这类换资源也没用，直接退出循环省一次计费请求。
+                let mismatch = last_err.contains("55000000") || last_err.contains("mismatched");
+                if !mismatch { break; }
+            }
+        }
+    }
+
+    // 带语气参数失败（音色不支持表现力版 / 标签写坏 / 参数越界）就退回最小参数再试一次：
+    // 宁可这次读得平淡，也不能整句没声音。
+    if tone.is_some() {
+        let plain = build_tts_body(&speaker, &text, language.as_deref(), None);
+        for rid in RESOURCE_IDS {
+            if let Ok(audio) = post_tts(&client, &api_key, rid, &plain).await {
+                log_verbose(&format!("[tts] 带语气参数合成失败，已退回标准参数（{rid}）：{last_err}"));
+                return Ok(audio);
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// 语音识别的服务端点与模型：与 TTS 同一路子 —— 请求从 Rust 侧发出，
