@@ -22,7 +22,7 @@
     "test:tts": "tsc src/tts/TTSPlayer.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/tts-mute.test.js && node tests/tts-order.test.js && node tests/tts-gapless.test.js && node tests/tts-fluency.test.js && node tests/tts-tone.test.js",
     "test:chatlog": "node tests/chatlog-core.test.js",
     "test:panel": "node tests/panel-regressions.test.js",
-    "test:asr": "tsc src/asr/asrLogic.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/asr-logic.test.js",
+    "test:asr": "tsc src/asr/asrLogic.ts src/audio/wakeGate.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/asr-logic.test.js && node tests/wake-gate.test.js",
     "test:lang": "tsc src/utils/outputLanguage.ts src/assistant/proactivePrompts.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/output-language.test.js",
     "test:weather": "tsc src/features/weather/WeatherFormat.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/weather.test.js",
     "test:hourly": "tsc src/features/hourly/HourlyChime.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/hourly.test.js",

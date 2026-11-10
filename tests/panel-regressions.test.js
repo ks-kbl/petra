@@ -58,9 +58,11 @@ function load(file, dependencies, globals = {}) {
   assert.equal(stored.boundsPaddings.B.left, 30, 'other model bounds remain unchanged');
 
   const logic = load('src/asr/asrLogic.ts', {});
+  const wakeGate = { holdWake: () => {}, releaseWake: () => {}, wakeHeld: () => false };
   const asr = load('src/asr/SpeechRecognizer.ts', {
     '@tauri-apps/api/core': api, './asrLogic': logic,
     '../utils/settings': { loadSettings: () => settings },
+    '../audio/wakeGate': wakeGate,
   }, { window: { SpeechRecognition: function() {} } });
   const recognizer = asr.getSpeechRecognizer();
   assert.equal(recognizer.needsApiKey(), true);

@@ -33,6 +33,7 @@ import {
   type ListenTiming,
 } from "./asrLogic";
 import { loadSettings } from "../utils/settings";
+import { holdWake, releaseWake } from "../audio/wakeGate";
 
 /** 用户在设置里要求「先走云端模型」吗（默认就是先走云端） */
 function preferCloudAsr(): boolean {
@@ -263,13 +264,17 @@ export class SpeechRecognizer {
   start(): void {
     if (this.isRecording() || this.starting) return;
     this.refreshBackend();
+    // 录音期间必须暂停"唤醒词监听"：两个采集流同时开，本地关键词引擎会把
+    // 用户对着输入框说的话也当成候选，轻则误触发"又叫一声"，重则抢麦克风。
+    holdWake("asr");
     if (this.backend === "web-speech") this.startWebSpeech();
     else void this.startSiliconFlow();
   }
 
   /** 停止并提交（停顿自动收尾走这里；按钮上的"再点一下"是 cancel，不是它） */
   stop(): void {
-    if (!this.isRecording()) return;
+    // 没在录也释放一次：可能刚好在"申请麦克风"那一下被用户点了停止
+    if (!this.isRecording()) { releaseWake("asr"); return; }
     if (this.backend === "web-speech") this.finishWebSpeech(true);
     else this.finishSiliconFlow(false);
   }
@@ -279,7 +284,7 @@ export class SpeechRecognizer {
     // 无条件作废当前 token：VAD 已经自动收尾（isRecording() 为 false）时，
     // 识别请求可能还在路上，早退会让它回来照样 onFinal → 关掉面板后还莫名其妙发出一条消息。
     this.startToken++;
-    if (!this.isRecording()) return;
+    if (!this.isRecording()) { releaseWake("asr"); return; }
     if (this.backend === "web-speech") this.finishWebSpeech(false);
     else this.finishSiliconFlow(true);
   }
@@ -406,6 +411,7 @@ export class SpeechRecognizer {
     this.webFullText = "";
     this.clearAutoStop();
     this.active = false;
+    releaseWake("asr");
     try { rec?.stop(); } catch { /* ignore */ }
     this.handlers.onStateChange?.(false);
     if (!submit) return;
@@ -734,6 +740,8 @@ export class SpeechRecognizer {
   }
 
   private cleanupAudio(): void {
+    // 录音彻底结束了才恢复唤醒监听（延迟 300ms 躲开尾巴，别刚说完就把自己再唤醒）
+    releaseWake("asr");
     this.stopVad();
     this.analyser = null;
     if (this.audioCtx) {

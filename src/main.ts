@@ -113,6 +113,7 @@ import { hasDrawnToday, getTodayDraw, dailyDraw } from "./features/card/DailyCar
 import { toggleDailyCardPanel } from "./features/card/DailyCardPanel";
 
 import { toast } from "./ui/Toast";
+import { holdWake, releaseWake } from "./audio/wakeGate";
 import { initErrorPopup, showErrorPopup } from "./ui/ErrorPopup";
 import { ttsPlayer } from "./tts/TTSPlayer";
 import { copyText } from "./ui/clipboard";
@@ -2342,10 +2343,10 @@ function playCachedWakeReply(text: string): boolean {
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mp3" }));
     const audio = new Audio(url);
-    void invoke("wake_set_paused", { paused: true }).catch(() => {});
+    holdWake("wake-reply");
     const resume = () => {
       URL.revokeObjectURL(url);
-      window.setTimeout(() => void invoke("wake_set_paused", { paused: false }).catch(() => {}), 300);
+      releaseWake("wake-reply");
     };
     audio.onended = resume;
     void audio.play().catch(resume);
@@ -2362,8 +2363,8 @@ function speakLocal(text: string): void {
     u.lang = "zh-CN";
     u.rate = 1.05;
     window.speechSynthesis.cancel();
-    void invoke("wake_set_paused", { paused: true }).catch(() => {});
-    u.onend = () => window.setTimeout(() => void invoke("wake_set_paused", { paused: false }).catch(() => {}), 300);
+    holdWake("wake-reply");
+    u.onend = () => releaseWake("wake-reply");
     window.speechSynthesis.speak(u);
   } catch {
     /* 系统没有语音合成时静默跳过，气泡照常显示 */
