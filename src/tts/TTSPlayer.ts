@@ -17,6 +17,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { loadSettings } from "../utils/settings";
+import { holdWake, releaseWake } from "../audio/wakeGate";
 import { takeSpeechSegment, flushSpeechSegment } from "./sentenceSplit";
 
 interface QueueItem {
@@ -217,14 +218,15 @@ class TTSPlayer {
    */
   private setWakePaused(paused: boolean) {
     try {
+      // 走统一的闸门：录音识别也在用同一个闸门，谁都不该把对方的暂停顶掉
       if (paused) {
         if (this.wakeResumeTimer) { window.clearTimeout(this.wakeResumeTimer); this.wakeResumeTimer = null; }
-        void invoke("wake_set_paused", { paused: true }).catch(() => {});
+        holdWake("tts");
       } else {
         if (this.wakeResumeTimer) window.clearTimeout(this.wakeResumeTimer);
         this.wakeResumeTimer = window.setTimeout(() => {
           this.wakeResumeTimer = null;
-          void invoke("wake_set_paused", { paused: false }).catch(() => {});
+          releaseWake("tts", 0);
         }, 300);
       }
     } catch { /* 忽略：唤醒功能没启用时不影响朗读 */ }
