@@ -51,6 +51,52 @@ export interface PersonaFields {
   emoji: string;
 }
 
+/** 生图接入可选的供应商（与对话供应商是两套，见 src/assistant/imageProviders.ts） */
+export type ImageProviderId =
+  | "siliconflow"
+  | "zhipu"
+  | "ark"
+  | "openai"
+  | "xai"
+  | "custom";
+
+/**
+ * 生图模型接入（与对话模型完全分开配置）。
+ *
+ * 为什么分开：现在很少有既能把话说好又能画图的模型。以前是"借用对话模型的端点和 Key，
+ * 从 /models 里猜一个生图模型"，碰到"对话能通、生图没渠道"就只能干瞪眼。
+ * 现在生图有自己的供应商、端点、Key（槽位 `image:<provider>`）和模型。
+ *
+ * `undefined`（没有这个字段）= 没接入生图，此时对模型隐藏 generate_image 工具。
+ */
+export interface ImageSettings {
+  provider: ImageProviderId;
+  /** 模型名；留空 = 用该供应商的默认模型 / 自动识别到的第一个 */
+  model: string;
+  /** 仅 provider === "custom" 时使用 */
+  customBaseUrl: string;
+  /** 当前应用的是哪个生图预设（空 = 手填的临时配置） */
+  activePresetId?: string;
+  /** 保存下来的生图预设（Key 不进这里，按预设 id 存在钥匙串 `imagePreset:<id>`） */
+  presets?: ImagePreset[];
+  /** 老用户从「对话端点里自动识别」迁移过来时打的标记（面板提示一次用） */
+  migratedFromChat?: boolean;
+  /** 旧的按供应商存的 Key 是否已经搬进预设槽位（避免重复搬） */
+  keyMigrated?: boolean;
+}
+
+/**
+ * 一套可复用的生图接入配置。
+ * 与对话预设同构：只存非敏感字段，Key 按 `imagePreset:<id>` 单独放钥匙串。
+ */
+export interface ImagePreset {
+  id: string;
+  name: string;
+  provider: ImageProviderId;
+  model: string;
+  customBaseUrl: string;
+}
+
 /**
  * 一组可复用的 API 配置（参考酒馆的"预设"）。
  *
@@ -103,10 +149,25 @@ export interface AssistantSettings {
   inputIdleHideSec: number;
   /** 对用户的称呼（如"主人"），空则让 AI 自行决定 */
   nickname: string;
-  /** 生图模型名（留空 = 从 /models 自动识别，如 gpt-image-2 / kolors） */
+  /**
+   * 生图模型接入（独立供应商 / 端点 / Key / 模型）。
+   * 缺省 = 没接入生图，此时不向模型暴露 generate_image。
+   */
+  image?: ImageSettings;
+  /**
+   * 生图总开关（缺省 true）。关掉后即使配好也不暴露 generate_image，
+   * 模型会如实说"生图功能被关了"，与"没配置"区分开。
+   */
+  imageEnabled?: boolean;
+  /**
+   * @deprecated 旧字段，只为读老存档兼容：以前"生图模型"是对话端点里的一个衍生值。
+   * 加载时会被迁移成 `image`，之后不再写入。
+   */
   imageModel?: string;
-  /** 拉过模型列表后记下"这个端点有没有生图模型"；undefined = 还没确认过 */
+  /** @deprecated 旧字段：以前靠"拉模型列表时猜端点有没有生图能力"，现已改为看 image 是否就绪 */
   imageCapable?: boolean;
+  /** 迁移完提示面板/桌宠弹一次「生图接入已独立」，弹完清掉 */
+  imageMigrationNotice?: boolean;
   /** 语音输入快捷键（按下直接开麦说话，Tauri accelerator 字符串）；空表示未设置 */
   voiceShortcut?: string;
   /** 全局呼出快捷键（Tauri accelerator 字符串，如 "Ctrl+Shift+A"）；空表示未设置 */
@@ -429,6 +490,64 @@ export function loadSettings(): Settings {
       try {
         localStorage.setItem(KEY, JSON.stringify(s));
       } catch { /* 忽略 */ }
+    }
+    // 生图接入迁移：老存档里"生图模型"是对话端点上的衍生值（imageModel）。
+    // 现在生图是独立接入，这里把它一次性搬成一条显式配置，行为保持不变；
+    // 之后用户在面板里改厂商/Key 就是改这条配置。迁移过就永不再跑（image 已存在）。
+    if (!s.assistant.image && (s.assistant.imageModel ?? "").trim()) {
+      // 对话供应商里能直接当生图用的（OpenAI 兼容 + 有 /images/generations）就沿用，
+      // 其余（deepseek / moonshot / groq…）没有生图接口，落成「自定义」等用户确认改。
+      const imageable = new Set(["siliconflow", "zhipu", "ark", "openai", "xai", "custom"]);
+      const sameProvider = imageable.has(s.assistant.provider);
+      s.assistant.image = {
+        provider: (sameProvider ? s.assistant.provider : "custom") as ImageProviderId,
+        model: (s.assistant.imageModel ?? "").trim(),
+        customBaseUrl: sameProvider ? "" : (s.assistant.customBaseUrl ?? ""),
+        migratedFromChat: true,
+      };
+      // 让 main.ts 启动时弹一句"生图接入已独立，去确认一下"，弹完自己清掉
+      s.assistant.imageMigrationNotice = true;
+      try {
+        localStorage.setItem(KEY, JSON.stringify(s));
+      } catch { /* 忽略 */ }
+    }
+    // 生图配置形状兜底：面板里选「不接入」会写回空字符串，这里统一成"没有这条配置"；
+    // 其余字段补成字符串，避免下游到处写 `?? ""`。
+    if (s.assistant.image) {
+      const img = s.assistant.image as Partial<ImageSettings> & { provider?: string };
+      if (!img.provider) {
+        delete s.assistant.image;
+      } else {
+        s.assistant.image = {
+          provider: img.provider as ImageProviderId,
+          model: String(img.model ?? ""),
+          customBaseUrl: String(img.customBaseUrl ?? ""),
+          activePresetId: String(img.activePresetId ?? ""),
+          presets: Array.isArray(img.presets) ? img.presets : [],
+          ...(img.migratedFromChat ? { migratedFromChat: true } : {}),
+          ...(img.keyMigrated ? { keyMigrated: true } : {}),
+        };
+        // 生图还没预设时有两条路会走到这里：
+        //   ①刚从"对话端点自动识别"迁过来的老配置；②用户已经手填过一套配置。
+        // 两种都自动收进一个名为「默认」的预设，这样预设列表一打开就有东西，
+        // 用户也能立刻再存第二套（Key 之后由 main.ts 异步搬进 imagePreset:<id>）。
+        if (!s.assistant.image.presets?.length) {
+          const id = `i${Date.now().toString(36)}`;
+          s.assistant.image.presets = [{
+            id,
+            name: "默认",
+            provider: s.assistant.image.provider,
+            model: s.assistant.image.model,
+            customBaseUrl: s.assistant.image.customBaseUrl,
+          }];
+          s.assistant.image.activePresetId = s.assistant.image.activePresetId || id;
+          s.assistant.image.keyMigrated = false;
+          // 立即落盘：预设 id 是现生成的，不存下来会在每次 load 时换一个新 id（Key 槽位就跟着漂）
+          try {
+            localStorage.setItem(KEY, JSON.stringify(s));
+          } catch { /* 忽略 */ }
+        }
+      }
     }
     return s;
   } catch {

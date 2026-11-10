@@ -81,7 +81,7 @@ const json = (obj, status = 200) =>
         return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
       };
       const img = await ac.generateImage({
-        provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1",
+        base: "https://example.com/v1", apiKey: "k",
         model: "gpt-image-2", prompt: "一只鲸鱼",
       });
       check("url 形式的生图结果原样带回，不在网页里下载", img.url === "https://example.com/a.png" && !img.base64, JSON.stringify({ url: img.url, b64: img.base64 }));
@@ -101,7 +101,7 @@ const json = (obj, status = 200) =>
         return new Response(new Uint8Array([1]), { status: 200 });
       };
       const img = await ac.generateImage({
-        provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1",
+        base: "https://example.com/v1", apiKey: "k",
         model: "gpt-image-2.6-flare", fallbackModels: ["gpt-image-2.6-flare", "gpt-image-2"], prompt: "鲸鱼",
       });
       check("没开通渠道时自动换下一个模型", img.model === "gpt-image-2" && calls.length === 2, JSON.stringify({ model: img.model, calls }));
@@ -111,7 +111,7 @@ const json = (obj, status = 200) =>
     {
       let err = "";
       try {
-        await ac.generateImage({ provider: "custom", apiKey: "k", customBaseUrl: "https://example.com/v1", model: "", prompt: "x" });
+        await ac.generateImage({ base: "https://example.com/v1", apiKey: "k", model: "", prompt: "x" });
       } catch (e) { err = e instanceof Error ? e.message : String(e); }
       check("无生图模型时提示中文", /生图模型/.test(err), err);
     }

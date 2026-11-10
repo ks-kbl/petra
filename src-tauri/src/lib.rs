@@ -1055,7 +1055,10 @@ fn sync_interaction_regions(
     viewport_width: Option<f32>,
     viewport_height: Option<f32>,
 ) -> Result<(), String> {
-    const MAX_REGIONS: usize = 128;
+    // 512 而不是 128：前端现在会给**每个**可见原生控件（按钮/输入框/叉号）单独登记一条区域，
+    // 一个功能多的面板（设置窗口 20+ 行）就能占掉上百条。128 会把后面的整段截掉，
+    // 表现就是"面板上靠后的按钮点了没反应"。
+    const MAX_REGIONS: usize = 512;
     // 逐条过滤非法区域，**不要整批失败**：以前只要有一条坏数据（数量超限、
     // 坐标越界、尺寸为 0），整次上报被拒、快照停在旧值，10 秒后全窗穿透 ——
     // 一条坏区域拖垮所有点击。
@@ -1075,7 +1078,7 @@ fn sync_interaction_regions(
             continue;
         }
         if clean.len() >= MAX_REGIONS {
-            log_warn("交互区域超过 128 条，已截断");
+            log_warn("交互区域超过 512 条，已截断");
             break;
         }
         clean.push(region);

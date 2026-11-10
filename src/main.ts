@@ -125,7 +125,7 @@ import { ACTIVITY_LABEL, nextActivity, type ActivityLevel } from "./utils/settin
 import { astrobotOn } from "./bridges/astrobot";
 import { openAssistant, repositionAssistantBubbles, showWakeBubble } from "./assistant/AssistantPanel";
 import { pluginRuntime, configurePluginHost } from "./plugins/runtime";
-import { setLifecycle, triggerProactive, closeAssistant, clearBubbles, clearApiKeyCache, clearHistory, isAssistantBusy, sayPetLine, setModelRectProvider, fitBubbleHeights, rearmIdleTimer } from "./assistant/AssistantPanel";
+import { setLifecycle, triggerProactive, closeAssistant, clearBubbles, clearApiKeyCache, clearImageKeyCache, clearHistory, isAssistantBusy, sayPetLine, setModelRectProvider, fitBubbleHeights, rearmIdleTimer } from "./assistant/AssistantPanel";
 import { getSpeechRecognizer } from "./asr/SpeechRecognizer";
 import { repositionLyricBubble } from "./music/LyricBubble";
 import {
@@ -136,10 +136,11 @@ import {
 import { startHourlyChime, stopHourlyChime, formatQuietRange } from "./features/hourly/HourlyChime";
 import { mountHandAxisControls } from "./live2d/psd/HandAxisPicker";
 import { buildHourlyQuietMenuItems } from "./features/hourly/HourlyQuietRows";
-import { listModels, PROVIDERS, getUsageStats, resetUsageStats, chatStream, pickDefaultChatModel, probeChatConnection } from "./assistant/AssistantClient";
+import { listModels, listImageModels, PROVIDERS, getUsageStats, resetUsageStats, chatStream, pickDefaultChatModel, probeChatConnection } from "./assistant/AssistantClient";
 import { clampGreetInterval, greetIntervalMs, greetingAnchorAfterReset, hasGreetingIntervalElapsed, nextGreetingDueAt } from "./assistant/greetingSchedule";
 import { BUILTIN_PERSONAS, findBuiltinPersona } from "./assistant/builtinPersonas";
 import { getApiKey, setApiKey, normalizeOpenAIBase, presetKeyScope, currentKeyScope } from "./assistant/apiKey";
+import { IMAGE_PROVIDERS, IMAGE_PROVIDER_IDS, imageKeyScope, imagePresetKeyScope, currentImageKeyScope, resolveImageBase, defaultImageModels, isImageConfigured } from "./assistant/imageProviders";
 import { registerEmotionReactor, reactToTouch, getMoodDriverValue, emotionExpression, emotionToAction } from "./assistant/EmotionEngine";
 import { showEmotionPopup } from "./assistant/EmotionPopups";
 import { listMiniGames, openMiniGame, closeMiniGame, isMiniGameOpen, activeMiniGameId, setMiniGameLifecycle } from "./games/host";
@@ -2498,6 +2499,14 @@ async function onMenuOpen() {
   requestInteractionRegionSync(true);
 }
 
+/**
+ * 哪些 UI 要单独登记成"可点击区域"（Rust 侧据此决定窗口要不要吃这一点的鼠标事件）。
+ *
+ * 教训：以前这里只列了几个具体容器（面板/菜单/输入条），于是**任何没被列到的按钮**
+ * 都点不动 —— 点上去窗口判定"这里是透明的"，事件直接漏到下层窗口；把桌宠拖开、让这个
+ * 按钮落进角色区域里，它又能点了。所以除了整块面板，还必须兜底覆盖所有原生控件：
+ * 面板里任意 button / input / 叉号，不管它挂在哪个容器上，都要有自己的区域。
+ */
 const INTERACTION_UI_SELECTORS: ReadonlyArray<readonly [string, string]> = [
   ["menu", "#menu"],
   ["model-panel", ".model-panel"],
@@ -2508,6 +2517,15 @@ const INTERACTION_UI_SELECTORS: ReadonlyArray<readonly [string, string]> = [
   ["assistant-bubble", "#as-bubbles > .as-bubble"],
   ["update", "#update-bubble"],
   ["custom", "[data-petra-interactive]"],
+  // ---- 兜底：所有可见的原生控件（不依赖容器 class） ----
+  ["control", "button"],
+  ["control", "input"],
+  ["control", "select"],
+  ["control", "textarea"],
+  ["control", "a[href]"],
+  ["control", "[role='button']"],
+  ["control", "[role='switch']"],
+  ["control", "[contenteditable='true']"],
 ];
 
 let interactionSyncRunning = false;
@@ -2540,8 +2558,11 @@ function collectInteractionRegions(): PhysicalInteractiveRegion[] {
   // 点击区域保底：边界松紧（-120~120）可以把包围盒压成一条几十像素的细缝，
   // 结果"明明指着宠物却点不动、拖动直接穿透"（实测出现过 33px 宽的区域）。
   // 这里只放宽**交互区域**，不动绿框/面板定位用的原始 getModelRect()。
-  const MIN_W = 120;
-  const MIN_H = 160;
+  // 保底别太狠：以前是 120×160，小体型模型会凭空长出几十像素的**看不见但吃点击**的环，
+  // 表现就是"桌宠旁边明明没东西，却点不到下面的窗口"。降到 48×64 仍能点中小模型，
+  // 又不会把透明区域撑成一块挡板。
+  const MIN_W = 48;
+  const MIN_H = 64;
   const petHit = { ...pet };
   if (petHit.right - petHit.left < MIN_W) {
     const cx = (petHit.left + petHit.right) / 2;
@@ -2583,7 +2604,8 @@ function collectInteractionRegions(): PhysicalInteractiveRegion[] {
         scale,
         clientPhysicalWidth,
         clientPhysicalHeight,
-        2,
+        // 留 4px 余量：鼠标压在按钮边缘 1~2px 外时也不该漏到下层窗口
+        4,
       );
       if (region) regions.push(region);
     });
@@ -2643,6 +2665,29 @@ function startInteractionRegionSync() {
   // 立即触发同步。
   window.setInterval(() => requestInteractionRegionSync(), 100);
   requestInteractionRegionSync(true);
+  if (import.meta.env.DEV) {
+    // 排障钩子：CDP 里 `__petRegions()` 能看到当前上报的矩形；
+    // `__petUncovered()` 列出"看得见、却没被任何区域覆盖的控件"（就是点了没反应的那些）
+    (window as unknown as Record<string, unknown>).__petRegions = () => collectInteractionRegions();
+    (window as unknown as Record<string, unknown>).__petUncovered = () => {
+      const covered = new Set<Element>();
+      for (const [, sel] of INTERACTION_UI_SELECTORS) {
+        document.querySelectorAll(sel).forEach((el) => covered.add(el));
+      }
+      const out: { tag: string; id: string; cls: string; text: string }[] = [];
+      document.querySelectorAll("button, input, select, textarea, a[href], [role='button']").forEach((el) => {
+        if (!visibleElementRect(el)) return;
+        if (covered.has(el)) return;
+        out.push({
+          tag: el.tagName,
+          id: (el as HTMLElement).id,
+          cls: String((el as HTMLElement).className).slice(0, 40),
+          text: (el.textContent || "").trim().slice(0, 20),
+        });
+      });
+      return out;
+    };
+  }
 }
 
 document.addEventListener("menu-closed", () => { engine.suspend(0); requestInteractionRegionSync(true); });
@@ -3725,7 +3770,7 @@ function readGenImages(): { path: string; prompt: string; model: string; ts: num
 }
 /** 模型列表的一句话说明（站点返回多少、过滤掉多少），面板上显示，解释"为什么只有这么几个" */
 let panelModelNote = "";
-let panelKeys = { assistant: false, tts: false, asr: false };
+let panelKeys = { assistant: false, tts: false, asr: false, image: false };
 /** 面板上直接显示出来的 Key 明文（用户明确要求「不怕泄露，贴在控制台上」） */
 /**
  * 面板上「可以直接看到明文」的 Key —— **只有 ASR**（用户自己贴过、且要求贴出来）。
@@ -3743,12 +3788,17 @@ let panelTopmost = false;
 
 /** 把三类 Key 的「有没有」状态同步给面板（只回布尔，绝不把 Key 本身推过去） */
 async function refreshPanelKeys(): Promise<void> {
-  const [a, t, r] = await Promise.all([
+  // 生图 Key 在独立槽位 image:<provider>，和对话的 Key 互不影响
+  const imgScope = isImageConfigured(settings.assistant.image)
+    ? currentImageKeyScope(settings.assistant.image)
+    : "";
+  const [a, t, r, i] = await Promise.all([
     getApiKey(),
     invoke<string>("get_tts_key").catch(() => ""),
     invoke<boolean>("asr_key_ready").catch(() => false),
+    imgScope ? getApiKey(imgScope).catch(() => "") : Promise.resolve(""),
   ]);
-  panelKeys = { assistant: !!a, tts: !!t, asr: !!r };
+  panelKeys = { assistant: !!a, tts: !!t, asr: !!r, image: !!i };
   // 只拿掩码：Key 明文不再进前端内存（以前面板能明文显示，内置 Key 被复制外传过）
   const asrInfo = await invoke<{ masked: string; builtin: boolean; ready: boolean }>("asr_key_info").catch(() => null);
   panelKeyValues = { asr: asrInfo?.masked ?? "", asrBuiltin: !!asrInfo?.builtin };
@@ -3833,6 +3883,25 @@ function buildPanelMeta() {
     platform: PLATFORM === "win" ? "Windows" : PLATFORM === "mac" ? "macOS" : "Linux",
     model: currentModel.name || currentModel.type,
     providers: Object.entries(PROVIDERS).map(([id, p]) => ({ id, label: p.label, model: p.defaultModel })),
+    // 生图供应商是**另一张表**（和对话分开选，和对话也不同一个 Key 槽位）
+    imageProviders: IMAGE_PROVIDER_IDS.map((id) => ({
+      id,
+      label: IMAGE_PROVIDERS[id].label,
+      note: IMAGE_PROVIDERS[id].note ?? "",
+      models: IMAGE_PROVIDERS[id].defaultModels,
+    })),
+    image: {
+      // 面板要显示"当前接的是谁、缺什么"，缺省（undefined）= 没接入
+      configured: isImageConfigured(settings.assistant.image),
+      enabled: settings.assistant.imageEnabled !== false,
+      provider: settings.assistant.image?.provider ?? "",
+      model: settings.assistant.image?.model ?? "",
+      customBaseUrl: settings.assistant.image?.customBaseUrl ?? "",
+      activePresetId: settings.assistant.image?.activePresetId ?? "",
+      presets: settings.assistant.image?.presets ?? [],
+      hasKey: !!panelKeys.image,
+      models: panelImageModels,
+    },
     // 内置人设清单（只给面板渲染卡片用；正文留在 WebView 侧，点"套用"才写进设置）
     personas: BUILTIN_PERSONAS.map((p) => ({ id: p.id, name: p.name, tagline: p.tagline })),
     languages: OUTPUT_LANGUAGE_OPTIONS,
@@ -3955,6 +4024,9 @@ async function applyPanelPatch(patch: Record<string, unknown>): Promise<void> {
   if (!changed.size) return;
   settings = loadSettings();
   const previousAssistant = { ...settings.assistant };
+  // 生图供应商的旧值要单独按字符串记下来：settings.assistant.image 是对象引用，
+  // deepAssign 会就地改它，浅拷贝读到的是"已经改完"的新值（踩过：换供应商检测不生效）。
+  const prevImageProvider = settings.assistant.image?.provider ?? "";
   const { boundsPadding, ...otherPatch } = patch;
   deepAssign(settings as unknown as Record<string, unknown>, otherPatch);
   if (boundsPadding && typeof boundsPadding === "object") {
@@ -4025,6 +4097,34 @@ async function applyPanelPatch(patch: Record<string, unknown>): Promise<void> {
     ttsPlayer.setConfig(settings.tts.enabled, ttsApiKey, settings.tts.speakerId, settings.assistant.outputLanguage ?? "");
   }
   if (changed.has("assistant")) clearApiKeyCache();
+  // 生图接入：换供应商就等于换了一个账号/端点 —— 模型名和已拉的清单都不能沿用，
+  // 否则会拿着 A 家的模型名去打 B 家的端点（401/404 一堆怪现象）。
+  const imgPatch = (patch as { assistant?: { image?: Record<string, unknown> } }).assistant?.image;
+  if (imgPatch) {
+    const prevProvider = prevImageProvider;
+    // 选「不接入」：直接删掉这条配置（而不是留一个 provider="" 的空壳）
+    if ("provider" in imgPatch && !String(settings.assistant.image?.provider ?? "")) {
+      delete settings.assistant.image;
+      panelImageModels = [];
+      clearImageKeyCache();
+      saveSettingsRaw(settings);
+    } else if ("provider" in imgPatch && (settings.assistant.image?.provider ?? "") !== (prevProvider ?? "")) {
+      settings.assistant.image = {
+        provider: settings.assistant.image!.provider,
+        model: "",
+        customBaseUrl: settings.assistant.image!.customBaseUrl ?? "",
+      };
+      panelImageModels = [];
+      clearImageKeyCache();
+      saveSettingsRaw(settings);
+    }
+    if ("customBaseUrl" in imgPatch) {
+      clearImageKeyCache();
+    }
+    if ("provider" in imgPatch || "customBaseUrl" in imgPatch || "model" in imgPatch) {
+      clearImageKeyCache();
+    }
+  }
   // 人设页改的是结构化字段，这里统一拼成最终文本写回 persona —— 对话/日记/抽卡/麻将都读它
   const aPatch0 = (patch as { assistant?: Record<string, unknown> }).assistant;
   if (aPatch0 && ("personaFields" in aPatch0 || "personaFree" in aPatch0)) {
@@ -4135,6 +4235,42 @@ async function handlePanelKeyAction(kind: string, payload: unknown): Promise<voi
     } else if (kind === "asr") {
       await invoke("set_asr_key", { apiKey: value });
       toast(value ? "语音识别 Key 已保存" : "已清空识别 Key");
+    } else if (kind === "image") {
+      // 生图 Key 有独立槽位：换供应商就换槽位，绝不覆盖对话模型的 Key
+      const provider = settings.assistant.image?.provider;
+      if (!provider) {
+        toast("先在「生图模型接入」里选一个供应商，再填 Key", "warn");
+        return;
+      }
+      const slot = currentImageKeyScope(settings.assistant.image);
+      await setApiKey(value, slot);
+      clearImageKeyCache();
+      toast(value ? `生图 Key 已保存（${IMAGE_PROVIDERS[provider]?.label ?? provider}）` : "已清空生图 Key");
+      // 存完 Key 顺手拉一次模型清单并填好默认模型：用户不用再多点一次"获取模型列表"，
+      // 真正做到"选供应商 → 粘 Key → 就能画"。
+      if (value) {
+        const img = settings.assistant.image;
+        if (img) {
+          try {
+            const found = await listImageModels(resolveImageBase(img.provider, img.customBaseUrl), value);
+            panelImageModels = found;
+            const usable = found.length ? found : defaultImageModels(img.provider);
+            if (usable.length && !(img.model || "").trim()) {
+              settings.assistant.image = { ...img, model: usable[0] };
+              saveSettings(settings);
+            }
+            toast(
+              found.length
+                ? `已识别 ${found.length} 个生图模型，默认用 ${settings.assistant.image?.model || usable[0]}`
+                : `这个站点没返回模型列表，已用内置默认：${usable[0] ?? "（请手动填模型名）"}`,
+              found.length ? "info" : "warn",
+            );
+          } catch (e) {
+            // Key 本身存住了，拉清单失败只是"没识别到模型"，别把保存说成失败
+            toast(`Key 已保存，但没拉到生图模型清单：${e instanceof Error ? e.message : String(e)}`, "warn");
+          }
+        }
+      }
     }
   } catch (e) {
     toast(`保存失败：${e instanceof Error ? e.message : String(e)}`, "warn");
@@ -4209,6 +4345,70 @@ async function handlePanelPresetAction(kind: string, payload: unknown): Promise<
     }
   } catch (e) {
     toast(`预设操作失败：${e instanceof Error ? e.message : String(e)}`, "warn");
+  }
+  await pushPanelState();
+}
+
+/**
+ * 面板上的「生图预设」操作：与对话预设同构（各自独立 Key）。
+ * 槽位：`imagePreset:<id>`；应用预设 = 把 provider/model/base 抄进当前生效配置 + 换上它的 Key。
+ */
+async function handlePanelImagePresetAction(kind: string, payload: unknown): Promise<void> {
+  const img = settings.assistant.image;
+  if (!img) return void toast("先在「生图模型接入」里选好供应商，再存预设", "warn");
+  const list = (img.presets ??= []);
+  const sep = kind.indexOf(":");
+  const action = sep < 0 ? kind : kind.slice(0, sep);
+  const arg = sep < 0 ? "" : kind.slice(sep + 1);
+  try {
+    if (action === "save") {
+      if (!isImageConfigured(img)) return void toast("生图配置还不完整（缺供应商或接口地址），先填好再存预设", "warn");
+      const name = String((payload as { name?: string })?.name ?? "").trim() || `生图 ${list.length + 1}`;
+      const id = `i${Date.now().toString(36)}`;
+      // 先把当前 Key 复制进新槽位，再切号，否则存完预设 Key 就"没了"
+      const curKey = await getApiKey(currentImageKeyScope(img)).catch(() => "");
+      list.push({
+        id,
+        name,
+        provider: img.provider,
+        model: img.model,
+        customBaseUrl: img.customBaseUrl,
+      });
+      img.activePresetId = id;
+      saveSettings(settings);
+      if (curKey) await setApiKey(curKey, imagePresetKeyScope(id)).catch(() => {});
+      clearImageKeyCache();
+      toast(`已保存生图预设「${name}」`);
+    } else if (action === "apply") {
+      const p = list.find((x) => x.id === arg);
+      if (!p) return void toast("生图预设不见了，刷新一下", "warn");
+      img.activePresetId = p.id;
+      img.provider = p.provider;
+      img.model = p.model;
+      img.customBaseUrl = p.customBaseUrl;
+      saveSettings(settings);
+      clearImageKeyCache();
+      panelImageModels = [];
+      toast(`已切换到生图预设「${p.name}」`);
+    } else if (action === "rename") {
+      const p = list.find((x) => x.id === arg);
+      const name = String((payload as { name?: string })?.name ?? "").trim();
+      if (!p || !name) return void toast("名字不能为空", "warn");
+      p.name = name;
+      saveSettings(settings);
+      toast("已重命名生图预设");
+    } else if (action === "delete") {
+      const p = list.find((x) => x.id === arg);
+      if (!p) return;
+      img.presets = list.filter((x) => x.id !== arg);
+      if (img.activePresetId === arg) img.activePresetId = "";
+      saveSettings(settings);
+      await setApiKey("", imagePresetKeyScope(arg)).catch(() => {});
+      clearImageKeyCache();
+      toast(`已删除生图预设「${p.name}」`);
+    }
+  } catch (e) {
+    toast(`生图预设操作失败：${e instanceof Error ? e.message : String(e)}`, "warn");
   }
   await pushPanelState();
 }
@@ -4390,6 +4590,46 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
         toast("识别完成");
         break;
       }
+      case "image-models-fetch": {
+        // 和对话的「获取模型列表」一样：面板里刚粘的 Key 还没保存也能直接拿去测
+        const img = settings.assistant.image;
+        if (!img || !img.provider) {
+          toast("先在上面选一个生图供应商", "warn");
+          break;
+        }
+        const typed = String(p.key ?? "").trim();
+        if (typed) {
+          await setApiKey(typed, imageKeyScope(img.provider));
+          clearImageKeyCache();
+          panelKeys = { ...panelKeys, image: true };
+        }
+        const key = await getApiKey(imageKeyScope(img.provider));
+        if (!key) {
+          toast("还没填生图 Key：粘贴后点「保存」，或直接点这个按钮（会自动保存）", "warn");
+          break;
+        }
+        try {
+          const base = resolveImageBase(img.provider, img.customBaseUrl);
+          const found = await listImageModels(base, key);
+          panelImageModels = found;
+          const fallback = defaultImageModels(img.provider);
+          // 站点没给清单（很多中转站不提供 /models）就用内置默认，保证"填完 Key 至少能画一张"
+          const usable = found.length ? found : fallback;
+          if (usable.length && !(img.model || "").trim()) {
+            settings.assistant.image = { ...img, model: usable[0] };
+            saveSettings(settings);
+          }
+          toast(
+            found.length
+              ? `拿到 ${found.length} 个生图模型`
+              : `这个站点没返回生图模型列表，已用内置默认：${usable[0] ?? "（请手动填模型名）"}`,
+            found.length ? "info" : "warn",
+          );
+        } catch (e) {
+          toast(`获取失败：${e instanceof Error ? e.message : String(e)}`, "warn");
+        }
+        break;
+      }
       case "models-fetch": {
         // 面板可能刚粘贴了 Key 但还没点「保存」——这时候直接拿它去测，
         // 比先报一个 401「无效的令牌」再让用户猜要友好得多。
@@ -4415,13 +4655,9 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
             panelModelNote = kept.length < raw.length
               ? `站点返回 ${raw.length} 个模型，其中 ${raw.length - kept.length} 个是图像/语音类（已在对话模型里隐藏）`
               : `站点返回 ${raw.length} 个模型`;
-            // 自动识别生图模型：用户不用再手填一遍名字
-            panelImageModels = imageModels;
-            settings.assistant.imageCapable = imageModels.length > 0;
-            if (imageModels.length && !(settings.assistant.imageModel || "").trim()) {
-              settings.assistant.imageModel = imageModels[0];
-              saveSettings(settings);
-            }
+            // 生图模型**不再从对话端点里自动识别**（用户要求两种模型分开填）：
+            // 这里只统计"过滤掉了几个非对话模型"用于说明，生图清单由「生图模型接入」自己拉。
+            void imageModels;
           },
         );
         toast(
@@ -4621,6 +4857,10 @@ function runPanelAction(id: string, payload?: unknown): void {
     void handlePanelPresetAction(id.slice("__preset:".length), payload);
     return;
   }
+  if (id.startsWith("__imgpreset:")) {
+    void handlePanelImagePresetAction(id.slice("__imgpreset:".length), payload);
+    return;
+  }
   // 「把桌宠叫到前面」不是菜单项，是面板自己的入口：被隐藏/被窗口压住时用
   if (id === "show-pet") {
     void invoke("debug_mark", { msg: "[panel] 把桌宠叫到前面" }).catch(() => {});
@@ -4743,6 +4983,47 @@ void getVersion()
     schedulePanelSync();
   })
   .catch(() => {});
+
+/**
+ * 生图接入从「对话端点里的衍生值」变成了独立配置。老用户升级后自动迁移一条等价配置，
+ * 但必须**明确告诉他们一声**（用户要求"弹"）：不然他打开面板会发现原来的生图模型名跑到了
+ * 一个新的地方，不知道是不是被清掉了。
+ */
+/**
+ * 把旧的「按供应商」生图 Key 搬进预设槽位（`image:<provider>` → `imagePreset:<id>`）。
+ * 旧槽位**不删**：万一新槽位写入失败，或者用户回退版本，Key 还在。
+ */
+async function migrateImageKeySlot(): Promise<void> {
+  const img = settings.assistant.image;
+  if (!img?.activePresetId || img.keyMigrated) return;
+  try {
+    const oldKey = await getApiKey(imageKeyScope(img.provider)).catch(() => "");
+    if (oldKey) {
+      await invoke("set_api_key", { scope: imagePresetKeyScope(img.activePresetId), apiKey: oldKey });
+    }
+    const fresh = loadSettings();
+    if (fresh.assistant.image?.activePresetId === img.activePresetId) {
+      fresh.assistant.image.keyMigrated = true;
+      saveSettings(fresh);
+    }
+    clearImageKeyCache();
+    schedulePanelSync();
+  } catch (e) {
+    console.warn("生图 Key 槽位迁移失败（不影响使用，会在下次保存 Key 时自愈）", e);
+  }
+}
+
+function notifyImageMigrationIfNeeded(): void {
+  const s = loadSettings();
+  if (!s.assistant.imageMigrationNotice) return;
+  s.assistant.imageMigrationNotice = false;
+  saveSettings(s);
+  window.setTimeout(() => {
+    toast("生图接入已独立成单独配置（和对话模型分开），去「控制面板 → 小助手 → 生图模型接入」确认一下 Key 和模型", "info");
+  }, 2600);
+}
+notifyImageMigrationIfNeeded();
+void migrateImageKeySlot();
 
 
 async function toggleIdle() {
