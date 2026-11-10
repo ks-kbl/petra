@@ -3465,6 +3465,12 @@ function buildMenu(engine: BehaviorEngine, opts?: { ignoreIdle?: boolean }): Men
           toast("先开启语音输出再测试", "info");
           return;
         }
+        // 音色 ID 是必填项：留空时播放器会直接静默返回，用户只会看到"没声音"，
+        // 所以在点试听这一步就把原因说清楚，别让他去猜
+        if (!(settings.tts.speakerId ?? "").trim()) {
+          toast("还没填「音色 ID」：打开控制面板 → 语音 → 音色 ID，填火山控制台里复刻出来的那个", "warn");
+          return;
+        }
         const lang = settings.assistant.outputLanguage ?? "";
         ttsPlayer.setConfig(true, ttsApiKey, settings.tts.speakerId, lang);
         const testText: Record<string, string> = {
@@ -3476,7 +3482,9 @@ function buildMenu(engine: BehaviorEngine, opts?: { ignoreIdle?: boolean }): Men
           de: "Hallo, Sprachtest erfolgreich.",
           ru: "Привет, тест голоса успешен.",
         };
-        ttsPlayer.pushDelta(testText[lang] ?? "你好，语音测试成功。");
+        // 试听也要带上语气设置：用户想验的正是"增强语气到底有没有效果"
+        ttsPlayer.setEmotion("happy");
+        ttsPlayer.pushDelta(testText[lang] ?? "你好，语音测试成功，今天也要开心一点哦。");
         ttsPlayer.flush();
       },
     },

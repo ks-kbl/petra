@@ -269,6 +269,15 @@ export interface Settings {
     enabled: boolean;
     apiKey: string;
     speakerId: string;
+    /**
+     * 增强语气（唯一对用户开放的开关）。
+     *
+     * 打开后用火山「声音复刻 2.0」的表现力增强版，**语气细节全部由 AI 自己决定**：
+     * 走口令还是走逐句标签、语速音调怎么偏移、要不要共用 section_id，
+     * 都按它这条回复的情绪标签自动选，不再让用户调一堆参数。
+     * 官方提示这一档"存在效果抽卡"（同一句多次合成效果可能不同），所以默认关。
+     */
+    enhanced?: boolean;
   };
   /** 语音识别（输入）配置 */
   asr: {
@@ -309,6 +318,13 @@ export interface Settings {
     /** 触发阈值：0.1 最灵敏、0.9 最严格（默认 0.25） */
     threshold: number;
   };
+}
+
+/** 把存档里可能被手改坏的数值夹回合法区间（NaN/空值回落到默认） */
+function clampNum(v: unknown, min: number, max: number, dflt: number): number {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.max(min, Math.min(max, n));
 }
 
 const DEFAULTS: Settings = {
@@ -383,6 +399,7 @@ const DEFAULTS: Settings = {
     enabled: false,
     apiKey: "",
     speakerId: "",
+    enhanced: false,
   },
   asr: {
     cloudFirst: false,
@@ -455,7 +472,13 @@ export function loadSettings(): Settings {
       },
       diary: { ...DEFAULTS.diary, ...(parsed.diary ?? {}) },
       dailyCard: { ...DEFAULTS.dailyCard, ...(parsed.dailyCard ?? {}) },
-      tts: { ...DEFAULTS.tts, ...(parsed.tts ?? {}) },
+      tts: {
+        ...DEFAULTS.tts,
+        ...(parsed.tts ?? {}),
+        // 老存档里那几个细项（expressive / toneMode / speechRate / pitch / sectionContext）
+        // 已合并成一个 enhanced：只要用户当初开过表现力模式，就当作开了增强语气
+        enhanced: (parsed.tts?.enhanced ?? parsed.tts?.expressive ?? false) === true,
+      },
       asr: { ...DEFAULTS.asr, ...(parsed.asr ?? {}) },
     };
     // 一次性迁移：老存档的 cloudFirst/denoise=true 是旧代码默认值（不是用户选的），

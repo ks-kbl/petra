@@ -19,7 +19,7 @@
     "test:app": "tsc src/utils/foregroundApp.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/foreground-app.test.js",
     "test:assistant": "tsc src/assistant/toolRuntime.ts src/assistant/AssistantClient.ts src/assistant/EmotionEngine.ts src/ui/bubbleTiming.ts src/assistant/chatSummary.ts src/assistant/memoryNudge.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/assistant-tools.test.js && node tests/screen-vision.test.js && node tests/assistant-compat.test.js",
     "test:split": "tsc src/tts/sentenceSplit.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/sentence-split.test.js",
-    "test:tts": "tsc src/tts/TTSPlayer.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/tts-mute.test.js && node tests/tts-order.test.js && node tests/tts-gapless.test.js && node tests/tts-fluency.test.js",
+    "test:tts": "tsc src/tts/TTSPlayer.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/tts-mute.test.js && node tests/tts-order.test.js && node tests/tts-gapless.test.js && node tests/tts-fluency.test.js && node tests/tts-tone.test.js",
     "test:chatlog": "node tests/chatlog-core.test.js",
     "test:panel": "node tests/panel-regressions.test.js",
     "test:asr": "tsc src/asr/asrLogic.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/asr-logic.test.js",

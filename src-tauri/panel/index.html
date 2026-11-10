@@ -758,8 +758,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
           fields: [
             { type: "video", label: "看视频：怎么配置音色", url: "https://www.bilibili.com/video/BV1jsH464EMV/?vd_source=3209f4bd9932af82549a8ed8b43e4e99", thanks: "喜欢的话记得三联喵，谢谢喵～" },
             { path: "tts.enabled", label: "开启朗读", type: "switch" },
-            { path: "tts.speakerId", label: "音色 ID", type: "text", placeholder: "留空用默认音色" },
+            { path: "tts.speakerId", label: "音色 ID", type: "text", placeholder: "必填：火山控制台 → 声音复刻 → 音色管理里的 Speaker ID", desc: "留空不会出声：火山没有「默认音色」，必须自己复刻一个音色并把 ID 填在这里" },
             { type: "secret", key: "tts", label: "语音朗读 Key", desc: "填写时面板不显示，填写后覆盖原设置" },
+            { path: "tts.enhanced", label: "增强语气", type: "switch", desc: "开启后 AI 会按自己这条回复的情绪调语气（开心上扬、难过放低、生气略快…），语速语调、用哪种方式都由它自己决定，你不用调。用的是火山声音复刻 2.0 的表现力增强版，官方提示这一档「存在效果抽卡」——同一句多次合成效果可能不一样，觉得忽好忽坏就关掉" },
             { type: "actions", items: [{ id: "tts-test", label: "试听一句" }] },
           ],
         },
