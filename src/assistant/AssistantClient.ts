@@ -297,11 +297,10 @@ const TOOLS = [
     type: "function",
     function: {
       name: "launch_application",
-      description:
-        "打开/启动本机已安装的软件时调用。只传应用名称，系统自动解析安装位置。",
+      description: "打开本机已安装的软件。只传应用名。",
       parameters: {
         type: "object",
-        properties: { application: { type: "string", description: "应用名称，如\"网易云音乐\"、\"记事本\"、\"VS Code\"" } },
+        properties: { application: { type: "string", description: "应用名，如「记事本」「VS Code」" } },
         required: ["application"],
       },
     },
@@ -311,7 +310,7 @@ const TOOLS = [
     function: {
       name: "run_shell",
       description:
-        "执行一条 Windows cmd 只读查询命令（白名单：ipconfig/dir/ping/netstat/systeminfo/tasklist/whoami/tree/type/echo 等）。禁止修改/删除类操作。",
+        "执行一条 cmd 只读查询命令（白名单：ipconfig/dir/ping/netstat/tasklist/whoami/tree/type 等）。禁止修改删除类操作。",
       parameters: {
         type: "object",
         properties: { command: { type: "string", description: "要执行的完整 cmd 命令" } },
@@ -323,13 +322,13 @@ const TOOLS = [
     type: "function",
     function: {
       name: "remember",
-      description: "把用户个人信息/偏好/习惯归档到长期记忆。category: identity/preference/habit/schedule/relationship/event/other；importance: 1核心 2重要 3琐碎。",
+      description: "把用户的信息/偏好/习惯/事件归档进长期记忆。同一件事有新进展就再记一次（覆盖旧的）。",
       parameters: {
         type: "object",
         properties: {
-          content: { type: "string", description: "要记住的内容，用简洁的中文陈述句" },
-          category: { type: "string", enum: ["identity", "preference", "habit", "schedule", "relationship", "event", "other"], description: "记忆分类" },
-          importance: { type: "number", description: "重要度 1-3，1=核心 2=重要 3=琐碎" },
+          content: { type: "string", description: "简洁的中文陈述句" },
+          category: { type: "string", enum: ["identity", "preference", "habit", "schedule", "relationship", "event", "other"], description: "分类" },
+          importance: { type: "number", description: "1核心 2重要 3琐碎" },
         },
         required: ["content", "category", "importance"],
       },
@@ -339,11 +338,11 @@ const TOOLS = [
     type: "function",
     function: {
       name: "delete_wrong_history",
-      description: "当用户强烈纠正你之前记错的事实时，调用此工具删除旧对话里相关的错误对话。传入错误事实相关的具体关键词，系统会删除命中的完整旧对话轮次，保留用户本轮的纠正。此工具不修改长期记忆。",
+      description: "用户强烈纠正你记错的事实时，删掉历史里相关的错误对话轮次（保留本轮纠正，不动长期记忆）。",
       parameters: {
         type: "object",
         properties: {
-          keywords: { type: "string", description: "错误事实相关的关键词，多个关键词用空格隔开，比如：没睡觉 熬夜 通宵" },
+          keywords: { type: "string", description: "相关关键词，空格隔开，如：熬夜 通宵" },
         },
         required: ["keywords"],
       },
@@ -353,13 +352,12 @@ const TOOLS = [
     type: "function",
     function: {
       name: "set_volume",
-      description:
-        "调节系统音量。传 level (0-100) 设置音量百分比，传 mute (true/false) 静音/取消静音。",
+      description: "调系统音量：level 设百分比，mute 静音/取消静音。",
       parameters: {
         type: "object",
         properties: {
           level: { type: "number", description: "音量 0-100" },
-          mute: { type: "boolean", description: "true=静音, false=取消静音" },
+          mute: { type: "boolean", description: "true=静音" },
         },
       },
     },
@@ -368,11 +366,11 @@ const TOOLS = [
     type: "function",
     function: {
       name: "set_reminder",
-      description: "定时提醒用户。传入分钟后触发，显示一条提醒气泡。",
+      description: "定时提醒，到点弹一条气泡。",
       parameters: {
         type: "object",
         properties: {
-          minutes: { type: "number", description: "多少分钟后提醒" },
+          minutes: { type: "number", description: "多少分钟后" },
           message: { type: "string", description: "提醒内容" },
         },
         required: ["minutes", "message"],
@@ -383,7 +381,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "get_weather",
-      description: "获取当前天气信息，返回简短天气文字。无需参数。",
+      description: "当前天气。",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -391,11 +389,11 @@ const TOOLS = [
     type: "function",
     function: {
       name: "schedule_shutdown",
-      description: "定时关机。传入分钟后自动关机（1~1440分钟）。",
+      description: "定时关机。",
       parameters: {
         type: "object",
         properties: {
-          minutes: { type: "number", description: "多少分钟后关机" },
+          minutes: { type: "number", description: "多少分钟后（1~1440）" },
         },
         required: ["minutes"],
       },
@@ -405,7 +403,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "cancel_shutdown",
-      description: "取消之前设定的定时关机。",
+      description: "取消定时关机。",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -414,12 +412,13 @@ const TOOLS = [
     function: {
       name: "search_web",
       description:
-        "联网搜索，返回真实网页的标题、链接和摘要（不是打开浏览器）。遇到时效性信息（新闻、版本号、价格、赛事、近况）或自己拿不准的事实时主动调用它查证，不要凭记忆编造。关键词用 2~5 个词的短查询效果最好；搜不到就换个说法再试一次，不要原地重复同一个词。",
+        "联网搜索，返回真实网页的标题/链接/摘要（不是打开浏览器）。新闻、版本号、价格、赛事、近况或拿不准的事实必须先搜，别凭记忆编。关键词用 2~5 个词；没结果就换个说法再试一次。",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "搜索关键词" },
-        },    required: ["query"],
+        },
+        required: ["query"],
       },
     },
   },
@@ -427,10 +426,10 @@ const TOOLS = [
     type: "function",
     function: {
       name: "open_url",
-      description: "用系统默认浏览器打开一个网址（http/https）。用户给了具体链接时用它。",
+      description: "用默认浏览器打开网址。",
       parameters: {
         type: "object",
-        properties: { url: { type: "string", description: "完整网址，需带 http:// 或 https://" } },
+        properties: { url: { type: "string", description: "完整网址，含 http(s)://" } },
         required: ["url"],
       },
     },
@@ -440,11 +439,11 @@ const TOOLS = [
     function: {
       name: "close_web_page",
       description:
-        "关闭浏览器里用户指定的那个网页（标签页）。keyword 传页面标题或站点名里的关键词，例如「bilibili」「淘宝」「那个视频」。只关一个：如果匹配到多个页面，工具会返回候选列表，你要先问用户是哪一个，不要自己猜。",
+        "关闭用户指定的浏览器标签页。只关一个：匹配到多个页面时工具会返回候选，要先问用户是哪个。",
       parameters: {
         type: "object",
         properties: {
-          keyword: { type: "string", description: "要关闭的页面的关键词（页面标题或站点名的一部分，至少 2 个字）" },
+          keyword: { type: "string", description: "页面标题或站点名关键词（至少 2 个字）" },
         },
         required: ["keyword"],
       },
@@ -454,10 +453,10 @@ const TOOLS = [
     type: "function",
     function: {
       name: "open_path",
-      description: "用系统默认程序打开本机的文件或文件夹（路径必须真实存在）。如「打开我的下载文件夹」。",
+      description: "用默认程序打开本机的文件或文件夹。",
       parameters: {
         type: "object",
-        properties: { path: { type: "string", description: "文件或文件夹的完整路径" } },
+        properties: { path: { type: "string", description: "完整路径" } },
         required: ["path"],
       },
     },
@@ -467,12 +466,12 @@ const TOOLS = [
     function: {
       name: "create_entry",
       description:
-        "新建文件夹或文件。路径必须是绝对路径，且只能建在 桌面/文档/下载 之内（其它位置会被拒绝）。is_dir=true 建文件夹；建文件时可传 content 直接写入内容。已存在的文件不会被覆盖（改内容请用 edit_text_file / write_text_file）。",
+        "新建文件或文件夹，只能建在 桌面/文档/下载 之内。改已有文件请用 edit_text_file / write_text_file。",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "完整绝对路径，例如 D:\\桌面\\笔记\\todo.txt" },
-          is_dir: { type: "boolean", description: "true=新建文件夹，false=新建文件" },
+          path: { type: "string", description: "完整绝对路径，如 D:\\桌面\\笔记\\todo.txt" },
+          is_dir: { type: "boolean", description: "true=建文件夹" },
           content: { type: "string", description: "新建文件时的初始内容（可选）" },
         },
         required: ["path", "is_dir"],
@@ -484,12 +483,12 @@ const TOOLS = [
     function: {
       name: "generate_image",
       description:
-        "用生图模型画一张图，**生成后自动保存到用户桌面**并把文件路径返回给用户。用户说「画一张…」「生成一张…图片」「来张壁纸」时调用。prompt 要写得具体：主体、风格、构图、颜色、光线。",
+        "画一张图，生成后自动保存到用户桌面并返回路径。prompt 写具体：主体、风格、构图、颜色、光线。",
       parameters: {
         type: "object",
         properties: {
-          prompt: { type: "string", description: "画面描述（中文即可，越具体越好）" },
-          size: { type: "string", description: "可选尺寸，如 1024x1024、1024x1536；不确定就别传" },
+          prompt: { type: "string", description: "画面描述，越具体越好" },
+          size: { type: "string", description: "可选尺寸，如 1024x1024；不确定别传" },
         },
         required: ["prompt"],
       },
@@ -499,12 +498,11 @@ const TOOLS = [
     type: "function",
     function: {
       name: "copy_to_desktop",
-      description:
-        "把**已经存在的**文件复制到用户桌面（例如把刚生成的图放桌面、把别的目录里的图片拿过来）。用户说「把图片放到我桌面」「把那个文件弄到桌面」时调用。只需要源文件的完整路径。",
+      description: "把已经存在的文件复制到用户桌面。",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "要复制的文件完整绝对路径" },
+          path: { type: "string", description: "源文件完整路径" },
         },
         required: ["path"],
       },
@@ -515,13 +513,13 @@ const TOOLS = [
     function: {
       name: "read_text_file",
       description:
-        "读取一个文本文件的**内容**（不是用默认程序打开，那个用 open_path）。返回带行号信息的一段内容；文件很大时只会返回一部分（truncated=true），可以再用 start_line 接着读。二进制文件会被拒绝。",
+        "读取文本文件内容（不是用程序打开，那个用 open_path）。文件大时只返回一部分，可再用 start_line 续读；二进制文件会被拒绝。",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "文件完整绝对路径" },
-          start_line: { type: "number", description: "从第几行开始读（1 基，默认 1）" },
-          max_lines: { type: "number", description: "最多读多少行（默认 200，上限 2000）" },
+          path: { type: "string", description: "文件完整路径" },
+          start_line: { type: "number", description: "从第几行开始（默认 1）" },
+          max_lines: { type: "number", description: "最多读多少行（默认 200）" },
         },
         required: ["path"],
       },
@@ -532,14 +530,14 @@ const TOOLS = [
     function: {
       name: "edit_text_file",
       description:
-        "修改文件内容：把 old_string 精确替换成 new_string。old_string 必须与文件里的内容**完全一致**（含缩进和换行），所以通常先用 read_text_file 看一遍。匹配到多处时必须给出更长的唯一片段，或把 replace_all 设为 true。覆盖前会自动备份成 xxx.petra-bak。",
+        "把 old_string 精确替换成 new_string。old_string 必须与文件内容完全一致，先用 read_text_file 看一遍；多处匹配时要给更长的唯一片段或 replace_all=true。改前自动备份成 xxx.petra-bak。",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "文件完整绝对路径" },
-          old_string: { type: "string", description: "要被替换掉的原文（必须与文件内容完全一致）" },
-          new_string: { type: "string", description: "替换成的新内容；传空串表示删除这段" },
-          replace_all: { type: "boolean", description: "true=替换所有匹配（默认 false，多处匹配会报错让模型收敛）" },
+          path: { type: "string", description: "文件完整路径" },
+          old_string: { type: "string", description: "要被替换的原文，必须完全一致" },
+          new_string: { type: "string", description: "替换成的新内容；空串=删除这段" },
+          replace_all: { type: "boolean", description: "true=替换所有匹配" },
         },
         required: ["path", "old_string", "new_string"],
       },
@@ -550,13 +548,13 @@ const TOOLS = [
     function: {
       name: "write_text_file",
       description:
-        "整个写入一个文件（覆盖或追加）。覆盖已有文件前会自动备份成 xxx.petra-bak；新建可执行/脚本类文件（exe/bat/ps1 等）会被拒绝。只是改几处内容时优先用 edit_text_file，避免误伤其它内容。",
+        "整份写入文件（覆盖或追加）。覆盖前自动备份成 xxx.petra-bak；exe/bat/ps1 等可执行文件会被拒绝。只改几处请用 edit_text_file。",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "文件完整绝对路径" },
-          content: { type: "string", description: "要写入的完整内容" },
-          mode: { type: "string", enum: ["overwrite", "append"], description: "overwrite=覆盖（默认），append=追加到末尾" },
+          path: { type: "string", description: "文件完整路径" },
+          content: { type: "string", description: "完整内容" },
+          mode: { type: "string", enum: ["overwrite", "append"], description: "overwrite=覆盖（默认），append=追加" },
         },
         required: ["path", "content"],
       },
@@ -566,11 +564,10 @@ const TOOLS = [
     type: "function",
     function: {
       name: "list_directory",
-      description:
-        "列出文件夹里有什么（目录在前）。用户说「桌面有什么/我下载里那个文件叫啥」时用它先看一遍；小助手只能列 桌面/文档/下载 之内的目录。",
+      description: "列出文件夹里有什么（目录在前），只能看 桌面/文档/下载 之内。",
       parameters: {
         type: "object",
-        properties: { path: { type: "string", description: "文件夹完整绝对路径" } },
+        properties: { path: { type: "string", description: "文件夹完整路径" } },
         required: ["path"],
       },
     },
@@ -579,7 +576,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "list_installed_apps",
-      description: "列出开始菜单里可启动的软件名。用户想打开某个软件但你拿不准名字时，先查一次再调用 launch_application。",
+      description: "列出开始菜单里可启动的软件名；拿不准软件名时先查一次。",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -587,7 +584,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "active_window_title",
-      description: "查看用户当前正在使用的窗口标题（知道主人在用什么软件）。用户问「我在干嘛/现在开着什么」时可用。",
+      description: "用户当前窗口的标题。",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -595,7 +592,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "capture_screen",
-      description: "截取当前屏幕画面。当用户想让你「看屏幕/看看桌面/截图/我屏幕上有什么/帮我看看这个界面」时调用。调用后你会看到屏幕画面内容，可以据此回答用户关于屏幕上显示了什么的问题。",
+      description: "截屏，之后你能看到屏幕内容。用户说「看屏幕/截图/我屏幕上有什么」时调用。",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -603,7 +600,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "get_idle_seconds",
-      description: "查看用户已经多久没有操作电脑（秒）。用于判断主人在不在，例如要不要轻声问候。",
+      description: "用户多久没操作电脑（秒）。",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -611,12 +608,12 @@ const TOOLS = [
     type: "function",
     function: {
       name: "send_notification",
-      description: "弹一条桌面通知给用户（标题+内容）。适合「帮我记一下/过会儿提醒」这类不需要打断的告知。",
+      description: "弹一条桌面通知。",
       parameters: {
         type: "object",
         properties: {
-          title: { type: "string", description: "通知标题，简短" },
-          body: { type: "string", description: "通知正文" },
+          title: { type: "string", description: "标题，简短" },
+          body: { type: "string", description: "正文" },
         },
         required: ["title", "body"],
       },
@@ -626,7 +623,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "lock_screen",
-      description: "锁定电脑屏幕。仅在用户明确说「锁屏/离开一下」时调用。",
+      description: "锁屏。仅用户明确要求时调用。",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -634,8 +631,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "daily_card",
-      description:
-        "仅在用户明确说「抽卡/今日运势/来一发」时调用（每天一次，已抽过返回今天结果）。其他任何情况都不要调用，也不要主动提起抽卡。拿到结果后用你的人设风格点评，不要原样复述。",
+      description: "仅在用户明确说「抽卡/今日运势/来一发」时调用，每天一次；别主动提起。",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -643,12 +639,11 @@ const TOOLS = [
     type: "function",
     function: {
       name: "view_diary",
-      description:
-        "仅在用户明确说「看日记/今天写了什么」时调用。不传日期返回最近 3 条摘要，传日期（YYYY-MM-DD）返回那天完整日记。",
+      description: "仅在用户明确说「看日记/今天写了什么」时调用。",
       parameters: {
         type: "object",
         properties: {
-          date: { type: "string", description: "日期，格式 YYYY-MM-DD。留空则返回最近几条摘要。" },
+          date: { type: "string", description: "YYYY-MM-DD，留空看最近几条摘要" },
         },
       },
     },
@@ -658,19 +653,20 @@ const TOOLS = [
     function: {
       name: "search_chat_history",
       description:
-        "搜索完整聊天历史（不受最近 120 条窗口限制）。用户问「之前/上次/以前/我说过/你让我/那个提醒/计时」等旧事，或需要确认过去约定时调用。",
+        "搜索完整聊天历史（不受最近 120 条窗口限制）。用户问「之前/上次/我说过/你让我/那个提醒」等旧事时调用。",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "检索关键词，尽量用用户提到的核心词" },
-          days: { type: "number", description: "向前搜索多少天，默认 30；填 0 表示全部历史" },
-          limit: { type: "number", description: "返回几条命中，默认 5，最多 10" },
+          query: { type: "string", description: "检索关键词，用用户提到的核心词" },
+          days: { type: "number", description: "向前搜索多少天，默认 30；0=全部" },
+          limit: { type: "number", description: "返回几条，默认 5" },
         },
         required: ["query"],
       },
     },
   },
 ];
+
 
 /** system prompt 最多注入的记忆条数（token 控制；聊天时按场景召回后再传入） */
 const MAX_MEMORY_IN_PROMPT = 20;
@@ -717,35 +713,54 @@ function buildVersionInfo(): string {
   return _versionInfoCache;
 }
 
-/** 组装 system prompt。导出是为了让测试能锁住"语言指令必须在最后"这条顺序（见 tests/assistant-tools.test.js）。 */
-export function systemPrompt(
-  persona: string,
-  memory: MemoryStore,
-  extraContext = "",
-  profileText = "",
-  historySummary = "",
-): string {
-  // 画像放 BASE_PROMPT 之后、记忆清单之前：
-  // 先让模型知道"这是谁"，再看到具体条目；extraContext（语言指令）仍压在最尾部。
-  const prof = profileText.trim() ? "\n\n" + profileText.trim() : "";
-  // 更早对话的滚动摘要：补 buildMessages 窗口切掉的上下文（长聊不失忆）
-  const hist = historySummary.trim() ? "\n\n" + historySummary.trim() : "";
-  let mem = "";
+/**
+ * 静态 system prompt：只有人格设定 + 固定的 BASE_PROMPT。
+ *
+ * **必须逐字节稳定**：它在请求的最前面，而供应商的前缀缓存（DeepSeek/OpenAI 等都按
+ * 「从头开始一模一样」的前缀打折计费）只认这一段。以前把当前时间、召回的记忆、画像
+ * 情绪、最近生成的图都写进 system，每轮都在变 → 整段历史每轮都按全价重算。
+ */
+export function systemPrompt(persona: string): string {
+  return `${persona ? persona + "\n\n" : ""}${BASE_PROMPT}`;
+}
+
+/**
+ * 每轮都会变的上下文：画像与情绪、召回的记忆、旧对话摘要、环境（称呼/时间）、
+ * 生图能力、过期任务提示。
+ *
+ * 统一压到**最后一条 user 消息的末尾**（见 toWireMessages）：工具定义 + system + 历史
+ * 组成的前缀就固定不变，缓存能命中；同时语言指令仍留在整段请求的最后，不会因为顺序
+ * 问题被中文语境带跑（"设置日语却回中文"就是这么来的）。
+ *
+ * 顺序有讲究：extraContext 里压着语言指令，必须排在最后一块。
+ */
+export function contextBlock(opts: {
+  memory?: MemoryStore;
+  profileText?: string;
+  historySummary?: string;
+  extraContext?: string;
+}): string {
+  const blocks: string[] = [];
+  const prof = (opts.profileText ?? "").trim();
+  if (prof) blocks.push(prof);
+  const memory = opts.memory ?? [];
   if (memory.length > 0) {
-    // 按重要度排序，核心记忆在前，超限截断
     const sorted = [...memory].sort((a, b) => a.importance - b.importance).slice(0, MAX_MEMORY_IN_PROMPT);
-    mem = "\n\n关于用户的记忆（按重要度排序）：\n" +
-      sorted.map((m) => {
-        const age = Date.now() - m.createdAt;
-        const days = Math.floor(age / 86400000);
-        const timeNote = days > 30 ? `（${Math.floor(days / 30)}个月前）` : days > 0 ? `（${days}天前）` : "（今天）";
-        return `- [${m.category}] ${m.content} ${timeNote}`;
-      }).join("\n");
+    blocks.push(
+      "关于用户的记忆（按重要度排序）：\n" +
+        sorted.map((m) => {
+          const age = Date.now() - m.createdAt;
+          const days = Math.floor(age / 86400000);
+          const timeNote = days > 30 ? `（${Math.floor(days / 30)}个月前）` : days > 0 ? `（${days}天前）` : "（今天）";
+          return `- [${m.category}] ${m.content} ${timeNote}`;
+        }).join("\n"),
+    );
   }
-  // extraContext 放**最后**：它里面压着语言指令（"必须全程用日语回复"）。
-  // 之前它排在 BASE_PROMPT 和记忆前面，后面紧跟着一大段中文，模型就顺着中文继续说中文
-  // （"设置日语却回中文"的根因）。指令要放尾部，模型对末尾最敏感。
-  return `${persona ? persona + "\n\n" : ""}${BASE_PROMPT}${prof}${mem}${hist}${extraContext ? "\n\n" + extraContext : ""}`;
+  const hist = (opts.historySummary ?? "").trim();
+  if (hist) blocks.push(hist);
+  const extra = (opts.extraContext ?? "").trim();
+  if (extra) blocks.push(extra);
+  return blocks.join("\n\n");
 }
 
 /**
@@ -790,35 +805,76 @@ export function sanitizeToolHistory(messages: ChatMessage[]): ChatMessage[] {
 
 /** 上下文窗口管理：截断 history（最近 N 条 + 字符上限），记忆并入 system。
  *  截断时不切断 tool_calls 序列（不删除紧跟 tool 消息的 assistant 消息）。 */
-function buildMessages(
+export function buildMessages(
   history: ChatMessage[],
   persona: string,
-  memory: MemoryStore,
-  extraContext = "",
   systemOverride = "",
-  profileText = "",
-  historySummary = "",
 ): ChatMessage[] {
   const MAX_MSGS = 120;
+  /** 窗口前移的步长：见下面的"量化起点" */
+  const WINDOW_STEP = 20;
   const MAX_CHARS = 30000;
+  /** 超预算时一次砍到 80%，不要每轮挪一条 */
+  const TRIM_TO_CHARS = Math.floor(MAX_CHARS * 0.8);
   // 先修序列再截断：坏序列留着会让整轮 400
-  let msgs = sanitizeToolHistory(history).slice(-MAX_MSGS);
-  // 定长切片可能正好从一条 tool 结果开始：OpenAI/DeepSeek 兼容端点要求 role=tool
-  // 必须紧跟带 tool_calls 的 assistant，否则整轮直接 400。历史是持久化且不限长的，
-  // 用过工具/日记/文件的长会话迟早会踩到。
-  msgs = sanitizeToolHistory(msgs);
+  const clean = sanitizeToolHistory(history);
+  // 定量化起点：直接 slice(-120) 的话，历史每多一条窗口就前移一条，
+  // **两次请求的前缀处处不同 → 前缀缓存永远命中不了**（长会话里等于每轮全价重算）。
+  // 改成按 20 条一格对齐，窗口每 20 条才整体前移一次，中间 19 轮前缀逐字节相同。
+  const rawStart = Math.max(0, clean.length - MAX_MSGS);
+  const start = Math.floor(rawStart / WINDOW_STEP) * WINDOW_STEP;
+  let msgs = clean.slice(start);
   let total = msgs.reduce((s, m) => s + (m.content?.length ?? 0), 0);
-  while (msgs.length > 2 && total > MAX_CHARS) {
-    // 若下一条是 tool 消息，说明当前是带 tool_calls 的 assistant，不能删
-    if (msgs[1]?.role === "tool") break;
-    total -= msgs[0].content?.length ?? 0;
-    msgs = msgs.slice(1);
+  if (total > MAX_CHARS) {
+    while (msgs.length > 2 && total > TRIM_TO_CHARS) {
+      // 一次丢掉"开头这一轮"——assistant + 它的全部 tool 结果要一起丢，
+      // 否则剩下的 tool 消息没有配对的 tool_calls，整轮 400。
+      let cut = 1;
+      while (cut < msgs.length && msgs[cut].role === "tool") cut++;
+      if (cut >= msgs.length - 1) break;
+      for (let k = 0; k < cut; k++) total -= msgs[k].content?.length ?? 0;
+      msgs = msgs.slice(cut);
+    }
   }
-  // 字符裁剪同样可能裁出孤立 tool（比如裁掉 assistant 那一轮）
+  // 裁剪同样可能裁出孤立 tool（比如裁掉 assistant 那一轮）
   msgs = sanitizeToolHistory(msgs);
   // systemOverride：轻量调用（如麻将实时点评）用它替代完整系统提示，省掉 BASE_PROMPT 与记忆
-  const system = systemOverride || systemPrompt(persona, memory, extraContext, profileText, historySummary);
+  const system = systemOverride || systemPrompt(persona);
   return [{ role: "system", content: system }, ...msgs];
+}
+
+/**
+ * 发送前的整形（只影响发出去的那一份，不动历史）：
+ *
+ * 1. 去掉只给本地用的 `ts`：每条消息十来个字符，120 条也就一两 k，但白送不如不要；
+ * 2. 把易变上下文 + 收尾语言提醒贴到**最后一条 user 消息的末尾**。
+ *
+ * 为什么贴在消息里而不是 system：工具定义 + system + 历史是最前面的一大段，
+ * 只要它在两次请求之间逐字节相同，供应商的前缀缓存就能命中（命中部分通常只按
+ * 1/10 计价）。任何写进 system 的易变量（时间、召回的记忆、情绪）都会让缓存整段失效。
+ * 而贴到最后一条 user 消息上，前缀完全不动，且语言指令依旧压在整段请求的最末尾。
+ */
+export function toWireMessages(
+  messages: ChatMessage[],
+  tail = "",
+  tailInstruction = "",
+): ChatMessage[] {
+  const out = messages.map((m) => {
+    const copy = { ...m };
+    delete copy.ts;
+    return copy;
+  });
+  const extra = [tail, tailInstruction]
+    .map((s) => (s || "").trim())
+    .filter(Boolean)
+    .join("\n\n");
+  if (!extra) return out;
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (out[i].role !== "user") continue;
+    out[i] = { ...out[i], content: `${out[i].content ?? ""}\n\n${extra}` };
+    break;
+  }
+  return out;
 }
 
 /**
@@ -1034,10 +1090,15 @@ export async function chatStream(
   const base = resolveBase(provider, customBaseUrl);
   const m = await resolveModelForRequest(provider, model, apiKey, base, customBaseUrl);
   if (!m) throw new Error("未设置模型名");
-  const baseMessages = buildMessages(
-    history, persona, memory, extraContext, systemOverride,
-    requestOptions.profileText ?? "", requestOptions.historySummary ?? "",
-  );
+  const baseMessages = buildMessages(history, persona, systemOverride);
+  // 易变上下文全部走消息尾部（见 toWireMessages）：system 只留人格 + BASE_PROMPT，
+  // 前缀才能稳定命中缓存。
+  const tailBlock = contextBlock({
+    memory,
+    profileText: requestOptions.profileText ?? "",
+    historySummary: requestOptions.historySummary ?? "",
+    extraContext,
+  });
   // 插件工具是运行时注册的：每次请求都重新拼一份，不能缓存在模块级常量里。
   const off = new Set(requestOptions.disabledTools ?? []);
   const toolDefs = enableTools
@@ -1056,7 +1117,11 @@ export async function chatStream(
   let useStream = true;
 
   const bodyFor = (toolsOn: boolean, streamOn: boolean): string => {
-    const messages = toolsOn ? baseMessages : stripToolData(baseMessages);
+    const messages = toWireMessages(
+      toolsOn ? baseMessages : stripToolData(baseMessages),
+      tailBlock,
+      requestOptions.tailInstruction ?? "",
+    );
     return JSON.stringify({
       model: m,
       messages: attachScreenImage(
@@ -1783,6 +1848,13 @@ export interface ChatRequestOptions {
   screenImage?: string;
   /** 用户本轮附加的图片（dataURL）。只在本轮请求里编码，不写进历史 */
   userImages?: string[];
+  /**
+   * 压在本轮最后一行的一句话（语言提醒之类）。
+   *
+   * 以前它被拼进 user 消息后再存进历史，于是**每一条历史 user 消息**都白带着同一句话，
+   * 120 条就是几千字符。现在只在发送时贴到最末尾，既省 token 又保证"最后一行"语义。
+   */
+  tailInstruction?: string;
   /**
    * 额外的工具定义（插件工具）。内置 TOOLS 始终会一起发；
    * 这里只放插件注册的工具，避免和内置表重复。

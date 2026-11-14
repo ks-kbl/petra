@@ -2249,9 +2249,11 @@ async function send(text: string) {
   if (sentImages.length) addUserAttachmentBubble(text.trim(), sentImages.map((i) => i.dataUrl));
   // 用户提到"之前/上次/让你/计时"等旧事：先自动检索一次完整历史（模型也保留工具备查）
   const historyRecall = await autoRecallHistory(composed);
-  // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑
+  // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑。
+  // 但它**不进历史**——交给 chatStream 的 tailInstruction 在发送时贴到最后一行，
+  // 否则之后每一条历史 user 消息都会带着同一句提醒，纯烧 token。
   const langReminder = buildLanguageReminder(outLang ?? "");
-  const userContent = langReminder ? `${composed}\n${langReminder}` : composed;
+  const userContent = composed;
   // 用户在纠正我（"记错了/我没说过/别记这个"）：记下来，这轮回复完立刻跑一次记忆提取，
   // 不等攒够 6 条 —— 否则 AI 会带着错的记忆再聊好几轮。
   const correctingNow = detectCorrection(text);
@@ -2339,6 +2341,8 @@ async function send(text: string) {
           profileText: [personaContextBlock(), turnNudge, historyRecall].filter(Boolean).join("\n\n"),
           // 长聊之后补上被窗口切掉的旧对话，避免"聊到一半突然不认识你"
           historySummary: summaryBlock(chatSummary),
+          // 语言提醒只贴在本轮请求最后一行，不写进历史
+          ...(langReminder ? { tailInstruction: langReminder } : {}),
         },
       );
       if (colorHook.lastEmotion() !== "neutral") streamEmo = colorHook.lastEmotion();

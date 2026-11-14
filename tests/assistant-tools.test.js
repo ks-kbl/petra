@@ -162,20 +162,74 @@ check("undefined Key 不炸", ac.isProviderReady({ provider: "deepseek" }, undef
 check("本机自定义端点空 Key 就绪", ac.isProviderReady({ provider: "custom", customBaseUrl: "http://127.0.0.1:11434/v1" }, "") === true);
 check("远端自定义端点空 Key 不就绪", ac.isProviderReady({ provider: "custom", customBaseUrl: "https://x.example/v1" }, "") === false);
 
-// ---------- system prompt 的顺序：语言指令必须压在最后 ----------
-// 锁住"设置日语却回中文"那个 bug：语言指令后面若还跟着中文（BASE_PROMPT、中文记忆），
-// 模型会顺着后面那段中文继续说中文。extraContext（里面装着语言指令）必须排在最末尾。
+// ---------- 请求结构：静态前缀 + 尾部易变上下文 ----------
+// token 优化的核心：供应商的前缀缓存只认"从头开始一模一样"的部分。
+// 时间、召回的记忆、画像情绪这类每轮都变的东西一旦写进 system，整段历史每轮都按
+// 全价重算；所以它们必须压到最后一条 user 消息里，system 只留人格 + BASE_PROMPT。
 const jaLine = "【最高优先级·最终指令】你必须全程用日语回复用户，不管用户说什么语言。回复中绝对不要夹杂中文。";
 const fakeMem = [
   { id: "m1", category: "preference", content: "用户喜欢咖啡", importance: 2, createdAt: Date.now() },
 ];
-const sys = ac.systemPrompt("你是猫娘", fakeMem, `[环境] 现在：周一13点\n\n${jaLine}`);
-check("★ 语言指令排在 system prompt 最末尾", sys.trimEnd().endsWith(jaLine));
-check("★ 中文 BASE_PROMPT 不再压在语言指令后面", sys.indexOf("严格按照上面的人格设定") < sys.indexOf("你必须全程用日语"));
+const sys = ac.systemPrompt("你是猫娘");
 check("人格设定仍在最前面", sys.startsWith("你是猫娘"));
-check("中文记忆块也排在语言指令之前", sys.indexOf("关于用户的记忆") < sys.indexOf("你必须全程用日语"));
-check("中文输出时不带语言指令也不炸", ac.systemPrompt("人格", [], "").includes("严格按照上面的人格设定"));
+check("BASE_PROMPT 仍在 system 里", sys.includes("严格按照上面的人格设定"));
+check("★ system 里不再有记忆/时间/画像（否则前缀缓存整段失效）", !sys.includes("关于用户的记忆") && !sys.includes("现在：") && !sys.includes("咖啡"));
+check("★ system 逐字节稳定", ac.systemPrompt("你是猫娘") === ac.systemPrompt("你是猫娘"));
 
+const tail = ac.contextBlock({
+  memory: fakeMem,
+  profileText: "【画像】爱喝咖啡",
+  historySummary: "【更早的对话】聊了接口",
+  extraContext: `[环境] 现在：周一13点\n\n${jaLine}`,
+});
+check("记忆/画像/摘要/环境都进了尾部块", tail.includes("咖啡") && tail.includes("爱喝咖啡") && tail.includes("更早的对话") && tail.includes("现在：周一13点"));
+check("★ 语言指令在尾部块的最后一块", tail.trimEnd().endsWith(jaLine));
+check("没有易变内容时尾部块是空串", ac.contextBlock({}) === "");
+
+const reminder = "[系统提醒：你必须用日语回复，不要用中文]";
+const wire = ac.toWireMessages(
+  [
+    { role: "system", content: sys },
+    { role: "user", content: "你好", ts: 1 },
+    { role: "assistant", content: "嗨", ts: 2 },
+    { role: "user", content: "在吗", ts: 3 },
+  ],
+  tail,
+  reminder,
+);
+const lastWire = wire[wire.length - 1];
+check("易变上下文贴到最后一条 user 消息上", String(lastWire.content).includes("爱喝咖啡"));
+check("★ 整段请求的最后一行是语言提醒", String(lastWire.content).trimEnd().endsWith(reminder));
+check("★ 历史消息不再携带 ts 字段（纯省 token）", wire.every((m) => m.ts === undefined));
+check("前缀消息一字不改，缓存才能命中", wire[1].content === "你好" && wire[2].content === "嗨");
+check("只给 system 也照样能发", ac.toWireMessages([{ role: "user", content: "hi", ts: 1 }]).length === 1);
+{
+  // 同一段历史、两轮不同的易变上下文：前缀必须完全一致
+  const h = [{ role: "user", content: "第一句", ts: 1 }, { role: "assistant", content: "收到", ts: 2 }];
+  const a = ac.toWireMessages([{ role: "system", content: sys }, ...h, { role: "user", content: "第二轮", ts: 3 }], "今日天气 晴", reminder);
+  const b = ac.toWireMessages([{ role: "system", content: sys }, ...h, { role: "user", content: "第二轮", ts: 3 }], "今日天气 雨", reminder);
+  check("★ 易变内容不同，前缀（工具前那段）依旧逐字节相同", JSON.stringify(a.slice(0, -1)) === JSON.stringify(b.slice(0, -1)));
+}
+
+// ---------- 历史窗口：按格前移，保证前缀可缓存 ----------
+{
+  const mk = (n) => Array.from({ length: n }, (_, i) => ({
+    role: i % 2 ? "assistant" : "user",
+    content: `第${i}条`,
+    ts: i,
+  }));
+  const w121 = ac.buildMessages(mk(121), "人格");
+  const w125 = ac.buildMessages(mk(125), "人格");
+  check("★ 窗口每隔 20 条才整体前移（121→125 条窗口起点不变）", w121[1].content === w125[1].content);
+  const w141 = ac.buildMessages(mk(141), "人格");
+  check("★ 到 141 条才前移一格", w141[1].content !== w121[1].content);
+  check("窗口不会无限长", w141.length - 1 <= 120 + 20, String(w141.length - 1));
+  check("system 只有一条且在最前", w141[0].role === "system" && w141.filter((m) => m.role === "system").length === 1);
+  // 一条超长消息把预算撑爆时，一次砍到 80% 以内
+  const fat = mk(20).map((m, i) => (i === 0 ? { ...m, content: "长".repeat(30000) } : m));
+  const trimmed = ac.buildMessages(fat, "人格");
+  check("超预算的长历史被裁到 80% 以内", trimmed.slice(1).reduce((s, m) => s + m.content.length, 0) <= 24000);
+}
 
   // ---- 工具调用序列修复（sanitizeToolHistory） ----
   // 端点要求：role=tool 必须紧跟带 tool_calls 的 assistant，且每个 id 都要有结果。
