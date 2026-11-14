@@ -57,12 +57,22 @@ const mk = () => new Float32Array(sr);
   check("多声道任一声道有声即保留", b.duration > 0.05, String(b.duration));
 }
 
-// ---------- 停顿 ----------
-check("句末留自然停顿", mod.pauseAfterSegment("今天天气不错。") === 0.07);
-check("问号也算句末", mod.pauseAfterSegment("吃了吗？") === 0.07);
-check("逗号处几乎不留缝", mod.pauseAfterSegment("今天天气不错，") === 0.015);
-check("换行/兜底处留中等停顿", mod.pauseAfterSegment("第一行内容足够长了吧") === 0.045);
+// ---------- 停顿（2026-11 调大：70ms 听起来等于没停顿） ----------
+check("句末留自然停顿", mod.pauseAfterSegment("今天天气不错。") === 0.3);
+check("问号也算句末", mod.pauseAfterSegment("吃了吗？") === 0.3);
+check("★ 省略号停得比句号久", mod.pauseAfterSegment("我在想……") === 0.5);
+check("英文省略号同样处理", mod.pauseAfterSegment("wait...") === 0.5);
+check("逗号处只留短缝", mod.pauseAfterSegment("今天天气不错，") === 0.08);
+check("没标点的兜底段", mod.pauseAfterSegment("第一行内容足够长了吧") === 0.16);
 check("空串不炸", typeof mod.pauseAfterSegment("") === "number");
+
+// ---------- 按「切分原因」给停顿：换行/省略号靠这个才停得下来 ----------
+check("★ 换行切开留段落停顿", mod.pauseForBoundary("newline") === 0.35);
+check("★ 省略号留最长停顿", mod.pauseForBoundary("ellipsis") === 0.5);
+check("句末停顿", mod.pauseForBoundary("sentence") === 0.3);
+check("逗号兜底切", mod.pauseForBoundary("soft") === 0.08);
+check("硬切兜底", mod.pauseForBoundary("hard") === 0.16);
+check("换行停顿 > 句末 > 逗号", mod.pauseForBoundary("newline") > mod.pauseForBoundary("sentence") && mod.pauseForBoundary("sentence") > mod.pauseForBoundary("soft"));
 
 console.log(`tts-fluency: fail=${fail}`);
 process.exit(fail ? 1 : 0);

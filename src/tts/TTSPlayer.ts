@@ -9,7 +9,8 @@
  * 「一顿一顿」。现在改成：
  *   1. 用 Web Audio 解码，把每段首尾的静音裁掉（保留一点点自然尾音）；
  *   2. 多段音频**提前排好时间轴**连续调度，段与段之间不再等事件回调；
- *   3. 只在真正的句末留 ~70ms 停顿，逗号/超长兜底切开的地方只留 ~15ms；
+ *   3. 停顿按「这一段为什么被切开」给：句末 ~0.3s、换行 ~0.35s、省略号 ~0.5s、
+ *      逗号兜底切 ~0.08s（2026-11 调大过：70ms 听起来等于没停顿）；
  *   4. 每段进出各做几毫秒淡入淡出，接缝处没有咔哒声。
  * 浏览器不支持 Web Audio 或解码失败时，自动退回原来的 HTMLAudioElement 队列
  * （Node 单测也走这条兜底路径，逻辑和旧版一致）。
@@ -18,7 +19,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { loadSettings } from "../utils/settings";
 import { holdWake, releaseWake } from "../audio/wakeGate";
-import { takeSpeechSegment, flushSpeechSegment } from "./sentenceSplit";
+import { takeSpeechSegment, flushSpeechSegment, type SpeechBoundary } from "./sentenceSplit";
 
 interface QueueItem {
   text: string;
@@ -38,9 +39,22 @@ interface QueueItem {
 
 /** 句末标点：只有这些结尾才值得留一个自然停顿 */
 const SENTENCE_END_RE = /[。！？!?…]$/;
-/** 句末停顿（秒）；逗号/兜底切开处只留很短的接缝 */
-const PAUSE_SENTENCE = 0.07;
-const PAUSE_SOFT = 0.015;
+/** 省略号：欲言又止，比句号停得更久 */
+const ELLIPSIS_RE = /(…|…{2,}|\.{2,})$/;
+/**
+ * 断句后的停顿（秒）。
+ *
+ * 2026-11 调大过一轮：以前句末只留 70ms、逗号 15ms，本意是消除"一顿一顿"，
+ * 那是旧的 `new Audio()` 队列时代（每段还带着几百毫秒解码间隙）。改成 Web Audio
+ * 预排时间轴后唯一的停顿来源就是这里，70ms 听起来等于没有——用户反馈"换行和省略号
+ * 不会断句、没有停顿"。现在按真实口语的换气长度给：句末 ~0.3s、换行 ~0.35s、
+ * 省略号 ~0.5s、逗号 ~0.08s。
+ */
+const PAUSE_SENTENCE = 0.3;
+const PAUSE_ELLIPSIS = 0.5;
+const PAUSE_NEWLINE = 0.35;
+const PAUSE_SOFT = 0.08;
+const PAUSE_HARD = 0.16;
 /** 调度时留一点提前量，避免 `currentTime` 已经越过开始时间 */
 const SCHEDULE_LEAD = 0.035;
 /** 裁剪静音时首尾各保留的余量（秒） */
@@ -94,9 +108,27 @@ export function findSpeechBounds(
  */
 export function pauseAfterSegment(text: string): number {
   const t = text.trim();
+  if (ELLIPSIS_RE.test(t)) return PAUSE_ELLIPSIS;
   if (SENTENCE_END_RE.test(t)) return PAUSE_SENTENCE;
   if (/[，,、；;：:]$/.test(t)) return PAUSE_SOFT;
-  return 0.045;
+  return PAUSE_HARD;
+}
+
+/**
+ * 按「被切开的理由」给停顿。
+ *
+ * 用切分时记录的原因、而不是回头猜文本结尾：换行切出来的段结尾根本没有标点
+ * （`slice(0, i).trim()` 会把换行剥掉），只看文本永远是"兜底长度"——这就是
+ * "换行不会停顿"的直接原因。
+ */
+export function pauseForBoundary(boundary: string): number {
+  switch (boundary) {
+    case "sentence": return PAUSE_SENTENCE;
+    case "ellipsis": return PAUSE_ELLIPSIS;
+    case "newline": return PAUSE_NEWLINE;
+    case "soft": return PAUSE_SOFT;
+    default: return PAUSE_HARD;
+  }
 }
 
 /**
@@ -290,10 +322,10 @@ class TTSPlayer {
       this.stopped = true;
     }
     // 攒够一句再送：短句会合并，不会出现"好。/对。"各自合成一次的碎片感
-    let seg: { segment: string; rest: string } | null = null;
+    let seg: { segment: string; rest: string; boundary: SpeechBoundary } | null = null;
     while ((seg = takeSpeechSegment(this.buffer))) {
       this.buffer = seg.rest;
-      this.enqueue(seg.segment);
+      this.enqueue(seg.segment, seg.boundary);
     }
   }
 
@@ -333,9 +365,10 @@ class TTSPlayer {
     this.setWakePaused(false);
   }
 
-  private enqueue(text: string) {
+  private enqueue(text: string, boundary?: SpeechBoundary) {
     const original = text.trim();
-    const pause = pauseAfterSegment(original);
+    // 有切分理由就按理由给停顿，没有（收尾的最后一小段）才回头按标点猜
+    const pause = boundary ? pauseForBoundary(boundary) : pauseAfterSegment(original);
     let clean = text
       // 括号里的动作/旁白不读（"（笑）""(小声)"），否则会念出来很出戏
       .replace(/[（(][^）)]*[）)]/g, "")
@@ -359,6 +392,9 @@ class TTSPlayer {
       // 表格竖线/分隔行不读
       .replace(/^\s*\|?[\s:|-]{4,}\|?\s*$/gm, "")
       .replace(/\|/g, " ")
+      // 段内残留的换行换成逗号：合成引擎按标点换气，直接压成空格就没有停顿了
+      // （短行会被"攒够长度再送"合并成一段，合并后行与行之间的换行就落在这里）
+      .replace(/\s*[\r\n]+\s*/g, "，")
       .replace(/\s+/g, " ")
       .trim();
     // 补一个句末标点：没有收尾标点时 TTS 的语调会"悬着"，听起来就是断在半句上

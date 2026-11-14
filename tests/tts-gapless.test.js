@@ -105,9 +105,11 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
     check("按文字顺序调度", !!a && !!b);
     check("第一段裁掉了开头静音", a.offset > 0, String(a.offset));
     check("第一段裁掉了结尾静音", a.duration < 0.3, String(a.duration));
+    // 2026-11：句间停顿从 70ms 调到 300ms（用户反馈"没有停顿"），
+    // 但"提前排好时间轴"这条不变——下半段仍然在第一段还没播完时就已经排进队列。
     check(
-      "第二段在第一段结束前就已排好（无缝）",
-      b.when >= a.when + a.duration && b.when < a.when + a.duration + 0.2,
+      "第二段在第一段结束前就已排好（只差一个句间停顿）",
+      Math.abs(b.when - (a.when + a.duration) - 0.3) < 0.02,
       JSON.stringify({ a, b }),
     );
   }
