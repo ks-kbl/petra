@@ -29,8 +29,8 @@ check("有公告", !!latest);
 check("★ 最新公告版本号 == package.json 版本号（发版别忘了写公告）", latest === pkg.version, `${latest} vs ${pkg.version}`);
 
 const one = ann.getUnreadAnnouncement();
-check("★ 没读过就该弹出来", !!one && one.version === "0.3.9", JSON.stringify(one && one.version));
-check("公告有标题和正文行", !!one && one.title.includes("0.3.9") && one.lines.length >= 3, one && one.title);
+check("★ 没读过就该弹出来", !!one && one.version === pkg.version, JSON.stringify(one && one.version));
+check("公告有标题和正文行", !!one && one.title.includes(pkg.version) && one.lines.length >= 3, one && one.title);
 check("正文里没有空字符串", !!one && one.lines.every((l) => typeof l === "string" && l.trim().length > 0));
 
 // 读过之后就不再弹
