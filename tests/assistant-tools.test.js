@@ -185,6 +185,17 @@ const tail = ac.contextBlock({
 check("记忆/画像/摘要/环境都进了尾部块", tail.includes("咖啡") && tail.includes("爱喝咖啡") && tail.includes("更早的对话") && tail.includes("现在：周一13点"));
 check("★ 语言指令在尾部块的最后一块", tail.trimEnd().endsWith(jaLine));
 check("没有易变内容时尾部块是空串", ac.contextBlock({}) === "");
+{
+  // 人设锚点：必须排在语言指令**之前**——中文锚点若压在外语指令后面，模型会说回中文
+  const withAnchor = ac.contextBlock({
+    profileText: "【画像】爱喝咖啡",
+    personaAnchor: "【人设提醒·你正在扮演】你就是「大肥鱼」。",
+    extraContext: `[环境] 现在：周一13点\n\n${jaLine}`,
+  });
+  check("★ 人设锚点在语言指令之前", withAnchor.indexOf("人设提醒") < withAnchor.indexOf(jaLine), withAnchor.slice(-120));
+  check("★ 语言指令仍是尾部块最后一句", withAnchor.trimEnd().endsWith(jaLine));
+  check("人设锚点在画像之后（中性上下文之后才提醒人设）", withAnchor.indexOf("爱喝咖啡") < withAnchor.indexOf("人设提醒"));
+}
 
 const reminder = "[系统提醒：你必须用日语回复，不要用中文]";
 const wire = ac.toWireMessages(

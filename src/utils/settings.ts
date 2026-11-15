@@ -145,6 +145,8 @@ export interface AssistantSettings {
   historyLang: string;
   /** 主动问候间隔时间（分钟） */
   greetInterval: number;
+  /** 用户用「这个/看屏幕」指代眼前内容时，前端自动截一张图随本轮带上（省一次工具往返） */
+  autoScreen: boolean;
   /** 输入框空闲多久自动收起（秒）；0 = 不自动收起 */
   inputIdleHideSec: number;
   /** 对用户的称呼（如"主人"），空则让 AI 自行决定 */
@@ -371,6 +373,7 @@ const DEFAULTS: Settings = {
     activePresetId: "",
     historyLang: "",
     greetInterval: 20,
+    autoScreen: true,
     inputIdleHideSec: 8,
     nickname: "",
     shortcut: "",
@@ -452,6 +455,40 @@ export function composePersona(a: AssistantSettings): string {
       : `对用户的称呼没有指定：一律直接用「你」，不要自创昵称（主人/宝贝/亲爱的/小朋友之类都不要用）。`,
   );
   return lines.join("\n");
+}
+
+/**
+ * 人设锚点：把人格压成**一句话**，贴在每次请求的末尾。
+ *
+ * 为什么需要它：完整人设（1000+ 字）永远排在请求的**最前面**，而最近的消息、画像、
+ * 记忆、环境、语言指令全在后面几百上千个 token 之后。模型对末尾最敏感，于是很容易
+ * 回到"助手/客服"的默认腔调——用户感受就是"人设设置好了，但聊起来体现不出来"。
+ *
+ * 这里只取最影响口吻的三样：名字、性格、说话方式，且各截一段，成本约 60~80 token。
+ * 注意：它只是**提醒**，完整人设仍然在 system 里，别指望一句话能替代。
+ */
+export function composePersonaAnchor(a: AssistantSettings, maxChars = 110): string {
+  const f = a.personaFields ?? DEFAULTS.assistant.personaFields;
+  const nick = (a.nickname ?? "").trim();
+  // 名字字段常写成「大肥鱼、本鱼、DeepSeek娘（…）」，只取第一个当自称
+  const first = (f.name ?? "").split(/[、,，(/（]/)[0].trim();
+  const clip = (t: string, n: number) => t.trim().replace(/[。；;，,、\s]+$/, "").slice(0, n);
+  const traits = clip(f.traits ?? "", 32);
+  const speech = clip(f.speech ?? "", 44);
+  if (!first && !traits && !speech) return "";
+  const parts: string[] = [];
+  if (first) parts.push(`你就是「${first}」，不是助手也不是客服`);
+  if (nick) parts.push(`叫用户「${nick}」`);
+  if (traits) parts.push(`性格：${traits}`);
+  if (speech) parts.push(`说话：${speech}`);
+  let out = `【人设提醒·你正在扮演】${parts.join("；")}。`;
+  if (out.length > maxChars) {
+    // 截断时退回最近的分号，避免把半句话留在末尾
+    const cut = out.slice(0, maxChars - 1);
+    const i = cut.lastIndexOf("；");
+    out = (i > 20 ? cut.slice(0, i) : cut) + "…";
+  }
+  return out;
 }
 
 export function loadSettings(): Settings {

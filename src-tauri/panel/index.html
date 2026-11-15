@@ -698,6 +698,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { path: "assistant.nickname", label: "对你的称呼", type: "text", placeholder: "留空则统一用「你」；填了就是固定称呼，不会随便换" },
             { path: "assistant.outputLanguage", label: "回复语言", type: "select", options: "languages" },
             { path: "assistant.greetInterval", label: "主动问候间隔", type: "number", min: 1, max: 1440, unit: "分钟" },
+            { path: "assistant.autoScreen", label: "指到屏幕就自动截一张", type: "switch", desc: "你说「这个 / 看这个 / 屏幕上」这类指代时，自动附一张当前截图（约 1~2k token），省掉模型先问一次" },
               { path: "assistant.inputIdleHideSec", label: "输入框空闲收起", type: "number", min: 0, max: 600, unit: "秒（0 = 不收起）" },
             { type: "hotkey", label: "呼出快捷键", desc: "点「录制」后直接按组合键（Esc 取消）。由系统层面捕获，浏览器占用的组合也能录；也可以手输" },
             { type: "hotkey", field: "voiceShortcut", target: "voice", label: "语音输入快捷键", desc: "按下直接在麦克风上说话，说完自动发送；再按一次取消。和上面的呼出快捷键互不影响" },

@@ -287,7 +287,8 @@ const BASE_PROMPT =
   "严格按照上面的人格设定说话，每一句话都符合该人设的语气、口吻、用词和情绪。不要像客服，不要像AI，你就是那个人。\n" +
   "【你是谁】Petra 是你自己的名字（应用名，你的第二名字）；你的第一名字是用户给你起的、写在上面人格设定里的那个，自称用第一名字。窗口标题或进程里出现 Petra、petra.exe、桌宠，都是**你自己的窗口**，不是主人在用别的软件，别提它、也别问「Petra 是什么」。\n" +
   "【工具能力】用户需要时可以：打开软件、查天气、调音量、搜网页、开网址、关网页、设提醒、锁屏、关机、查当前窗口、在桌面/文档/下载里新建文件或文件夹、读文件内容、改文件（改前自动备份）。改文件前先读一遍，改完说清楚改了什么、备份在哪。工具只在意图明确时调用，结果用符合人设的口语转述，失败就如实说。\n" +
-  "【联网】遇到时效性信息（新闻、版本号、价格、赛事、人物近况、最近发生的事）或你自己拿不准的事实时，先调用 search_web 查真实网页再回答，不要凭记忆编造；搜到结果后用自己的话转述，别把整段摘要念出来。搜索失败（超时/没结果）时最多换个更短更常见的关键词再试一次，还不行就如实说「这次没查到」，不要硬编也不要反复重试。\n" +
+  "【看屏幕】用户说「这个/那个/看这个/我这儿/屏幕上/界面/这题/这段话/我这穿的」这类指代眼前内容的话时，你**并没有看到画面**——必须先调用 capture_screen 看完再回答。没调用截图就绝不许说「我看到了/我看了一眼/凑近看了看」，也不许凭常识猜画面上有什么、写得对不对（猜错比说不知道更伤）。用户让你看屏幕而截图失败/没拿到图，就直说没看清、让他再说一遍或者发张图。\n" +
+  "【联网】只在这几种情况下搜：新闻时事、版本号、价格行情、赛事比分、人物近况、政策法规、你不确定的具体事实。搜之前先想清楚**用户在问的那个具体东西**是什么，查询词要「主体＋具体点」（例：问「黄老板是不是下岗了」就搜「黄仁勋 卸任 英伟达 CEO」，不要搜「英伟达 显卡 价格」）。一次没搜到就换一个更短更准的说法再试，最多两次，还不行就如实说没查到，不要硬编、也不要换着花样反复搜。搜到结果用自己的话转述，别念整段摘要。纯闲聊、情绪、算数、常识、写代码这类不需要搜，直接答。\n" +
   "【记忆】用户透露偏好/习惯/情绪就调用 remember；同一件事有新进展就用同主题再记一次（会覆盖旧的），用户纠正你时一定要记对的那条。记住是为了把话接得更准，不要拿出来炫耀「我记得」。\n" +
   "【旧任务】对话历史里几天前的计时、提醒、待办、约定默认已经结束或过期；除非用户明确问起，否则不要把它们当成当前正在做的事，也不要主动复述。\n" +
   "不要主动提工具能力，不要说\"作为AI\"之类的话。";
@@ -412,7 +413,7 @@ const TOOLS = [
     function: {
       name: "search_web",
       description:
-        "联网搜索，返回真实网页的标题/链接/摘要（不是打开浏览器）。新闻、版本号、价格、赛事、近况或拿不准的事实必须先搜，别凭记忆编。关键词用 2~5 个词；没结果就换个说法再试一次。",
+        "联网搜索，返回真实网页的标题/链接/摘要（不是打开浏览器）。新闻、版本号、价格、赛事、近况、政策这类时效信息必须先搜。查询词写「主体＋具体点」，别用泛泛的话题词；没结果换个更短更准的说法再试一次。",
       parameters: {
         type: "object",
         properties: {
@@ -592,7 +593,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "capture_screen",
-      description: "截屏，之后你能看到屏幕内容。用户说「看屏幕/截图/我屏幕上有什么」时调用。",
+      description: "截屏，之后你能真正看到屏幕内容。用户说「看屏幕/截图/我屏幕上有什么」，或用「这个/那个/看这个」指代眼前的东西时调用——没截就别描述画面。",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -738,6 +739,8 @@ export function contextBlock(opts: {
   memory?: MemoryStore;
   profileText?: string;
   historySummary?: string;
+  /** 人设锚点：一句话的人设复述，压在中性上下文之后、语言指令之前 */
+  personaAnchor?: string;
   extraContext?: string;
 }): string {
   const blocks: string[] = [];
@@ -758,6 +761,10 @@ export function contextBlock(opts: {
   }
   const hist = (opts.historySummary ?? "").trim();
   if (hist) blocks.push(hist);
+  // 人设锚点排在语言指令**之前**：中文锚点若压在外语指令后面，模型会顺着它说回中文
+  //（"设置日语却回中文"就是这么来的），所以顺序必须是 …中性上下文 → 人设 → 语言指令。
+  const anchor = (opts.personaAnchor ?? "").trim();
+  if (anchor) blocks.push(anchor);
   const extra = (opts.extraContext ?? "").trim();
   if (extra) blocks.push(extra);
   return blocks.join("\n\n");
@@ -1097,6 +1104,7 @@ export async function chatStream(
     memory,
     profileText: requestOptions.profileText ?? "",
     historySummary: requestOptions.historySummary ?? "",
+    personaAnchor: requestOptions.personaAnchor ?? "",
     extraContext,
   });
   // 插件工具是运行时注册的：每次请求都重新拼一份，不能缓存在模块级常量里。
@@ -1865,6 +1873,8 @@ export interface ChatRequestOptions {
    * 这里只放插件注册的工具，避免和内置表重复。
    */
   extraTools?: unknown[];
+  /** 人设锚点（由 settings.composePersonaAnchor 生成）：贴在请求末尾提醒别跑味 */
+  personaAnchor?: string;
   /** 本轮禁用的内置工具名（例如端点没有生图能力时禁掉 generate_image） */
   disabledTools?: string[];
   /**

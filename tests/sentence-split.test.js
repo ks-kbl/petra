@@ -65,6 +65,18 @@ check("太短的换行行不切", sp.takeSpeechSegment("好\n") === null);
   check("流到一半的省略号先不切（等第二个 …）", sp.takeSpeechSegment("我在想要不要现在说这件事…") === null);
 }
 
+// ---------- 英文/日文句号 ----------
+{
+  const en = sp.takeSpeechSegment("This sentence is long enough. And here is another one.");
+  check("★ 英文句号能断句", !!en && en.segment === "This sentence is long enough.", JSON.stringify(en?.segment));
+  const pi = sp.takeSpeechSegment("Pi is about 3.14159 and that is fine.");
+  check("★ 小数点 3.14159 不被切", !!pi && pi.segment.endsWith("fine."), JSON.stringify(pi?.segment));
+  const url = sp.takeSpeechSegment("Go to example.com and look around there.");
+  check("★ 域名 example.com 不被切", !!url && url.segment.endsWith("there."), JSON.stringify(url?.segment));
+  const ja = sp.takeSpeechSegment("これは十分に長い日本語の文です。次の文も続きます。");
+  check("日文句号也能断", !!ja && ja.segment.endsWith("。"));
+}
+
 // ---------- 增量流 ----------
 let buf = "";
 const out = [];
