@@ -39,10 +39,27 @@ jobs:
         shell: pwsh
         run: |
           ./scripts/fetch-sherpa.ps1
+
           $lib = Join-Path $env:USERPROFILE "petra-sherpa\prebuilt\sherpa-onnx-v1.12.9-win-x64-shared"
-          if (-not (Test-Path $lib)) { throw "预编译库目录不存在：$lib" }
+          $dllDir = Join-Path $lib "lib"
+          if (-not (Test-Path (Join-Path $dllDir "cargs.dll"))) {
+            Write-Host "lib 目录内容："
+            Get-ChildItem -Recurse $lib | Select-Object -First 40 FullName | Format-Table -AutoSize
+            throw "预编译库里缺少 cargs.dll：$dllDir"
+          }
           "SHERPA_LIB_PATH=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "SHERPA_LIB_PATH=$lib"
+
+          # sherpa-rs-sys 的 build.rs 会把这些 DLL 硬链接/复制到 target/release 和
+          # target/release/deps。它在 GitHub runner 上失败过一次（源文件明明存在，
+          # 复制却报 Failed to copy），与其猜原因，不如先把目标文件摆好——build.rs
+          # 只在目标不存在时才复制，摆好以后这一步直接跳过。
+          $rel = "src-tauri/target/release"
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $rel "deps") | Out-Null
+          Copy-Item (Join-Path $dllDir "*.dll") $rel -Force
+          Copy-Item (Join-Path $dllDir "*.dll") (Join-Path $rel "deps") -Force
+          Get-ChildItem $rel -Filter *.dll | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Install frontend dependencies
         run: npm ci
