@@ -29,6 +29,21 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # 唤醒词（KWS）依赖 sherpa-onnx。默认会从源码编译那份 C++，而它的
+      # cmake/show-info.cmake 里用 `wmic os get caption,version` 取系统信息——
+      # GitHub 的 windows-latest 已经移除 WMIC，取到空字符串 → string(REPLACE)
+      # 参数不足 → configure 失败（2026-11-15 v0.3.9 首次发版就是这么挂的）。
+      # 本机一直是走官方预编译库（.cargo/config.toml 里的 SHERPA_LIB_PATH），
+      # CI 也照做：拉预编译库 + 用 GITHUB_ENV 传路径，直接跳过 C++ 源码编译。
+      - name: 准备 sherpa-onnx 预编译库（跳过 C++ 源码编译）
+        shell: pwsh
+        run: |
+          ./scripts/fetch-sherpa.ps1
+          $lib = Join-Path $env:USERPROFILE "petra-sherpa\prebuilt\sherpa-onnx-v1.12.9-win-x64-shared"
+          if (-not (Test-Path $lib)) { throw "预编译库目录不存在：$lib" }
+          "SHERPA_LIB_PATH=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "SHERPA_LIB_PATH=$lib"
+
       - name: Install frontend dependencies
         run: npm ci
 
