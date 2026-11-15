@@ -6,7 +6,7 @@ import type { AssistantProvider } from "../utils/settings";
 import { trackEvent } from "../features/diary/DiaryEventTracker";
 import { dailyDraw, hasDrawnToday, getTodayDraw, getCollectionProgress } from "../features/card/DailyCardManager";
 import { loadDiaries, getDiary } from "../features/diary/DiaryManager";
-import { loadSettings, saveSettings } from "../utils/settings";
+import { composePersonaAnchor, loadSettings, saveSettings } from "../utils/settings";
 import { getApiKey, currentKeyScope, normalizeOpenAIBase } from "./apiKey";
 import { buildLanguageInstruction, buildLanguageReminder, langNameOf, splitTranslation } from "../utils/outputLanguage";
 import { appNameFromTitle, frontWindowForModel, isDesktopWindow, isOwnWindow } from "../utils/foregroundApp";
@@ -92,6 +92,7 @@ import { deleteWrongHistory } from "./ChatHistory";
 import { toast } from "../ui/Toast";
 import { notifyHttpError } from "../ui/ErrorPopup";
 import { friendlyApiError } from "./errorHints";
+import { AUTO_SCREEN_NOTE, looksLikeScreenReference } from "./screenIntent";
 import { getSpeechRecognizer, type SpeechRecognizer } from "../asr/SpeechRecognizer";
 import { pluginRuntime } from "../plugins/runtime";
 
@@ -2243,9 +2244,17 @@ async function send(text: string) {
   reactNow(userEmo);
   boostMood("chat");
   if (userEmo !== "neutral") boostMood(userEmo);
-  // 截图：由模型通过 capture_screen 工具触发，不再前端关键词预判。
+  // 截图：模型也可以自己用 capture_screen 触发；但用户明显在说"眼前这个东西"时，
+  // 前端先截一张备好（否则模型会直接编「我凑近看了看」——实测过）。
   // 只在本轮生效、不进历史 —— 图片 base64 很大，进历史会把存储撑爆。
   const screenshot: { image: string | undefined } = { image: undefined };
+  let autoScreenAttached = false;
+  if (s.assistant.autoScreen !== false && !imagesForTurn.length && looksLikeScreenReference(text)) {
+    try {
+      screenshot.image = await invoke<string>("capture_screen");
+      autoScreenAttached = Boolean(screenshot.image);
+    } catch { /* 截不到就算了，模型还能自己调工具 */ }
+  }
   busy = true;
   const loading = addBubble("ai", "");
   const colorHook = makeStreamColorHook(loading);
@@ -2255,6 +2264,8 @@ async function send(text: string) {
     // **不设轮数/次数上限**（用户要求取消工具调用上限）：靠"模型不再发起工具调用"自然结束。
     // 仍保留同参数重复调用的提醒（ToolLoopBudget.noteCall），那是提示，不拦执行。
     const budget = new ToolLoopBudget({ maxRounds: Infinity, maxCalls: Infinity });
+    // 人设锚点：整轮只算一次（设置改了才会变），贴在请求末尾防"越聊越像客服"
+    const personaAnchor = composePersonaAnchor(s.assistant);
     // 生图是否就绪（独立接入 + Key）只在这一轮开始时查一次，别每轮重复打 IPC
     const imgState = await imageReadyState();
     let finished = false;
@@ -2278,6 +2289,7 @@ async function send(text: string) {
       const extraCtxWithLang =
         buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") +
         "\n\n" + imageCtx + "\n\n" + recentImageBlock() +
+        (autoScreenAttached ? "\n\n" + AUTO_SCREEN_NOTE : "") +
         (expiredNote ? "\n\n" + expiredNote : "") +
         "\n\n" + langInstruction;
 
@@ -2314,6 +2326,8 @@ async function send(text: string) {
           historySummary: summaryBlock(chatSummary),
           // 语言提醒只贴在本轮请求最后一行，不写进历史
           ...(langReminder ? { tailInstruction: langReminder } : {}),
+          // 人设锚点：人设完整文本在 system 最前面，太远了，这里再补一句短提醒
+          ...(personaAnchor ? { personaAnchor } : {}),
         },
       );
       if (colorHook.lastEmotion() !== "neutral") streamEmo = colorHook.lastEmotion();
@@ -2458,6 +2472,12 @@ async function send(text: string) {
     }
   } catch (e) {
     const msgText = e instanceof Error ? e.message : String(e);
+    // 这条消息没发出去 = 用户白打了一段。放回输入框（用户这期间自己又打了字就不覆盖），
+    // 让他改一改端点/网络后直接回车重发，而不是凭记忆重打。
+    if (!streamed && input && !input.value.trim() && text.trim()) {
+      setInputValue(text.trim());
+      toast("这次没发出去，原话已放回输入框", "info");
+    }
     // 写进 lasted.log：用户反馈"说着说着就 API 错误"时，光看屏幕上的气泡没法定位，
     // 这里把状态码/响应体（以及 4xx 时的历史尾部）留在日志里。
     void invoke("debug_mark", { msg: `[assistant] 请求失败：${msgText}` }).catch(() => {});

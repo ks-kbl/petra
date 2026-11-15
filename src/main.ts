@@ -6489,14 +6489,25 @@ async function toggleAssistantSettings() {
     usageLabel.className = "as-set-label";
     usageLabel.textContent = "AI 用量";
     const usageBox = document.createElement("div");
-    usageBox.style.cssText = "flex:1;font-size:11.5px;color:#8a7a95;line-height:1.8;";
+    usageBox.style.cssText = "flex:1;font-size:11.5px;color:#8a7a95;line-height:1.8;white-space:pre-line;";
     const fmtTokens = (n: number) => (n >= 10000 ? (n / 1000).toFixed(1) + "k" : String(n));
+    const pct = (part: number, whole: number) => (whole > 0 ? Math.round((part / whole) * 100) : 0);
     const renderUsage = () => {
       const u = getUsageStats();
-      const cachedPart = u.cachedTokens > 0 ? " · 缓存命中 " + fmtTokens(u.cachedTokens) : "";
-      usageBox.textContent = u.calls > 0
-        ? "共 " + u.calls + " 次调用 · 输入 " + fmtTokens(u.inputTokens) + " · 输出 " + fmtTokens(u.outputTokens) + cachedPart + " tok（服务端优先，本地估算兜底）"
-        : "暂无记录（服务端优先，本地估算兜底）";
+      if (u.calls <= 0) {
+        usageBox.textContent = "暂无记录（服务端优先，本地估算兜底）";
+        return;
+      }
+      // 缓存命中只报原始数没人看得懂：换成「命中率」+「大概省了多少输入费」
+      // （命中部分各家都按 1/10 上下计价，这里按 10% 折算，只作体感参考）
+      const hitRate = pct(u.cachedTokens, u.inputTokens);
+      const lastRate = pct(u.lastCached, u.lastInput);
+      const savedRate = Math.round(hitRate * 0.9);
+      const line1 = "共 " + u.calls + " 次调用 · 输入 " + fmtTokens(u.inputTokens) + " · 输出 " + fmtTokens(u.outputTokens);
+      const line2 = u.cachedTokens > 0
+        ? "缓存命中 " + fmtTokens(u.cachedTokens) + "（总命中率 " + hitRate + "%，最近一轮 " + lastRate + "%）→ 约省 " + savedRate + "% 输入费"
+        : "缓存命中 0：这家端点可能不支持前缀缓存（或没回报用量），换 DeepSeek/OpenAI 官方才有";
+      usageBox.textContent = line1 + "\n" + line2;
     };
     renderUsage();
     const usageReset = document.createElement("button");

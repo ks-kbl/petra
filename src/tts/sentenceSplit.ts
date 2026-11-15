@@ -77,6 +77,23 @@ export function takeSpeechSegment(
       continue;
     }
 
+    // 英文/日文句号：`.` / `。` 都要能断，但 `3.14`、`example.com`、`e.g.` 不能断。
+    // 判据：后面必须是空白/引号/结尾（不是字母数字），且前后不同时是数字。
+    if (depth === 0 && (ch === "." || ch === "。")) {
+      if (ch === ".") {
+        const prev = text[i - 1] ?? "";
+        const next = text[i + 1];
+        const decimal = /[0-9]/.test(prev) && /[0-9]/.test(next ?? "");
+        const inWord = /[A-Za-z0-9]/.test(next ?? "");
+        if (decimal || inWord) continue;
+      }
+      const segment = text.slice(0, i + 1);
+      if (segment.trim().length >= minChars) {
+        return { segment: segment.trim(), rest: text.slice(i + 1).replace(/^\s+/, ""), boundary: "sentence" };
+      }
+      continue;
+    }
+
     // 句末标点：必须在括号外
     if (depth === 0 && SENTENCE_END.has(ch)) {
       const segment = text.slice(0, i + 1);
