@@ -90,8 +90,8 @@ import { ttsPlayer } from "../tts/TTSPlayer";
 import { getVisibleRect } from "../ui/visible";
 import { deleteWrongHistory } from "./ChatHistory";
 import { toast } from "../ui/Toast";
-import { localizeUiText } from "../utils/uiText";
 import { notifyHttpError } from "../ui/ErrorPopup";
+import { friendlyApiError } from "./errorHints";
 import { getSpeechRecognizer, type SpeechRecognizer } from "../asr/SpeechRecognizer";
 import { pluginRuntime } from "../plugins/runtime";
 
@@ -2133,35 +2133,6 @@ function makeStreamColorHook(el: HTMLElement): {
   };
 }
 
-/** 把原始 API 错误翻译成友善提示（402 余额不足 / 401 Key 无效 / 429 限流等） */
-function friendlyApiError(e: unknown): string {
-  const raw = e instanceof Error ? e.message : String(e);
-  const status = Number((/API 错误\s*(\d{3})/i.exec(raw) || /HTTP\s*(\d{3})/i.exec(raw) || [])[1] || 0);
-  if (/402|insufficient balance|余额不足|欠费|quota exceeded/i.test(raw) || status === 402) {
-    return "💸 API 余额不足或额度已用完：请到「小助手设置」充值，或换一个可用的 API Key。\n（AI 暂时下线，但右键 →「🎮 小游戏」，桌宠还能陪你打麻将哦～）";
-  }
-  if (/401|403|invalid_api_key|unauthorized|forbidden|令牌|鉴权/i.test(raw) || status === 401 || status === 403) {
-    return "🔑 API Key 无效、已过期或没有权限，请到「小助手设置」重新填写。";
-  }
-  if (/429|rate limit|too many requests|限流/i.test(raw) || status === 429) {
-    return "⏳ 请求太频繁了，缓一缓再聊吧～";
-  }
-  if (/timeout|超时|failed to fetch|networkerror|load failed|网络|econn|enotfound/i.test(raw)) {
-    return "🌐 网络不可用或请求超时，请检查网络/代理后再试。";
-  }
-  if (/404|model not found|model_not_found|模型/i.test(raw) || status === 404) {
-    return "🤖 模型名或接口地址不存在：请在设置里检查「API 端点 / 模型名」，或点「自动获取模型」重新选择。";
-  }
-  if (status === 400 || status === 422) {
-    return "⚠️ 请求参数不被服务端接受（400/422）：请检查模型名、端点地址，以及当前模型是否支持该功能。";
-  }
-  if (status >= 500 && status <= 599) {
-    return "🛠️ 服务端暂时不可用，请稍后重试。";
-  }
-  // 未知错误：给用户一句中文兜底，原始英文只写日志（send 的 catch 已调用 debug_mark）
-  return localizeUiText(raw) || "AI 请求失败，请稍后重试。";
-}
-
 /** 注入 system prompt 的紧凑环境上下文（约 20-30 token：称呼 + 时间 + 陪伴时长，增强陪伴感） */
 function buildChatContext(nickname: string, outputLang: string): string {
   const now = new Date();
@@ -2249,9 +2220,11 @@ async function send(text: string) {
   if (sentImages.length) addUserAttachmentBubble(text.trim(), sentImages.map((i) => i.dataUrl));
   // 用户提到"之前/上次/让你/计时"等旧事：先自动检索一次完整历史（模型也保留工具备查）
   const historyRecall = await autoRecallHistory(composed);
-  // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑
+  // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑。
+  // 但它**不进历史**——交给 chatStream 的 tailInstruction 在发送时贴到最后一行，
+  // 否则之后每一条历史 user 消息都会带着同一句提醒，纯烧 token。
   const langReminder = buildLanguageReminder(outLang ?? "");
-  const userContent = langReminder ? `${composed}\n${langReminder}` : composed;
+  const userContent = composed;
   // 用户在纠正我（"记错了/我没说过/别记这个"）：记下来，这轮回复完立刻跑一次记忆提取，
   // 不等攒够 6 条 —— 否则 AI 会带着错的记忆再聊好几轮。
   const correctingNow = detectCorrection(text);
@@ -2339,6 +2312,8 @@ async function send(text: string) {
           profileText: [personaContextBlock(), turnNudge, historyRecall].filter(Boolean).join("\n\n"),
           // 长聊之后补上被窗口切掉的旧对话，避免"聊到一半突然不认识你"
           historySummary: summaryBlock(chatSummary),
+          // 语言提醒只贴在本轮请求最后一行，不写进历史
+          ...(langReminder ? { tailInstruction: langReminder } : {}),
         },
       );
       if (colorHook.lastEmotion() !== "neutral") streamEmo = colorHook.lastEmotion();

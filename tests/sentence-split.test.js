@@ -48,6 +48,23 @@ check("换行处断开", !!line && line.segment === "第一行内容足够长了
 check("换行后的内容接得上", !!line && line.rest === "第二行也足够长了呀。", JSON.stringify(line?.rest));
 check("太短的换行行不切", sp.takeSpeechSegment("好\n") === null);
 
+// ---------- 切分原因（TTS 按它决定停顿长短） ----------
+{
+  const s1 = sp.takeSpeechSegment("今天天气不错，我们出去走走吧。");
+  check("句号 → sentence", s1 && s1.boundary === "sentence", JSON.stringify(s1?.boundary));
+  const s2 = sp.takeSpeechSegment("我在想要不要现在告诉你……然后就忘了。");
+  check("★ 省略号 → ellipsis 且整对切出", !!s2 && s2.boundary === "ellipsis" && s2.segment.endsWith("……"), JSON.stringify(s2?.segment));
+  const s3 = sp.takeSpeechSegment("第一行内容足够长了吧\n第二行也足够长了呀。");
+  check("★ 换行 → newline", s3 && s3.boundary === "newline", JSON.stringify(s3?.boundary));
+  const s4 = sp.takeSpeechSegment("这是一个没有句号的超长句子啊".repeat(5), { maxChars: 40 });
+  check("超长兜底 → soft/hard", s4 && (s4.boundary === "soft" || s4.boundary === "hard"), JSON.stringify(s4?.boundary));
+  check("太短的省略号也要断（嗯……）", (() => {
+    const r = sp.takeSpeechSegment("嗯……然后呢，我就走了呀。");
+    return !!r && r.boundary === "ellipsis";
+  })());
+  check("流到一半的省略号先不切（等第二个 …）", sp.takeSpeechSegment("我在想要不要现在说这件事…") === null);
+}
+
 // ---------- 增量流 ----------
 let buf = "";
 const out = [];

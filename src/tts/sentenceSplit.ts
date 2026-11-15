@@ -13,6 +13,9 @@
  * 同时保证不切进 `「」（）`和 `3.14` 这类小数点里。
  */
 
+/** 这一段是「因为什么」被切开的 —— 决定它后面该停多久 */
+export type SpeechBoundary = "sentence" | "ellipsis" | "newline" | "soft" | "hard";
+
 export interface SpeechSplitOptions {
   /** 一段至少这么长才值得单独送去合成（太短的会跟下一句合并） */
   minChars?: number;
@@ -31,7 +34,7 @@ export const DEFAULT_MIN_CHARS = 10;
 export const DEFAULT_MAX_CHARS = 90;
 
 /** 句末标点（强断句）。刻意不含 `；;，、：` —— 那些是句中停顿 */
-const SENTENCE_END = new Set(["。", "！", "？", "!", "?", "…"]);
+const SENTENCE_END = new Set(["。", "！", "？", "!", "?"]);
 const SOFT_BREAK = new Set(["，", ",", "、", "；", ";", "：", ":", " "]);
 /** 成对符号：进入这些符号后不允许断句 */
 const OPENERS = new Set(["（", "(", "「", "『", "“", "‘", "【", "《"]);
@@ -44,7 +47,7 @@ const CLOSERS = new Set(["）", ")", "」", "』", "”", "’", "】", "》"]);
 export function takeSpeechSegment(
   buffer: string,
   opts: SpeechSplitOptions = {},
-): { segment: string; rest: string } | null {
+): { segment: string; rest: string; boundary: SpeechBoundary } | null {
   const minChars = opts.minChars ?? DEFAULT_MIN_CHARS;
   const maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS;
   let text = buffer.replace(/^\s+/, "");
@@ -58,13 +61,27 @@ export function takeSpeechSegment(
     else if (CLOSERS.has(ch)) depth = Math.max(0, depth - 1);
     else if (SOFT_BREAK.has(ch) && depth === 0) lastSoft = i;
 
+    // 省略号：`…` / `……` / `...` 都是一个明确的"这里要停一下"，单独处理。
+    // 它比句号更该停（欲言又止），门槛也放低到 3 个字——"嗯……"这种就是要断的。
+    if (depth === 0 && (ch === "…" || (ch === "." && text[i + 1] === "."))) {
+      let j = i;
+      while (j + 1 < text.length && (text[j + 1] === "…" || text[j + 1] === ".")) j++;
+      // 流还没说完：`……` 可能只到了一半，等下一批字符再决定，别把半个省略号切出去
+      if (j === text.length - 1) continue;
+      const segment = text.slice(0, j + 1);
+      const need = Math.min(minChars, 3);
+      if (segment.trim().length >= need) {
+        return { segment: segment.trim(), rest: text.slice(j + 1), boundary: "ellipsis" };
+      }
+      i = j;
+      continue;
+    }
+
     // 句末标点：必须在括号外
     if (depth === 0 && SENTENCE_END.has(ch)) {
-      // 「……」 是省略号的一半，等它凑完再切
-      if (ch === "…" && text[i + 1] === "…" && i + 1 === text.length - 1) continue;
       const segment = text.slice(0, i + 1);
       if (segment.trim().length >= minChars) {
-        return { segment: segment.trim(), rest: text.slice(i + 1) };
+        return { segment: segment.trim(), rest: text.slice(i + 1), boundary: "sentence" };
       }
       // 太短：不切，继续往后攒（这就是"短句合并"）
       continue;
@@ -76,7 +93,7 @@ export function takeSpeechSegment(
       if (ch === "\r" && text[i + 1] === "\n") continue;
       const segment = text.slice(0, i).trim();
       if (segment.length >= minChars) {
-        return { segment, rest: text.slice(i + 1).replace(/^[\r\n]+/, "") };
+        return { segment, rest: text.slice(i + 1).replace(/^[\r\n]+/, ""), boundary: "newline" };
       }
       continue;
     }
@@ -85,7 +102,9 @@ export function takeSpeechSegment(
     if (i + 1 >= maxChars) {
       const cut = lastSoft > 0 ? lastSoft + 1 : maxChars;
       const segment = text.slice(0, cut);
-      if (segment.trim()) return { segment: segment.trim(), rest: text.slice(cut) };
+      if (segment.trim()) {
+        return { segment: segment.trim(), rest: text.slice(cut), boundary: lastSoft > 0 ? "soft" : "hard" };
+      }
       break;
     }
   }
