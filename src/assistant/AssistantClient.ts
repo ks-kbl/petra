@@ -1225,14 +1225,19 @@ export async function chatStream(
       useStream = false;
       continue;
     }
-    const hint = provider === "custom"
-      ? " (自定义/中转站端点：请确认 URL 是否带 /v1、模型名是否与中转站文档一致)"
-      : "";
+    // 一个响应都没收到时，别把话说得像"模型名写错了"——那是网络层的事。
+    // 这条提示会被 friendlyApiError 单独识别成一类（见 errorHints.ts），
+    // 里面出现的"模型名"等字样以前会误触发"模型不存在"的结论。
+    const hint = !lastStatus
+      ? `（没有收到任何响应：端点 ${base} 不可达——确认服务在跑、URL 带 /v1、没被代理/防火墙拦；浏览器报 Failed to fetch 多半是跨域被挡）`
+      : provider === "custom"
+        ? " (自定义/中转站端点：请确认 URL 是否带 /v1、模型名是否与中转站文档一致)"
+        : "";
     // 选了图像/语音类模型时，端点只会回一句 Upstream request failed / 400 —— 这里补一句人话
     const nonChat = looksLikeNonChatModel(m)
       ? "（这个模型看起来是图像/语音类模型，不是对话模型，换一个聊天模型试试，比如 deepseek-chat、gpt-4o-mini）"
       : "";
-    throw new Error(`API 错误 ${lastStatus || 0}${hint}: ${errText.slice(0, 300)}${nonChat}`);
+    throw new Error(`API 错误 ${lastStatus || 0}${hint}: ${errText.slice(0, 300) || (lastStatus ? "" : "空响应")}${nonChat}`);
   }
   if (!res || !res.body) {
     throw new Error(`API 错误 ${lastStatus || 0}: ${errText.slice(0, 300) || "没有收到响应"}`);

@@ -90,8 +90,8 @@ import { ttsPlayer } from "../tts/TTSPlayer";
 import { getVisibleRect } from "../ui/visible";
 import { deleteWrongHistory } from "./ChatHistory";
 import { toast } from "../ui/Toast";
-import { localizeUiText } from "../utils/uiText";
 import { notifyHttpError } from "../ui/ErrorPopup";
+import { friendlyApiError } from "./errorHints";
 import { getSpeechRecognizer, type SpeechRecognizer } from "../asr/SpeechRecognizer";
 import { pluginRuntime } from "../plugins/runtime";
 
@@ -2131,35 +2131,6 @@ function makeStreamColorHook(el: HTMLElement): {
     },
     lastEmotion: () => lastEmo,
   };
-}
-
-/** 把原始 API 错误翻译成友善提示（402 余额不足 / 401 Key 无效 / 429 限流等） */
-function friendlyApiError(e: unknown): string {
-  const raw = e instanceof Error ? e.message : String(e);
-  const status = Number((/API 错误\s*(\d{3})/i.exec(raw) || /HTTP\s*(\d{3})/i.exec(raw) || [])[1] || 0);
-  if (/402|insufficient balance|余额不足|欠费|quota exceeded/i.test(raw) || status === 402) {
-    return "💸 API 余额不足或额度已用完：请到「小助手设置」充值，或换一个可用的 API Key。\n（AI 暂时下线，但右键 →「🎮 小游戏」，桌宠还能陪你打麻将哦～）";
-  }
-  if (/401|403|invalid_api_key|unauthorized|forbidden|令牌|鉴权/i.test(raw) || status === 401 || status === 403) {
-    return "🔑 API Key 无效、已过期或没有权限，请到「小助手设置」重新填写。";
-  }
-  if (/429|rate limit|too many requests|限流/i.test(raw) || status === 429) {
-    return "⏳ 请求太频繁了，缓一缓再聊吧～";
-  }
-  if (/timeout|超时|failed to fetch|networkerror|load failed|网络|econn|enotfound/i.test(raw)) {
-    return "🌐 网络不可用或请求超时，请检查网络/代理后再试。";
-  }
-  if (/404|model not found|model_not_found|模型/i.test(raw) || status === 404) {
-    return "🤖 模型名或接口地址不存在：请在设置里检查「API 端点 / 模型名」，或点「自动获取模型」重新选择。";
-  }
-  if (status === 400 || status === 422) {
-    return "⚠️ 请求参数不被服务端接受（400/422）：请检查模型名、端点地址，以及当前模型是否支持该功能。";
-  }
-  if (status >= 500 && status <= 599) {
-    return "🛠️ 服务端暂时不可用，请稍后重试。";
-  }
-  // 未知错误：给用户一句中文兜底，原始英文只写日志（send 的 catch 已调用 debug_mark）
-  return localizeUiText(raw) || "AI 请求失败，请稍后重试。";
 }
 
 /** 注入 system prompt 的紧凑环境上下文（约 20-30 token：称呼 + 时间 + 陪伴时长，增强陪伴感） */
