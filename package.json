@@ -41,7 +41,8 @@
     "test:send": "tsc src/assistant/sendCompose.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/send-compose.test.js",
     "test:errors": "tsc src/assistant/errorHints.ts src/utils/uiText.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/api-error-hints.test.js",
     "test:anchor": "tsc src/utils/settings.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/persona-anchor.test.js",
-    "test:screen": "tsc src/assistant/screenIntent.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/screen-intent.test.js"
+    "test:screen": "tsc src/assistant/screenIntent.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/screen-intent.test.js",
+    "test:announce": "tsc src/features/Announcement.ts --rootDir src --outDir tests/build --module commonjs --target ES2020 --skipLibCheck --moduleResolution node && node tests/announcement.test.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

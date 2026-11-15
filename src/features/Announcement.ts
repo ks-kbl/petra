@@ -14,6 +14,20 @@ export interface Announcement {
 /** 当前版本的公告内容 */
 const ANNOUNCEMENTS: Announcement[] = [
   {
+    version: "0.3.9",
+    title: "✨ Petra v0.3.9更新",
+    lines: [
+      "大家好，本次更新内容如下：",
+      "· 语音唤醒上线：本地离线识别，喊一声就把桌宠叫出来，不联网、不花钱；录音识别和唤醒也不再抢麦克风。",
+      "· 生图单独接一套：生图模型独立接入（供应商 / 端点 / Key / 模型，带预设和总开关），填完 Key 就能画，画完自动存桌面。",
+      "· 会真的看屏幕了：你说「这个」「看这个」「这题」，它先把当前屏幕截下来再看，不会再假装「我看到了」；联网也会去搜你真正问的那件事。",
+      "· 更省 token、更像本鱼：请求结构重排后聊天越久越省（缓存命中部分按 1/10 计价）；末尾加了人设锚点，不会越聊越像客服；语音的换行和省略号也有停顿了。",
+      "· 顺便声明一句：petra目前没有聘请黄仁勋当本项目CEO的计划，感谢对petra生产与发展的关注。",
+      ". 我们创建了一个交流群，有什么问题和反馈可以在QQ群中发，会有成员解答，更多细节可见QQ群：908632095",
+      "谢谢各位一直在用 petra。有问题右键反馈给我们就好。",
+    ],
+  },
+  {
     version: "0.3.6",
     title: "✨ Petra v0.3.6更新",
     lines: [
@@ -195,6 +209,11 @@ export function getUnreadAnnouncement(): Announcement | null {
   // 注意：不要遍历整个列表去找"版本号不等于已读版本"的那条，
   // 否则已读过 0.2.4 之后会把更老的 0.2.3 当成未读弹出来。
   return localStorage.getItem(ANNOUNCE_KEY) === contentKey(latest.version, latest.lines) ? null : latest;
+}
+
+/** 最新一条公告的版本号（给"发版别忘了写公告"的测试用） */
+export function latestAnnouncementVersion(): string {
+  return ANNOUNCEMENTS[0]?.version ?? "";
 }
 
 /** 标记当前版本公告已读 */
