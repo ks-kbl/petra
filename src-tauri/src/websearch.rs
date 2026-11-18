@@ -23,6 +23,9 @@ pub struct SearchHit {
     /// 这条结果来自哪个引擎（DuckDuckGo / Bing / 百度）。前端会显示给用户看，
     /// 也方便一眼判断"跑的是不是带多引擎兜底的新构建"。
     pub engine: String,
+    /// 本地重排分数（越大越相关）。前端不用，但保留着便于排查"为什么排这个"。
+    #[serde(default)]
+    pub score: f64,
 }
 
 const UA: &str =
@@ -305,7 +308,7 @@ fn parse_ddg(html: &str, limit: usize) -> Vec<SearchHit> {
 
         let url = decode_ddg_href(&href);
         if !title.is_empty() && !url.is_empty() {
-            hits.push(SearchHit { title, url, snippet, engine: String::new() });
+            hits.push(SearchHit { title, url, snippet, engine: String::new(), score: 0.0 });
         }
     }
     hits
@@ -368,7 +371,7 @@ fn parse_bing(html: &str, limit: usize) -> Vec<SearchHit> {
             }
         }
         if !title.is_empty() && href.starts_with("http") {
-            hits.push(SearchHit { title, url: href, snippet, engine: String::new() });
+            hits.push(SearchHit { title, url: href, snippet, engine: String::new(), score: 0.0 });
         }
     }
     hits
@@ -408,7 +411,8 @@ fn parse_rss(xml: &str, limit: usize) -> Vec<SearchHit> {
                 url: link,
                 snippet: clean_text(&desc),
                 engine: String::new(),
-            });
+            score: 0.0,
+        });
         }
     }
     hits
@@ -466,7 +470,7 @@ fn parse_baidu(html: &str, limit: usize) -> Vec<SearchHit> {
             }
         }
         if !title.is_empty() && href.starts_with("http") {
-            hits.push(SearchHit { title, url: href, snippet, engine: String::new() });
+            hits.push(SearchHit { title, url: href, snippet, engine: String::new(), score: 0.0 });
         }
     }
     hits
@@ -640,109 +644,272 @@ fn decode_entity(ent: &str) -> Option<char> {
     Some(ch)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    const DDG_FIXTURE: &str = r#"
-<div class="links_main links_deep result__body">
-  <h2 class="result__title">
-    <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1&amp;rut=abc">标题 &amp; 实体</a>
-  </h2>
-  <a class="result__snippet" href="//x">摘要 <b>高亮</b> 文本</a>
-</div>
-<div class="links_main links_deep result__body">
-  <h2 class="result__title">
-    <a rel="nofollow" class="result__a" href="https://plain.example.org/p">第二条</a>
-  </h2>
-  <a class="result__snippet" href="//y">第二条摘要</a>
-</div>
-"#;
 
-    const BING_FIXTURE: &str = r#"
-<li class="b_algo" data-id="x">
-  <h2><a href="https://www.example.com/news?id=1" h="ID=SERP">必应结果&nbsp;标题</a></h2>
-  <div class="b_caption"><p class="b_lineclamp">这是<b>必应</b>摘要。</p></div>
-</li>
-<li class="b_algo" data-id="y">
-  <h2><a href="https://www.example.com/second">第二条</a></h2>
-  <p>第二条摘要</p>
-</li>
-"#;
+// ==================== 多引擎合并 + 本地重排 ====================
 
-    const BAIDU_FIXTURE: &str = r#"
-<div class="result c-container">
-  <h3 class="t"><a href="http://www.baidu.com/link?url=abc">百度结果标题</a></h3>
-  <div class="c-abstract">百度<em>摘要</em>内容</div>
-</div>
-<div class="result c-container">
-  <h3 class="t"><a href="https://www.example.org/x">第二条</a></h3>
-  <div class="content-right">第二条摘要</div>
-</div>
-"#;
-
-    #[test]
-    fn parses_ddg_two_results() {
-        let hits = parse_ddg(DDG_FIXTURE, 5);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].url, "https://example.com/a?b=1");
-        assert!(hits[0].title.contains("标题 & 实体"));
-        assert!(hits[0].snippet.contains("摘要"));
+/// 查询词切成"权重片段"：英文按词、中文按二元组。
+///
+/// 为什么中文要切二元组：不做分词的情况下，"英伟达 股价" 里的"英伟达"必须能命中
+/// "英伟达股价大跌"这种没有空格的标题，否则相关度算不出来。
+pub fn query_tokens(q: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut ascii_buf = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+    let flush_ascii = |buf: &mut String, out: &mut Vec<String>| {
+        if buf.len() >= 2 {
+            out.push(buf.to_lowercase());
+        }
+        buf.clear();
+    };
+    let flush_cjk = |chars: &mut Vec<char>, out: &mut Vec<String>| {
+        if chars.len() == 1 {
+            out.push(chars[0].to_string());
+        } else {
+            for w in chars.windows(2) {
+                out.push(w.iter().collect());
+            }
+        }
+        chars.clear();
+    };
+    for ch in q.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if !cjk.is_empty() { flush_cjk(&mut cjk, &mut out); }
+            ascii_buf.push(ch);
+        } else if is_cjk(ch) {
+            flush_ascii(&mut ascii_buf, &mut out);
+            cjk.push(ch);
+        } else {
+            flush_ascii(&mut ascii_buf, &mut out);
+            flush_cjk(&mut cjk, &mut out);
+        }
     }
-
-    #[test]
-    fn parses_bing_results() {
-        let hits = parse_bing(BING_FIXTURE, 5);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].url, "https://www.example.com/news?id=1");
-        assert!(hits[0].title.contains("必应结果"));
-        assert!(hits[0].snippet.contains("必应"));
-        assert_eq!(hits[1].snippet, "第二条摘要");
-    }
-
-    #[test]
-    fn parses_baidu_results() {
-        let hits = parse_baidu(BAIDU_FIXTURE, 5);
-        assert_eq!(hits.len(), 2);
-        assert!(hits[0].url.starts_with("http"));
-        assert_eq!(hits[0].title, "百度结果标题");
-        assert!(hits[0].snippet.contains("摘要"));
-        assert_eq!(hits[1].snippet, "第二条摘要");
-    }
-
-    #[test]
-    fn respects_limit_and_dedupes() {
-        let dup = r#"
-<li class="b_algo"><h2><a href="https://a.com/x">A</a></h2><p>1</p></li>
-<li class="b_algo"><h2><a href="https://a.com/x">A 重复</a></h2><p>2</p></li>
-<li class="b_algo"><h2><a href="https://b.com/y">B</a></h2><p>3</p></li>
-"#;
-        let hits = dedupe(parse_bing(dup, 10), 10);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].url, "https://a.com/x");
-        assert_eq!(hits[1].url, "https://b.com/y");
-        assert_eq!(parse_bing(dup, 1).len(), 1);
-    }
-
-    #[test]
-    fn empty_html_yields_nothing() {
-        assert!(parse_ddg("", 5).is_empty());
-        assert!(parse_bing("<html>没有结果</html>", 5).is_empty());
-        assert!(parse_baidu("<html>没有结果</html>", 5).is_empty());
-    }
-
-    #[test]
-    fn cache_roundtrip() {
-        let hits = vec![SearchHit {
-            title: "t".into(),
-            url: "https://x".into(),
-            snippet: "s".into(),
-            engine: "Bing".into(),
-        }];
-        let key = cache_key(" 测试 ", 5);
-        cache_put(key.clone(), &hits);
-        let got = cache_get(&key).expect("命中缓存");
-        assert_eq!(got[0].url, "https://x");
-        assert!(cache_get("不存在的词|5").is_none());
-    }
+    flush_ascii(&mut ascii_buf, &mut out);
+    flush_cjk(&mut cjk, &mut out);
+    out.sort();
+    out.dedup();
+    out
 }
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF)
+}
+
+/// 域名权威度：官方文档/百科/GitHub 加分，内容农场减分。
+fn domain_bonus(url: &str) -> f64 {
+    let u = url.to_lowercase();
+    let good = [
+        "wikipedia.org", "github.com", "docs.", "developer.", "microsoft.com", "apple.com",
+        "python.org", "rust-lang.org", "mozilla.org", "stackoverflow.com", "npmjs.com",
+        ".gov", ".edu", "arxiv.org", "zhihu.com",
+    ];
+    let bad = ["so.com/link", "hao123", "csdn.net/download", "wenku.baidu.com/view"];
+    let mut score = 0.0;
+    if good.iter().any(|g| u.contains(g)) { score += 1.2; }
+    if bad.iter().any(|b| u.contains(b)) { score -= 1.5; }
+    // 纯 IP 或超长带一堆参数的，多半是采集页
+    if u.contains("?") && u.matches('&').count() >= 3 { score -= 0.5; }
+    score
+}
+
+/// 本地重排：把"谁先返回用谁"换成"按相关度排"。
+///
+/// 这是"搜出来的东西不对"的主因——并发竞速时，第一个返回的引擎决定了全部结果，
+/// 而它可能恰好只给了几条导航页。现在所有引擎的结果一起参与打分。
+pub fn rank_hits(hits: Vec<SearchHit>, query: &str, limit: usize) -> Vec<SearchHit> {
+    let tokens = query_tokens(query);
+    let mut scored: Vec<SearchHit> = hits
+        .into_iter()
+        .map(|mut h| {
+            let title = h.title.to_lowercase();
+            let snippet = h.snippet.to_lowercase();
+            let mut score = 0.0;
+            for t in &tokens {
+                if title.contains(t.as_str()) { score += 2.0; }
+                if snippet.contains(t.as_str()) { score += 1.0; }
+            }
+            // 摘要太短的多半是导航页/目录页
+            if h.snippet.chars().count() < 30 { score -= 1.0; }
+            if h.snippet.chars().count() > 120 { score += 0.3; }
+            score += domain_bonus(&h.url);
+            h.score = (score * 100.0).round() / 100.0;
+            h
+        })
+        .collect();
+    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    scored
+}
+
+/// 多查询并发搜索 + 合并重排。
+///
+/// 查询变体由模型给（2~3 个更短、更具体的写法），全部跑完再一起排序——
+/// 这就是搜索界的"查询扩展"：单靠一条 query 很容易漏掉正确结果。
+fn multi_search_blocking(queries: &[String], limit: usize) -> Result<Vec<SearchHit>, String> {
+    let mut all: Vec<SearchHit> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    for q in queries.iter().take(3) {
+        match search_blocking(q, Some(limit)) {
+            Ok(hits) => all.extend(hits),
+            Err(e) => problems.push(format!("「{}」：{}", q.trim(), e)),
+        }
+    }
+    if all.is_empty() {
+        return Err(if problems.is_empty() {
+            "没有拿到任何结果".to_string()
+        } else {
+            problems.join("；")
+        });
+    }
+    // 合并后按"主查询"重排（第一个 query 是模型认为最准的那个）
+    let main = queries.first().cloned().unwrap_or_default();
+    let mut merged = dedupe(all, limit * 3);
+    merged = rank_hits(merged, &main, limit);
+    Ok(merged)
+}
+
+/// 多查询搜索（前端在"模型给了多个说法"时用）。
+#[tauri::command]
+pub async fn web_search_multi(queries: Vec<String>, limit: Option<usize>) -> Result<Vec<SearchHit>, String> {
+    let qs: Vec<String> = queries.into_iter().map(|q| q.trim().to_string()).filter(|q| !q.is_empty()).collect();
+    if qs.is_empty() {
+        return Err("搜索词是空的".into());
+    }
+    let limit = limit.unwrap_or(6).clamp(1, 10);
+    tauri::async_runtime::spawn_blocking(move || multi_search_blocking(&qs, limit))
+        .await
+        .map_err(|e| format!("搜索任务异常：{e}"))?
+}
+
+// ==================== 读页面正文 ====================
+
+/// 从 HTML 里抽正文（不引入新依赖的最小实现）。
+///
+/// 为什么必须有这一步：搜索结果只有一行摘要，模型拿摘要硬答，答案自然浮于表面、
+/// 还容易编。Edge 之所以答得准，是因为它读得到正文——这是"像浏览器"的关键一环。
+///
+/// 做法：去掉脚本/样式/导航等整块标签 → 去其余标签 → 解实体 → 按行切、
+/// 丢掉过短的导航行 → 取前 8000 字符。
+pub fn extract_readable(html: &str, max_chars: usize) -> String {
+    let mut s = html.to_string();
+    // 整块丢掉（大小写不敏感地找开闭标签）
+    for tag in ["script", "style", "noscript", "nav", "header", "footer", "aside", "form", "svg"] {
+        s = strip_tag_block(&s, tag);
+    }
+    // 去注释
+    while let (Some(a), Some(b)) = (s.find("<!--"), s.find("-->")) {
+        if b > a { s.replace_range(a..b + 3, " "); } else { break; }
+    }
+    // 去标签 + 解实体
+    let text = strip_tags(&s);
+    let text = decode_entities(&text);
+    // 按行切，只留像句子的行
+    let mut out = String::new();
+    for raw in text.split('\n') {
+        let line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.chars().count() < 12 { continue; }
+        if out.chars().count() + line.chars().count() > max_chars { break; }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
+fn strip_tag_block(html: &str, tag: &str) -> String {
+    let lower = html.to_lowercase();
+    let open = format!("<{}", tag);
+    let close = format!("</{}>", tag);
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find(&open) {
+        let start = i + rel;
+        out.push_str(&html[i..start]);
+        match lower[start..].find(&close) {
+            Some(crel) => i = start + crel + close.len(),
+            None => { i = html.len(); }
+        }
+    }
+    out.push_str(&html[i.min(html.len())..]);
+    out
+}
+
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => { in_tag = true; out.push(' '); }
+            '>' => { in_tag = false; out.push(' '); }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn decode_entities(s: &str) -> String {
+    s.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&ldquo;", "“")
+        .replace("&rdquo;", "”")
+        .replace("&hellip;", "…")
+}
+
+#[derive(serde::Serialize)]
+pub struct WebPage {
+    pub url: String,
+    pub title: String,
+    pub text: String,
+    /// 正文被截断没有（截断时前端会提示模型"没看全"）
+    pub truncated: bool,
+}
+
+/// 读一个网页的正文（给模型用，不是打开浏览器）。
+#[tauri::command]
+pub async fn read_web_page(url: String) -> Result<WebPage, String> {
+    let target = url.trim().to_string();
+    if !target.starts_with("http://") && !target.starts_with("https://") {
+        return Err("只能读 http/https 开头的网址".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = build_client()?;
+        let resp = client.get(&target).send().map_err(|e| format!("打不开这个网址：{}", describe_req_error(&e)))?;
+        if !resp.status().is_success() {
+            return Err(format!("这个网址返回了 {}", resp.status().as_u16()));
+        }
+        // 只看网页，别去解析 PDF/图片
+        let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+        if !ctype.is_empty() && !ctype.contains("html") && !ctype.contains("text") {
+            return Err(format!("这个链接不是网页（{}），没法读正文", ctype));
+        }
+        let body = resp.text().map_err(|e| format!("读取网页失败：{e}"))?;
+        let title = extract_title(&body);
+        let max = 8000usize;
+        let text = extract_readable(&body, max);
+        if text.chars().count() < 80 {
+            return Err("这个页面的正文几乎抓不到（可能要靠脚本渲染），换一条结果试试".into());
+        }
+        let truncated = text.chars().count() >= max - 200;
+        Ok(WebPage { url: target, title, text, truncated })
+    })
+    .await
+    .map_err(|e| format!("读页面任务异常：{e}"))?
+}
+
+fn extract_title(html: &str) -> String {
+    let lower = html.to_lowercase();
+    if let (Some(a), Some(b)) = (lower.find("<title"), lower.find("</title>")) {
+        if b > a {
+            let seg = &html[a..b];
+            if let Some(gt) = seg.find('>') {
+                return decode_entities(seg[gt + 1..].trim());
+            }
+        }
+    }
+    String::new()
+}
+

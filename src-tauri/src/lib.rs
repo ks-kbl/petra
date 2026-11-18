@@ -6517,6 +6517,7 @@ pub fn run() {
             set_interacting, set_menu_open, set_window_pos_size,
             set_volume, send_notification, get_weather, fetch_lyrics,
             websearch::web_search,
+            websearch::web_search_multi, websearch::read_web_page,
             list_installed_apps, open_path, lock_screen,
             save_chat_history, load_chat_history, search_chat_history,
             schedule_shutdown, cancel_shutdown,

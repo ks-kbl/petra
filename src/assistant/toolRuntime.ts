@@ -33,6 +33,8 @@ export const TOOL_SPECS: Record<string, ToolSpec> = {
   cancel_shutdown: {},
   // 搜索结果要带标题+链接+摘要，5 条很容易超 1500 字，单独放宽
   search_web: { required: ["query"], maxResultChars: 2600, readOnly: true },
+  // 读页面：正文本来就长（Rust 侧已截到 8k 字符），这里再留宽一点，别把有用的段落砍掉
+  read_web_page: { required: ["url"], maxResultChars: 9000, readOnly: true },
   open_url: { required: ["url"] },
   // 结果里可能带"当前开着的标签页"候选列表，给宽一点的截断上限
   close_web_page: { required: ["keyword"], maxResultChars: 1200 },

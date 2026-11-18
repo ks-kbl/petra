@@ -1,6 +1,7 @@
 import { lifeRuntime } from "./lifeRuntime";
 import { filterMentionable } from "./mentionScore";
 import { voiceCapabilityLine } from "./voiceTone";
+import { buildQueryVariants, hitRelevance, RELEVANCE_FLOOR } from "./searchQuery";
 import { invoke } from "@tauri-apps/api/core";
 import { readingHoldMs } from "../ui/bubbleTiming";
 import { chatStream, extractCommand, stripCommand, PROVIDERS, isProviderReady, type ChatMessage, type ToolCall, type MemoryEntry, type MemoryStore } from "./AssistantClient";
@@ -2758,16 +2759,53 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     if (tc.name === "cancel_shutdown") {
       await invokeTool(tc, "cancel_shutdown");
     }
+    if (tc.name === "read_web_page") {
+      const url = String(tc.args.url || "").trim();
+      if (!url) {
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "缺少 url，请补上再调用一次。" });
+      } else {
+        try {
+          const page = await invoke<{ url: string; title: string; text: string; truncated: boolean }>("read_web_page", { url });
+          const head = [`【${page.title || "网页正文"}】`, page.url];
+          if (page.truncated) head.push("（正文较长，只读了前面一部分）");
+          pushHistory({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: `${head.join("\n")}\n\n${page.text}`,
+          });
+        } catch (e) {
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `读不了这个页面：${e}` });
+        }
+      }
+    }
     if (tc.name === "search_web") {
       const query = String(tc.args.query || "").trim();
       if (!query) {
         pushHistory({ role: "tool", tool_call_id: tc.id, content: "搜索词是空的，请带上 query 再调用一次。" });
       } else {
         try {
-          const hits = await invoke<{ title: string; url: string; snippet: string; engine?: string }[]>("web_search", {
-            query,
-            limit: 5,
+          // 查询改写：把整句拆成 2~3 个更像搜索词的变体，一起搜再合并重排
+          const modelQueries = Array.isArray(tc.args.queries)
+            ? (tc.args.queries as unknown[]).map((q) => String(q)).filter(Boolean)
+            : [];
+          const variants = [...new Set([...(modelQueries.length ? modelQueries : [query]), ...buildQueryVariants(query)])].slice(0, 3);
+          let hits = await invoke<{ title: string; url: string; snippet: string; engine?: string; score?: number }[]>("web_search_multi", {
+            queries: variants,
+            limit: 6,
           });
+          // 相关性自检：结果基本不沾边就换一组更短的关键词再搜一次，而不是把垃圾交给模型
+          let relevance = hitRelevance(hits, query);
+          if (relevance < RELEVANCE_FLOOR && variants.length > 1) {
+            const retryQueries = variants.slice(1);
+            try {
+              const retry = await invoke<{ title: string; url: string; snippet: string; engine?: string; score?: number }[]>("web_search_multi", {
+                queries: retryQueries,
+                limit: 6,
+              });
+              const retryRel = hitRelevance(retry, query);
+              if (retryRel > relevance) { hits = retry; relevance = retryRel; }
+            } catch { /* 重搜失败就用原来的结果 */ }
+          }
           const text = (hits || [])
             .map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}\n   ${h.snippet}`)
             .join("\n");
@@ -2777,7 +2815,10 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           pushHistory({
             role: "tool",
             tool_call_id: tc.id,
-            content: text ? `搜索「${query}」的结果${from}：\n${text}` : `搜索「${query}」没有结果`,
+            content: text
+              ? `搜索「${query}」的结果${from}：\n${text}\n\n`
+                + `（如果这些摘要不足以回答问题，用 read_web_page 读第 1~2 条的正文；一次最多读两页）`
+              : `搜索「${query}」没有结果`,
           });
         } catch (e) {
           // 搜索失败要让模型知道，它可以换个关键词再试或直接说查不到，别让用户等成"卡住"

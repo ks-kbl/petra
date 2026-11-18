@@ -437,13 +437,36 @@ const TOOLS = [
     function: {
       name: "search_web",
       description:
-        "联网搜索，返回真实网页的标题/链接/摘要（不是打开浏览器）。新闻、版本号、价格、赛事、近况、政策这类时效信息必须先搜。查询词写「主体＋具体点」，别用泛泛的话题词；没结果换个更短更准的说法再试一次。",
+        "联网搜索，返回真实网页的标题/链接/摘要（不是打开浏览器）。新闻、版本号、价格、赛事、近况、政策这类时效信息必须先搜。"
+        + "查询词写「主体＋具体点」，别用整句。如果拿不准怎么写，可以一次给 2~3 个说法（queries），系统会并发搜完合并重排。"
+        + "摘要不够用时，用 read_web_page 打开最靠前的那一两条结果读正文。",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "搜索关键词" },
+          query: { type: "string", description: "搜索关键词（主体＋具体点）" },
+          queries: {
+            type: "array",
+            items: { type: "string" },
+            description: "可选：2~3 个不同的说法，会并发搜索后合并重排（第一个当作最准的）",
+          },
         },
         required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_web_page",
+      description:
+        "读取一个网页的正文（不是打开浏览器给你看）。搜索结果只有摘要、答不深的时候用它读前 1~2 条结果。"
+        + "一次最多读两页；正文太长会被截断。",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "要读的网页地址（http/https）" },
+        },
+        required: ["url"],
       },
     },
   },
