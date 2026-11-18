@@ -7,7 +7,8 @@
  * 1. **只拒绝非必要请求**（撒娇、陪你玩、唱歌、讲笑话、闲聊）；
  *    关机/删除/发送/提醒/打开软件这类**永不拒绝**——拒绝一次就是事故。
  * 2. **同一条命令第二次必须执行**（嘴硬心软，也给用户明确出路）。
- * 3. **每 24 小时最多拒绝 2 次**（否则变成在跟用户作对）。
+ * 3. **每天拒几次由人设决定**（傲娇嘴硬的多拒一次，温柔的几乎不拒），
+ *    模型也能在运行时调（setRefusalCap）；上限硬顶 4 次，不可能无限甩脸色。
  * 4. 说了「认真的」「别闹了」「正经一点」这类**安全词**，立刻照做。
  * 另外拒绝时必须给理由 + 留台阶，不能只甩一个"不要"。
  */
@@ -46,6 +47,10 @@ export interface RefusalInput {
   roll: number;
   /** 安全词命中（外面先算，便于测试） */
   serious?: boolean;
+  /** 当天额度（由人设推导，或模型直接给）；不传按 2 算 */
+  dailyCap?: number;
+  /** 闹脾气倾向（表达型推导），默认 1 */
+  tendency?: number;
 }
 
 export interface RefusalDecision {
@@ -59,26 +64,51 @@ export interface RefusalDecision {
   out?: string;
 }
 
-/** 心情 → 闹脾气的概率 */
-export function refusalProbability(mood: number): number {
-  if (mood <= -0.55) return 0.35;
-  if (mood < -0.2) return 0.12;
-  return 0;
+/**
+ * 心情 → 闹脾气的概率，再乘一个"人设倾向"。
+ *
+ * 三种表达型的倾向不同：爱吐槽的（sarcastic）更容易甩脸色；
+ * 高冷的（terse）懒得吵，只是不理；温柔的（pretend）基本不会拒绝，只会变冷。
+ */
+export function refusalProbability(mood: number, tendency = 1): number {
+  const base = mood <= -0.55 ? 0.35 : mood < -0.2 ? 0.12 : 0;
+  return Math.min(0.5, base * Math.max(0.3, Math.min(1.5, tendency)));
 }
 
-/** 一天最多拒绝几次 */
-export const REFUSAL_DAILY_CAP = 2;
+/** 表达型 → 闹脾气倾向（概率倍率） */
+export function refusalTendency(style: "sarcastic" | "terse" | "pretend"): number {
+  if (style === "sarcastic") return 1.2;
+  if (style === "terse") return 0.8;
+  return 0.5;
+}
+
+/**
+ * 表达型 + 人设特征 → 每天拒绝额度（0~4）。
+ *
+ * 这个数不是"限制用户"，而是"这个角色今天能甩几次脸色"：
+ * 爱吐槽又有底气的多一次，温柔的几乎不拒。AI 也可以在运行时覆盖（见 lifeRuntime.setRefusalCap）。
+ */
+export function refusalBudget(style: "sarcastic" | "terse" | "pretend", traits: string[] = []): number {
+  let cap = style === "sarcastic" ? 3 : style === "terse" ? 2 : 1;
+  if (traits.includes("lazy") || traits.includes("food")) cap += 1; // 懒散/爱吃的人更容易耍赖
+  if (traits.includes("sport") || traits.includes("tech")) cap -= 1; // 正经/自律的少甩脸色
+  return Math.max(0, Math.min(4, cap));
+}
+
+/** 硬顶：无论谁来调，一天也不会拒超过 4 次 */
+export const REFUSAL_DAILY_MAX = 4;
 
 export function shouldRefuse(i: RefusalInput): RefusalDecision {
   const kind = classifyRequest(i.text);
-  const probability = refusalProbability(i.mood);
+  const probability = refusalProbability(i.mood, i.tendency ?? 1);
+  const cap = Math.max(0, Math.min(REFUSAL_DAILY_MAX, i.dailyCap ?? 2));
   const no = (reason?: string): RefusalDecision => ({ refuse: false, kind, probability, reason });
 
   if (i.serious || isSerious(i.text)) return no("安全词：立刻照做");
   if (kind === "safety") return no("安全/不可逆操作：永不拒绝");
   if (kind === "task") return no("功能性请求：不拒绝");
   if (i.sameRequestRefused > 0) return no("同一条请求已经拒绝过，第二次必须执行");
-  if (i.refusedToday >= REFUSAL_DAILY_CAP) return no("今日拒绝额度已用完");
+  if (i.refusedToday >= cap) return no(`今日拒绝额度已用完（${cap} 次）`);
   if (probability <= 0) return no("心情还没差到要闹脾气");
   if (i.roll >= probability) return no("这次没抽中");
 

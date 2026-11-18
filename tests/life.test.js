@@ -254,13 +254,28 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("★ 发消息永不可拒绝", !refusal.shouldRefuse({ ...base, text: "帮我发消息给张三" }).refuse);
   check("★ 功能性请求不拒", !refusal.shouldRefuse({ ...base, text: "帮我查一下天气" }).refuse);
   check("★ 同一条请求第二次必须执行", !refusal.shouldRefuse({ ...base, text: "陪我聊会儿嘛", sameRequestRefused: 1 }).refuse);
-  check("★ 每天最多拒 2 次", !refusal.shouldRefuse({ ...base, text: "陪我聊会儿嘛", refusedToday: 2 }).refuse);
+  check("默认额度 2 次用完后不再拒", !refusal.shouldRefuse({ ...base, text: "陪我聊会儿嘛", refusedToday: 2 }).refuse);
+  check("★ 额度可以按人设放宽（傲娇 3 次）", !refusal.shouldRefuse({ ...base, text: "陪我聊会儿嘛", refusedToday: 2, dailyCap: 3 }).refuse === false
+    && refusal.shouldRefuse({ ...base, text: "陪我聊会儿嘛", refusedToday: 2, dailyCap: 3 }).refuse === true);
+  check("★ 额度可以按人设收紧（温柔 1 次）", refusal.shouldRefuse({ ...base, text: "陪我聊会儿嘛", refusedToday: 1, dailyCap: 1 }).refuse === false);
   check("★ 说「认真的」立刻照做", !refusal.shouldRefuse({ ...base, text: "认真的，陪我聊会儿" }).refuse);
   check("没生气时不拒绝", !refusal.shouldRefuse({ ...base, mood: 0.2, text: "陪我聊会儿嘛" }).refuse);
   check("小不爽概率更低", refusal.refusalProbability(-0.3) < refusal.refusalProbability(-0.8));
   check("★ 拒绝台词会说明原因", /不干|不。|不太想/.test(refusal.refusalLine("sarcastic", "还在气头上")));
   check("话变少型的拒绝更短", refusal.refusalLine("terse", "还在气头上").length
     < refusal.refusalLine("sarcastic", "还在气头上").length);
+}
+
+// ---------- 拒绝额度由人设决定 ----------
+{
+  check("★ 傲娇嘴硬的额度更高", refusal.refusalBudget("sarcastic", ["lazy"]) >= 3, String(refusal.refusalBudget("sarcastic", ["lazy"])));
+  check("★ 温柔的额度最低", refusal.refusalBudget("pretend", []) <= 1, String(refusal.refusalBudget("pretend", [])));
+  check("正经/自律的人设少甩脸色", refusal.refusalBudget("sarcastic", ["tech"]) < refusal.refusalBudget("sarcastic", []));
+  check("额度硬顶 4 次、下限 0", refusal.refusalBudget("sarcastic", ["lazy", "food"]) <= 4
+    && refusal.refusalBudget("pretend", ["tech", "sport"]) >= 0);
+  check("★ 表达型影响闹脾气概率", refusal.refusalProbability(-0.8, refusal.refusalTendency("sarcastic"))
+    > refusal.refusalProbability(-0.8, refusal.refusalTendency("pretend")));
+  check("概率有上限（不会每次都拒）", refusal.refusalProbability(-1, 1.5) <= 0.5);
 }
 
 console.log(`life: fail=${fail}`);

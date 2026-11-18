@@ -23,7 +23,7 @@ import { applyAffect, decay, defaultFavor, favorLine, toneLine, type Favor } fro
 import { detectTraits, type RoutineTrait } from "./personaRoutine";
 import { addressLine, addressTier, deriveAddressForms, type AddressForms } from "./address";
 import { deriveExpressionStyle, styleLine, type ExpressionStyle } from "./expressionStyle";
-import { refusalLine, shouldRefuse } from "./refusal";
+import { refusalBudget, refusalLine, refusalTendency, shouldRefuse, REFUSAL_DAILY_MAX } from "./refusal";
 
 const STORE_KEY = "petra.life.v1";
 /** 最近保留多少条用户原话用于学口头禅 */
@@ -56,8 +56,8 @@ interface Persisted {
   address: AddressForms;
   /** 生气时的表达型（人设推导） */
   style: ExpressionStyle;
-  /** 拒绝执行记账：今天拒了几次、拒过哪些请求 */
-  refusals: { day: string; count: number; keys: string[] };
+  /** 拒绝执行记账：今天拒了几次、拒过哪些请求、当天额度（人设给的，模型可覆盖） */
+  refusals: { day: string; count: number; keys: string[]; cap: number };
 }
 
 let data: Persisted | null = null;
@@ -86,7 +86,7 @@ function fresh(now: number): Persisted {
     traits: [],
     address: { close: "你", neutral: "你", cold: "喂" },
     style: "sarcastic",
-    refusals: { day: dayKey(now), count: 0, keys: [] },
+    refusals: { day: dayKey(now), count: 0, keys: [], cap: 2 },
   };
 }
 
@@ -187,6 +187,8 @@ export function setPersona(persona: string, now = Date.now()): void {
   d.traits = traits;
   d.address = address;
   d.style = style;
+  // 额度跟着人设走：傲娇多一次、温柔的几乎不拒
+  d.refusals.cap = refusalBudget(style, traits);
   planCache = null;
   save();
 }
@@ -199,7 +201,7 @@ export function setPersona(persona: string, now = Date.now()): void {
  */
 export function maybeRefuse(text: string, now = Date.now()): string | null {
   const d = load(now);
-  if (d.refusals.day !== dayKey(now)) d.refusals = { day: dayKey(now), count: 0, keys: [] };
+  if (d.refusals.day !== dayKey(now)) d.refusals = { ...d.refusals, day: dayKey(now), count: 0, keys: [] };
   const key = (text || "").trim().slice(0, 40);
   const same = d.refusals.keys.filter((k) => k === key).length;
   const decision = shouldRefuse({
@@ -208,6 +210,8 @@ export function maybeRefuse(text: string, now = Date.now()): string | null {
     refusedToday: d.refusals.count,
     sameRequestRefused: same,
     roll: Math.random(),
+    dailyCap: d.refusals.cap,
+    tendency: refusalTendency(d.style),
   });
   if (!decision.refuse) return null;
   d.refusals.count += 1;
@@ -217,6 +221,18 @@ export function maybeRefuse(text: string, now = Date.now()): string | null {
 }
 
 /** 记一条模型判断出来的情绪（半衰期由模型给，界面不暴露） */
+/**
+ * 让模型自己决定"今天能甩几次脸色"（0~4，硬顶 4）。
+ *
+ * 用户的原话是"别那么死，按人设让 AI 自己判断"——所以给这么个入口，
+ * 模型可以在对话里自己调（比如被连续冒犯后决定今天不再配合）。
+ */
+export function setRefusalCap(cap: number, now = Date.now()): void {
+  const d = load(now);
+  d.refusals.cap = Math.max(0, Math.min(REFUSAL_DAILY_MAX, Math.round(cap)));
+  save();
+}
+
 export function recordAffect(
   kind: AffectKind,
   reason: string,
@@ -339,6 +355,7 @@ export const lifeRuntime = {
   noteUserMessage,
   setPersona,
   maybeRefuse,
+  setRefusalCap,
   recordAffect,
   /** 当前心情值（-1~1），只给内部过滤用，不进 UI */
   promptMood: (now = Date.now()) => currentMood(load(now).affect, now).value,
