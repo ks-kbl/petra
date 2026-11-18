@@ -95,11 +95,13 @@ export function moodLine(events: AffectEvent[], now = Date.now()): string {
   const { value, dominant } = currentMood(events, now);
   if (!dominant || Math.abs(value) < 0.12) return "";
   const why = dominant.reason ? `，因为「${dominant.reason}」` : "";
+  // 注意：这里**不规定"话短"或"语气冲"**——那由 expressionStyle 按人设决定
+  // （阴阳怪气型生气时话反而更多）。两处都写就会互相打架。
   if (value <= -0.55) {
-    return `你现在正在生气${why}。回话要短、冲一点，不要主动开新话题，也别装作没事；被问到为什么生气就直说原因。`;
+    return `你现在正在生气${why}。不要装作没事，也别主动开新话题；被问到为什么生气就直说原因。`;
   }
   if (value < -0.2) {
-    return `你还有点不爽${why}。语气可以带点刺，但不用一直揪着不放。`;
+    return `你还有点不爽${why}。不用一直揪着不放，但也没必要装作完全不在意。`;
   }
   if (value >= 0.55) {
     return `你现在心情很好${why}。语气轻快，愿意多聊两句。`;

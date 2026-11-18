@@ -21,6 +21,9 @@ import {
 } from "./affect";
 import { applyAffect, decay, defaultFavor, favorLine, toneLine, type Favor } from "./favor";
 import { detectTraits, type RoutineTrait } from "./personaRoutine";
+import { addressLine, addressTier, deriveAddressForms, type AddressForms } from "./address";
+import { deriveExpressionStyle, styleLine, type ExpressionStyle } from "./expressionStyle";
+import { refusalLine, shouldRefuse } from "./refusal";
 
 const STORE_KEY = "petra.life.v1";
 /** 最近保留多少条用户原话用于学口头禅 */
@@ -49,6 +52,12 @@ interface Persisted {
   favor: Favor;
   /** 从人设识别出的生活特征 */
   traits: RoutineTrait[];
+  /** 三档称呼（人设推导） */
+  address: AddressForms;
+  /** 生气时的表达型（人设推导） */
+  style: ExpressionStyle;
+  /** 拒绝执行记账：今天拒了几次、拒过哪些请求 */
+  refusals: { day: string; count: number; keys: string[] };
 }
 
 let data: Persisted | null = null;
@@ -75,6 +84,9 @@ function fresh(now: number): Persisted {
     affect: [],
     favor: defaultFavor(now),
     traits: [],
+    address: { close: "你", neutral: "你", cold: "喂" },
+    style: "sarcastic",
+    refusals: { day: dayKey(now), count: 0, keys: [] },
   };
 }
 
@@ -98,6 +110,9 @@ export function load(now = Date.now()): Persisted {
           affect: Array.isArray(j.affect) ? (j.affect as AffectEvent[]).slice(-8) : [],
           favor: j.favor && typeof j.favor.score === "number" ? (j.favor as Favor) : base.favor,
           traits: Array.isArray(j.traits) ? (j.traits as RoutineTrait[]) : [],
+          address: (j.address as AddressForms) ?? base.address,
+          style: (j.style as ExpressionStyle) ?? base.style,
+          refusals: { ...base.refusals, ...(j.refusals ?? {}) },
         };
         return data;
       }
@@ -164,10 +179,41 @@ export function noteUserMessage(text: string, now = Date.now()): void {
 export function setPersona(persona: string, now = Date.now()): void {
   const d = load(now);
   const traits = detectTraits(persona);
-  if (traits.join(",") === d.traits.join(",")) return;
+  const address = deriveAddressForms(persona);
+  const style = deriveExpressionStyle(persona);
+  const sameTraits = traits.join(",") === d.traits.join(",");
+  const sameAddr = address.close === d.address.close && address.cold === d.address.cold;
+  if (sameTraits && sameAddr && style === d.style) return;
   d.traits = traits;
+  d.address = address;
+  d.style = style;
   planCache = null;
   save();
+}
+
+/**
+ * 生气时"不干活"：返回要说的拒绝台词；不拒绝返回 null。
+ *
+ * 所有边界都在 refusal.ts 里（只拒社交请求、第二次必做、每天最多 2 次、
+ * 安全词立刻照做），这里只负责取状态、掷骰子、记账。
+ */
+export function maybeRefuse(text: string, now = Date.now()): string | null {
+  const d = load(now);
+  if (d.refusals.day !== dayKey(now)) d.refusals = { day: dayKey(now), count: 0, keys: [] };
+  const key = (text || "").trim().slice(0, 40);
+  const same = d.refusals.keys.filter((k) => k === key).length;
+  const decision = shouldRefuse({
+    text,
+    mood: currentMood(d.affect, now).value,
+    refusedToday: d.refusals.count,
+    sameRequestRefused: same,
+    roll: Math.random(),
+  });
+  if (!decision.refuse) return null;
+  d.refusals.count += 1;
+  d.refusals.keys = [...d.refusals.keys, key].slice(-10);
+  save();
+  return refusalLine(d.style, decision.reason ?? "还在气头上");
 }
 
 /** 记一条模型判断出来的情绪（半衰期由模型给，界面不暴露） */
@@ -237,7 +283,11 @@ export function promptBlock(now = Date.now()): string {
   if (life) parts.push(`【你现在的状态】${life}`);
   const mood = moodLine(d.affect, now);
   if (mood) parts.push(`【你的情绪】${mood}`);
-  const tone = toneLine(d.favor, currentMood(d.affect, now).value);
+  const moodValue = currentMood(d.affect, now).value;
+  const tier = addressTier(moodValue, d.favor.score);
+  parts.push(`【称呼】${addressLine(tier, d.address).replace(/^称呼：/, "")}`);
+  if (moodValue < -0.2) parts.push(`【生气的样子】${styleLine(d.style)}`);
+  const tone = toneLine(d.favor, moodValue);
   if (tone) parts.push(`【语气】${tone}`);
   const fav = favorLine(d.favor);
   if (fav) parts.push(`【关系】${fav}`);
@@ -288,6 +338,7 @@ export const lifeRuntime = {
   markDelivered,
   noteUserMessage,
   setPersona,
+  maybeRefuse,
   recordAffect,
   /** 当前心情值（-1~1），只给内部过滤用，不进 UI */
   promptMood: (now = Date.now()) => currentMood(load(now).affect, now).value,

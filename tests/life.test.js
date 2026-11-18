@@ -14,6 +14,9 @@ const affect = require("./build/assistant/affect.js");
 const favorMod = require("./build/assistant/favor.js");
 const mention = require("./build/assistant/mentionScore.js");
 const persona = require("./build/assistant/personaRoutine.js");
+const addr = require("./build/assistant/address.js");
+const style = require("./build/assistant/expressionStyle.js");
+const refusal = require("./build/assistant/refusal.js");
 
 let fail = 0;
 const check = (name, cond, extra = "") => {
@@ -152,7 +155,10 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("★ 气头上心情是负的", m1.value < -0.5 && m1.dominant.reason === "被叫胖");
   const m2 = affect.currentMood(events, now + 4 * 3600 * 1000);
   check("★ 四小时后气基本消了", Math.abs(m2.value) < 0.15, m2.value.toFixed(2));
-  check("★ 生气时会给出「短、冲、不开新话题」的约束", /短|冲|不要主动开新话题/.test(affect.moodLine(events, now)));
+  // 情绪只负责"为什么、到什么程度、别装没事"；"话短还是阴阳"由表达型决定
+  check("★ 生气时会说明原因并禁止装没事", /别装|不要装作没事/.test(affect.moodLine(events, now))
+    && affect.moodLine(events, now).includes("被叫胖"));
+  check("★ 情绪描述不规定语气长短（那是表达型的事）", !/话要短|语气冲/.test(affect.moodLine(events, now)));
   check("没情绪时不产生提示", affect.moodLine([], now) === "");
 
   // 同一原因重复触发是刷新时间，不是叠强度
@@ -214,6 +220,47 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("★ 大肥鱼的日子里有吃/躺/摸鱼", /吃|奶茶|躺|赖床|吃|饿/.test(fishText), fishText);
   check("★ 同一天、不同人设，日子不一样", JSON.stringify(planFish) !== JSON.stringify(planNeutral));
   check("没人设时也能生成", planNeutral.length === 6);
+}
+
+// ---------- 称呼三档 ----------
+{
+  const forms = addr.deriveAddressForms("赛博女仆鲸鱼娘，叫用户「老大」，也叫鱼片，傲娇");
+  check("★ 从人设里认出亲昵称呼", forms.close === "老大", JSON.stringify(forms));
+  check("★ 气到极点且关系一般 → 冷淡档", addr.addressTier(-0.8, 0.3) === "cold");
+  check("★ 气到极点但关系好 → 只掉到中性", addr.addressTier(-0.8, 0.8) === "neutral");
+  check("★ 平时且关系好 → 亲昵", addr.addressTier(0.1, 0.8) === "close");
+  check("★ 冷淡档不再用亲昵称呼", /别用亲昵称呼/.test(addr.addressLine("cold", forms)), addr.addressLine("cold", forms));
+  check("没写称呼的人设也能用", addr.deriveAddressForms("一个普通的助手").neutral === "你");
+}
+
+// ---------- 生气的表达型 ----------
+{
+  check("★ 傲娇/毒舌人设 → 阴阳怪气", style.deriveExpressionStyle("贱兮兮、傲娇、爱吐槽") === "sarcastic");
+  check("★ 高冷人设 → 话变少", style.deriveExpressionStyle("高冷、话少、沉默") === "terse");
+  check("★ 温柔人设 → 嘴硬装没事", style.deriveExpressionStyle("温柔体贴、心软") === "pretend");
+  check("三种表达型都有各自的说法", new Set([
+    style.styleLine("sarcastic"), style.styleLine("terse"), style.styleLine("pretend"),
+  ]).size === 3);
+}
+
+// ---------- 生气时不干活（含四条硬约束） ----------
+{
+  const base = { mood: -0.8, refusedToday: 0, sameRequestRefused: 0, roll: 0 };
+  const social = refusal.shouldRefuse({ ...base, text: "陪我聊会儿嘛" });
+  check("★ 气头上、社交请求 → 会拒绝", social.refuse === true, JSON.stringify(social));
+  check("拒绝要给理由和台阶", !!social.reason && !!social.out);
+  check("★ 关机这类永不可拒绝", !refusal.shouldRefuse({ ...base, text: "帮我关机" }).refuse);
+  check("★ 删除文件永不可拒绝", !refusal.shouldRefuse({ ...base, text: "把那个文件删掉" }).refuse);
+  check("★ 发消息永不可拒绝", !refusal.shouldRefuse({ ...base, text: "帮我发消息给张三" }).refuse);
+  check("★ 功能性请求不拒", !refusal.shouldRefuse({ ...base, text: "帮我查一下天气" }).refuse);
+  check("★ 同一条请求第二次必须执行", !refusal.shouldRefuse({ ...base, text: "陪我聊会儿嘛", sameRequestRefused: 1 }).refuse);
+  check("★ 每天最多拒 2 次", !refusal.shouldRefuse({ ...base, text: "陪我聊会儿嘛", refusedToday: 2 }).refuse);
+  check("★ 说「认真的」立刻照做", !refusal.shouldRefuse({ ...base, text: "认真的，陪我聊会儿" }).refuse);
+  check("没生气时不拒绝", !refusal.shouldRefuse({ ...base, mood: 0.2, text: "陪我聊会儿嘛" }).refuse);
+  check("小不爽概率更低", refusal.refusalProbability(-0.3) < refusal.refusalProbability(-0.8));
+  check("★ 拒绝台词会说明原因", /不干|不。|不太想/.test(refusal.refusalLine("sarcastic", "还在气头上")));
+  check("话变少型的拒绝更短", refusal.refusalLine("terse", "还在气头上").length
+    < refusal.refusalLine("sarcastic", "还在气头上").length);
 }
 
 console.log(`life: fail=${fail}`);

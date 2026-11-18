@@ -66,15 +66,16 @@ export function favorLine(fav: Favor): string {
 export function toneLine(fav: Favor, moodValue: number): string {
   // 阈值必须和 affect.moodLine 对齐（-0.55 大生气 / -0.2 小不爽），
   // 否则同一个状态会出现"你还有点不爽" + "你在生气"两句话打架。
+  // 这里只给"关系层面的分寸"，具体怎么表现交给 expressionStyle。
   if (moodValue <= -0.55) {
-    if (fav.score >= 0.62) return "你在生气，但因为关系好，可以凶两句再自己找台阶下。";
-    if (fav.score <= 0.38) return "你在生气，而且本来也不算亲近，语气可以冷一点。";
-    return "你在生气，语气冲一点，别主动开新话题。";
+    if (fav.score >= 0.62) return "因为关系好，你闹脾气也只是嘴上说说，留个台阶别真的翻脸。";
+    if (fav.score <= 0.38) return "你们本来也不算亲近，可以冷一点，不必给台阶。";
+    return "别主动开新话题。";
   }
   if (moodValue < -0.2) {
     return fav.score >= 0.62
-      ? "你还有点不爽，但关系好，嘴上带刺就行，别真的翻脸。"
-      : "你还有点不爽，话可以少一点。";
+      ? "还有点不爽，但关系好，别真的翻脸。"
+      : "还有点不爽，不用太热络。";
   }
   if (moodValue >= 0.5 && fav.score >= 0.62) return "心情好又亲近，可以主动撒个娇或多说两句。";
   return "";

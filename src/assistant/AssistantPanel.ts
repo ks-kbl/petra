@@ -2245,6 +2245,17 @@ async function send(text: string) {
   lastSentAt = Date.now();
   // 情感反馈：先分析用户消息（零 token），立即驱动角色表情/动作 + 心情
   const userEmo = classifyEmotion(text);
+  // 生气了可以"不干活"：只拒社交类请求，第二次必做、每天最多 2 次、
+  // 说「认真的」立刻照做（边界见 refusal.ts）。拒绝也要说清楚为什么。
+  {
+    const refuseLine = lifeRuntime.maybeRefuse(text, Date.now());
+    if (refuseLine) {
+      const b = addBubble("ai", refuseLine);
+      scheduleFade(b, 9000);
+      busy = false;
+      return;
+    }
+  }
   reactNow(userEmo);
   boostMood("chat");
   if (userEmo !== "neutral") boostMood(userEmo);
