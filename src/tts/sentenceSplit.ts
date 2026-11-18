@@ -14,13 +14,21 @@
  */
 
 /** 这一段是「因为什么」被切开的 —— 决定它后面该停多久 */
-export type SpeechBoundary = "sentence" | "ellipsis" | "newline" | "soft" | "hard";
+export type SpeechBoundary = "sentence" | "ellipsis" | "newline" | "paragraph" | "soft" | "hard";
 
 export interface SpeechSplitOptions {
   /** 一段至少这么长才值得单独送去合成（太短的会跟下一句合并） */
   minChars?: number;
   /** 单段上限：超过就在最近的逗号/空格处断开，避免一次合成太长容易超时 */
   maxChars?: number;
+  /**
+   * 单个换行是否只当「句中停顿」而不是断句点。
+   *
+   * 默认 false（保持老行为：一行一段）。TTS 改成「攒整段再送」之后，
+   * 模型那种一行一句的回复会被拆成好几段各自起调——所以朗读路径传 true：
+   * 单换行只记成 soft break，真的遇到空行（段落）才切。
+   */
+  softNewline?: boolean;
 }
 
 export const DEFAULT_MIN_CHARS = 10;
@@ -50,6 +58,7 @@ export function takeSpeechSegment(
 ): { segment: string; rest: string; boundary: SpeechBoundary } | null {
   const minChars = opts.minChars ?? DEFAULT_MIN_CHARS;
   const maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS;
+  const softNewline = opts.softNewline === true;
   let text = buffer.replace(/^\s+/, "");
   if (!text.trim()) return null;
 
@@ -108,6 +117,23 @@ export function takeSpeechSegment(
     // 否则一行行读下来会连成一大串，或者被 maxChars 从行中间切断。
     if (depth === 0 && (ch === "\n" || ch === "\r")) {
       if (ch === "\r" && text[i + 1] === "\n") continue;
+      // 空行 = 真的换段落：这里切一刀，而且门槛放得很低（一句话就是一段的时候也要停）
+      const prevBreak = i === 0 || text[i - 1] === "\n" || text[i - 1] === "\r";
+      const nextBreak = text[i + 1] === "\n" || text[i + 1] === "\r";
+      if (prevBreak || nextBreak) {
+        let rest = i + 1;
+        while (text[rest] === "\n" || text[rest] === "\r" || text[rest] === " ") rest++;
+        const segment = text.slice(0, i).trim();
+        if (segment.length >= 2) {
+          return { segment, rest: text.slice(rest), boundary: "paragraph" };
+        }
+        continue;
+      }
+      if (softNewline) {
+        // 朗读路径：单换行只算一个停顿位，等攒够长度一起送合成（段内换行后会被读成逗号）
+        lastSoft = i;
+        continue;
+      }
       const segment = text.slice(0, i).trim();
       if (segment.length >= minChars) {
         return { segment, rest: text.slice(i + 1).replace(/^[\r\n]+/, ""), boundary: "newline" };
@@ -126,6 +152,35 @@ export function takeSpeechSegment(
     }
   }
   return null;
+}
+
+/**
+ * 首段：先出声最要紧，攒够一句就送，别为了等长句让用户干等。
+ * 8 个字 ≈「嗯……好吧，那我去看看。」这种，合成一次一秒多就能播。
+ */
+export const FIRST_MIN_CHARS = 8;
+export const FIRST_MAX_CHARS = 48;
+/**
+ * 之后：一段尽量长，把两三句合并成**一次**合成。
+ *
+ * 这是「像朗读」的最大来源——每句单独合成 = 每句重新起调。合并到 140 字后
+ * 一次请求里能容纳三四个短句，模型自己会给跨句的连贯语调。
+ * 上限卡在 140 而不是无限：Rust 侧单次请求 30 秒超时，140 字中文约 30 秒音频，
+ * 合成耗时（RTF≈0.3）约 9 秒，留够余量；再长就有超时和「等太久才开口」的风险。
+ */
+export const STEADY_MIN_CHARS = 26;
+export const STEADY_MAX_CHARS = 140;
+
+/**
+ * 按「这条回复已经送出去几段」给下一段挑长度门槛（纯函数，可单测）。
+ *
+ * 前紧后松：第一段短（快速开口），之后每段长（减少接缝、保住句间语调）。
+ */
+export function speechLimits(spokenSegments: number): SpeechSplitOptions {
+  if (spokenSegments <= 0) {
+    return { minChars: FIRST_MIN_CHARS, maxChars: FIRST_MAX_CHARS, softNewline: true };
+  }
+  return { minChars: STEADY_MIN_CHARS, maxChars: STEADY_MAX_CHARS, softNewline: true };
 }
 
 /** 流结束时把剩下的尾巴交出去（不够一句也要说完） */

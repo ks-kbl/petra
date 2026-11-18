@@ -91,7 +91,8 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
   const idled = [];
 
   player.pushDelta("第一句要说得长一点，够断句了。");
-  player.pushDelta("第二句也要说得长一点，才能单独成段。");
+  // 第二句必须 ≥26 字：合成粒度改成「攒够一段再送」后，短句会和后文合并
+  player.pushDelta("第二句同样要写得足够长才行，这样才会被单独送进合成请求里，对吧。");
   // 真实调用方是在 flush 之后注册的：这时队列里已经有内容，必须等播完才回调
   player.onIdle(() => idled.push(1));
   await settle();
@@ -105,11 +106,11 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
     check("按文字顺序调度", !!a && !!b);
     check("第一段裁掉了开头静音", a.offset > 0, String(a.offset));
     check("第一段裁掉了结尾静音", a.duration < 0.3, String(a.duration));
-    // 2026-11：句间停顿从 70ms 调到 300ms（用户反馈"没有停顿"），
+    // 2026-11 二轮：合成粒度改大后接缝变少，句间停顿从 300ms 收到 220ms，
     // 但"提前排好时间轴"这条不变——下半段仍然在第一段还没播完时就已经排进队列。
     check(
       "第二段在第一段结束前就已排好（只差一个句间停顿）",
-      Math.abs(b.when - (a.when + a.duration) - 0.3) < 0.02,
+      Math.abs(b.when - (a.when + a.duration) - 0.22) < 0.02,
       JSON.stringify({ a, b }),
     );
   }

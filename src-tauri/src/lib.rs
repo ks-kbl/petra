@@ -4340,6 +4340,8 @@ struct TtsTone {
     model: Option<String>,
     /// 自然语言语气口令（context_texts，只取第一个值，不计费）
     context_text: Option<String>,
+    /// 对话上下文（context_texts 的完整形式）：前一段原文 + 语气口令，按顺序给
+    context_texts: Option<Vec<String>>,
     /// 是否解析 <cot text=…> 语音标签
     use_tag_parser: Option<bool>,
     speech_rate: Option<f64>,
@@ -4376,14 +4378,23 @@ fn strip_cot_tags(text: &str) -> String {
     out
 }
 
-/// 拼一次请求体：`tone` 为空就是原来那套最小参数
-fn build_tts_body(speaker: &str, text: &str, language: Option<&str>, tone: Option<&TtsTone>) -> serde_json::Value {
+/// 拼一次请求体：`tone` 为空就是原来那套最小参数。
+///
+/// `sample_rate` 单独传：48k 的声音更透（齿音、气声都在），但部分复刻音色只吃 24k，
+/// 调用方失败后会拿 24000 再试一轮，见 `tts_synthesize`。
+fn build_tts_body(
+    speaker: &str,
+    text: &str,
+    language: Option<&str>,
+    tone: Option<&TtsTone>,
+    sample_rate: u32,
+) -> serde_json::Value {
     // 只有真的开了标签解析才保留 <cot>；否则一律剥掉，绝不能让标签被念出来
     let tag_parser = tone.and_then(|t| t.use_tag_parser) == Some(true);
     let text: String = if tag_parser { text.to_string() } else { strip_cot_tags(text) };
     let text = text.as_str();
 
-    let mut audio = serde_json::json!({ "format": "mp3", "sample_rate": 24000 });
+    let mut audio = serde_json::json!({ "format": "mp3", "sample_rate": sample_rate });
     let mut additions = serde_json::Map::new();
     let mut req = serde_json::Map::new();
     req.insert("text".into(), serde_json::Value::String(text.to_string()));
@@ -4393,8 +4404,26 @@ fn build_tts_body(speaker: &str, text: &str, language: Option<&str>, tone: Optio
         if let Some(m) = t.model.as_deref().filter(|m| !m.is_empty()) {
             req.insert("model".into(), serde_json::Value::String(m.to_string()));
         }
-        if let Some(ctx) = t.context_text.as_deref().filter(|c| !c.trim().is_empty()) {
-            additions.insert("context_texts".into(), serde_json::json!([ctx]));
+        // context_texts 是数组：前一段原文在前、语气口令在后，模型靠它接住上一句的
+        // 语速和情绪。旧的单值 context_text 仍然兼容，合并成同一个数组。
+        let mut ctxs: Vec<String> = Vec::new();
+        if let Some(list) = t.context_texts.as_ref() {
+            for c in list {
+                let c = c.trim();
+                if !c.is_empty() {
+                    ctxs.push(c.to_string());
+                }
+            }
+        }
+        if let Some(ctx) = t.context_text.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            if !ctxs.iter().any(|c| c == ctx) {
+                ctxs.push(ctx.to_string());
+            }
+        }
+        // 官方建议别太多：超过 4 条要么稀释指令，要么直接报参数错
+        ctxs.truncate(4);
+        if !ctxs.is_empty() {
+            additions.insert("context_texts".into(), serde_json::json!(ctxs));
         }
         if tag_parser {
             additions.insert("use_tag_parser".into(), serde_json::Value::Bool(true));
@@ -4456,6 +4485,12 @@ async fn post_tts(client: &reqwest::Client, api_key: &str, resource_id: &str, bo
     Ok(combined)
 }
 
+/// 已经验证可用的采样率（0 = 还没定）。
+///
+/// 高采样率是"声音更透"的前提，但部分复刻音色只吃 24k；不记住结论的话，
+/// 每段语音都要先失败一次再退回，等于对同一个错误反复计费。
+static TTS_SAMPLE_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 #[tauri::command]
 async fn tts_synthesize(
     api_key: String,
@@ -4468,8 +4503,11 @@ async fn tts_synthesize(
         return Err("还没填「音色 ID」：语音朗读必须指定一个音色（火山控制台 → 声音复刻 → 音色管理里的 Speaker ID），留空不会出声".into());
     }
 
+    // 单段最长 140 字（前端 speechLimits 定的），中文约 30 秒音频；合成本身 RTF≈0.3，
+    // 但弱网/排队时要留余量，所以给到 30 秒而不是原来的 15 秒——超时会把整段丢掉，
+    // 而丢一段就是整句静音。
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
 
@@ -4478,34 +4516,51 @@ async fn tts_synthesize(
     // 用户手里的音色可能是复刻 1.0 或官方大模型音色，所以按顺序试：
     // 复刻 2.0 → 复刻 1.0 → 官方音色 2.0。第一个成功就停。
     const RESOURCE_IDS: [&str; 3] = ["seed-icl-2.0", "seed-icl-1.0", "seed-tts-2.0"];
-    let body = build_tts_body(&speaker, &text, language.as_deref(), tone.as_ref());
     let mut last_err = String::new();
-    for (i, rid) in RESOURCE_IDS.iter().enumerate() {
-        match post_tts(&client, &api_key, rid, &body).await {
-            Ok(audio) => {
-                if i > 0 {
-                    log_verbose(&format!("[tts] 音色匹配到资源 {rid}（默认的 seed-icl-2.0 不适用）"));
+
+    // 采样率先 48k（齿音和气声更清楚，听着不那么"闷"），失败再退回 24k。
+    // 一旦定下来就记在静态里：否则每段都要先失败一次才能用 24k —— 那是**双倍计费**。
+    let known = TTS_SAMPLE_RATE.load(Ordering::Relaxed);
+    let rates: &[u32] = if known != 0 {
+        std::slice::from_ref(&known)
+    } else {
+        &[48000u32, 24000u32]
+    };
+    for &rate in rates {
+        let body = build_tts_body(&speaker, &text, language.as_deref(), tone.as_ref(), rate);
+        for (i, rid) in RESOURCE_IDS.iter().enumerate() {
+            match post_tts(&client, &api_key, rid, &body).await {
+                Ok(audio) => {
+                    if i > 0 {
+                        log_verbose(&format!("[tts] 音色匹配到资源 {rid}（默认的 seed-icl-2.0 不适用）"));
+                    }
+                    if known == 0 {
+                        TTS_SAMPLE_RATE.store(rate, Ordering::Relaxed);
+                        if rate != 48000 {
+                            log_verbose("[tts] 48k 合成失败，已退回 24k（本进程后续都用 24k）");
+                        }
+                    }
+                    return Ok(audio);
                 }
-                return Ok(audio);
-            }
-            Err(e) => {
-                last_err = e;
-                // 只有"资源不匹配"才值得换一个资源 ID 再试；
-                // Key 无效 / 余额不足 / 文本为空这类换资源也没用，直接退出循环省一次计费请求。
-                let mismatch = last_err.contains("55000000") || last_err.contains("mismatched");
-                if !mismatch { break; }
+                Err(e) => {
+                    last_err = e;
+                    // 只有"资源不匹配"才值得换一个资源 ID 再试；
+                    // Key 无效 / 余额不足 / 文本为空这类换资源也没用，直接退出循环省一次计费请求。
+                    let mismatch = last_err.contains("55000000") || last_err.contains("mismatched");
+                    if !mismatch { break; }
+                }
             }
         }
-    }
 
-    // 带语气参数失败（音色不支持表现力版 / 标签写坏 / 参数越界）就退回最小参数再试一次：
-    // 宁可这次读得平淡，也不能整句没声音。
-    if tone.is_some() {
-        let plain = build_tts_body(&speaker, &text, language.as_deref(), None);
-        for rid in RESOURCE_IDS {
-            if let Ok(audio) = post_tts(&client, &api_key, rid, &plain).await {
-                log_verbose(&format!("[tts] 带语气参数合成失败，已退回标准参数（{rid}）：{last_err}"));
-                return Ok(audio);
+        // 带语气参数失败（音色不支持表现力版 / 标签写坏 / 参数越界）就退回最小参数再试一次：
+        // 宁可这次读得平淡，也不能整段没声音。
+        if tone.is_some() {
+            let plain = build_tts_body(&speaker, &text, language.as_deref(), None, rate);
+            for rid in RESOURCE_IDS {
+                if let Ok(audio) = post_tts(&client, &api_key, rid, &plain).await {
+                    log_verbose(&format!("[tts] 带语气参数合成失败，已退回标准参数（{rid}）：{last_err}"));
+                    return Ok(audio);
+                }
             }
         }
     }

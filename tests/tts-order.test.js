@@ -70,14 +70,19 @@ global.Blob = class {
 };
 URL.createObjectURL = (blob) => `blob:${blob.parts[0][0]}`;
 
-/** 每句的合成耗时（毫秒）与编号；慢的那句故意放最前面 */
+/**
+ * 每句的合成耗时（毫秒）与编号；慢的那句故意放最前面。
+ *
+ * 注意长度：第一段门槛低（8~48 字），会立刻单独成段；之后每段至少要 26 字才切，
+ * 所以第二句起都写成 28 字，保证"一句一段"，这个用例测的才是播放顺序而不是合并逻辑。
+ */
 const PLAN = {
-  "第一句要说得长一点，才够断句的长度。": { id: 1, ms: 60 },
-  "第二句也要说得长一点，才不会被并进上一句。": { id: 2, ms: 5 },
-  "第三句同样要足够长，才能单独成为一段。": { id: 3, ms: 5 },
-  "第四句继续说点长的话，方便验证播放顺序。": { id: 4, ms: 5 },
-  "第五句也不能太短，否则会被合并处理。": { id: 5, ms: 5, fail: true },
-  "第六句到这里差不多了，长度刚刚好够用。": { id: 6, ms: 5 },
+  "第一句要说得短一点，先出声再说。": { id: 1, ms: 60 },
+  "第二句开始就要写长了，这样才不会被并进上一句里去，对吧。": { id: 2, ms: 5 },
+  "第三句同样要写得足够长，才能单独成为一段独立的合成请求。": { id: 3, ms: 5 },
+  "第四句继续说点长的话，方便验证播放顺序到底对不对，别急。": { id: 4, ms: 5 },
+  "第五句也不能太短，否则会被合并处理掉，测试就没有意义了。": { id: 5, ms: 5, fail: true },
+  "第六句到这里差不多了，长度刚刚好够用而且不会越界，收工。": { id: 6, ms: 5 },
 };
 /** 合成"完成"的先后顺序（用来证明乱序合成这件事真的发生了） */
 const finished = [];
@@ -112,14 +117,14 @@ const order = () => playOrder.join(",");
   ttsPlayer.setConfig(true, "test-key", "test-speaker");
 
   // ---------- 场景 A：第一句合成最慢 ----------
-  ttsPlayer.pushDelta("第一句要说得长一点，才够断句的长度。");
-  ttsPlayer.pushDelta("第二句也要说得长一点，才不会被并进上一句。");
-  ttsPlayer.pushDelta("第三句同样要足够长，才能单独成为一段。");
+  ttsPlayer.pushDelta("第一句要说得短一点，先出声再说。");
+  ttsPlayer.pushDelta("第二句开始就要写长了，这样才不会被并进上一句里去，对吧。");
+  ttsPlayer.pushDelta("第三句同样要写得足够长，才能单独成为一段独立的合成请求。");
   await sleep(120); // 等三句的合成都回来（第一句最慢）
 
   check(
     "前提：合成确实是乱序完成的（后面的句子先回来）",
-    finished[0] !== "第一句要说得长一点，才够断句的长度。",
+    finished[0] !== "第一句要说得短一点，先出声再说。",
     finished.join(" → "),
   );
   check("三句都预取到了", created.length === 3, `created=${created.length}`);
@@ -142,9 +147,9 @@ const order = () => playOrder.join(",");
   // ---------- 场景 B：中间那句合成失败 ----------
   finished.length = 0;
   const warnsBefore = warnings.length;
-  ttsPlayer.pushDelta("第四句继续说点长的话，方便验证播放顺序。");
-  ttsPlayer.pushDelta("第五句也不能太短，否则会被合并处理。");
-  ttsPlayer.pushDelta("第六句到这里差不多了，长度刚刚好够用。");
+  ttsPlayer.pushDelta("第四句继续说点长的话，方便验证播放顺序到底对不对，别急。");
+  ttsPlayer.pushDelta("第五句也不能太短，否则会被合并处理掉，测试就没有意义了。");
+  ttsPlayer.pushDelta("第六句到这里差不多了，长度刚刚好够用而且不会越界，收工。");
   await sleep(120);
 
   check(

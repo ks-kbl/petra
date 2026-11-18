@@ -17,7 +17,7 @@ try {
 } finally {
   Module._load = originalLoad;
 }
-const { wrapCotTag, emotionToneInstruction } = mod;
+const { wrapCotTag, emotionToneInstruction, composeContextTexts } = mod;
 
 let n = 0;
 const ok = (name, cond, extra = "") => { n++; if (!cond) { console.error("FAIL", name, extra); process.exitCode = 1; } else console.log("PASS", name); };
@@ -31,6 +31,20 @@ ok("未知情绪回落中性", emotionToneInstruction("whatever") === emotionTon
 const short = wrapCotTag("今天也要开心哦", "happy");
 ok("短句能包成 cot 标签", short === "<cot text=开心>今天也要开心哦</cot>", String(short));
 ok("长句拒绝包装", wrapCotTag("啊".repeat(80), "happy") === null);
+
+// 跨句上下文（A 层整段合成）：前文 + 语气口令一起塞进 context_texts
+{
+  const ctx = composeContextTexts("上一句我说的是这个意思。", "用日常聊天的语气说");
+  ok("★ 上下文第一条是前一段原文", ctx[0] === "上一句我说的是这个意思。", JSON.stringify(ctx));
+  ok("★ 上下文后面跟语气口令", ctx[1] === "用日常聊天的语气说", JSON.stringify(ctx));
+  ok("没有前文时只有口令", composeContextTexts("", "用轻快的语气说").length === 1);
+  ok("没前文也没口令时为空", composeContextTexts("", "").length === 0);
+  const longPrev = "啊".repeat(200);
+  const cut = composeContextTexts(longPrev, "口令");
+  ok("★ 超长前文取尾部（保住最新内容）", cut[0].length === 80 && cut[0] === longPrev.slice(-80), String(cut[0].length));
+  ok("换行压成空格，别把换行喂给合成", composeContextTexts("第一行\n第二行", "").length === 1);
+  ok("最多 4 条", composeContextTexts("a", "b").length <= 4);
+}
 
 // 边界：刚好卡在上限内要能包，超一个字就拒绝
 const base = "<cot text=开心></cot>".length;

@@ -19,7 +19,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { loadSettings } from "../utils/settings";
 import { holdWake, releaseWake } from "../audio/wakeGate";
-import { takeSpeechSegment, flushSpeechSegment, type SpeechBoundary } from "./sentenceSplit";
+import { takeSpeechSegment, flushSpeechSegment, speechLimits, type SpeechBoundary } from "./sentenceSplit";
+import { stretchFillerInChannels, fillerStretchFor, isBareFiller } from "./prosody";
 
 interface QueueItem {
   text: string;
@@ -35,6 +36,13 @@ interface QueueItem {
   gen: number;
   /** 这段之后该停多久（秒）：按原文结尾判断，不能看补过句号的 text */
   pause: number;
+  /**
+   * 送合成时一起带上的前文（入队那一刻的快照）。
+   *
+   * 必须在入队时抓，不能等 preload 异步跑到一半再读 this.recentTexts —— 那会儿
+   * 后面几段可能已经入队了，模型看到的"上一句"会是它自己。
+   */
+  context: string[];
 }
 
 /** 句末标点：只有这些结尾才值得留一个自然停顿 */
@@ -44,22 +52,30 @@ const ELLIPSIS_RE = /(…|…{2,}|\.{2,})$/;
 /**
  * 断句后的停顿（秒）。
  *
- * 2026-11 调大过一轮：以前句末只留 70ms、逗号 15ms，本意是消除"一顿一顿"，
- * 那是旧的 `new Audio()` 队列时代（每段还带着几百毫秒解码间隙）。改成 Web Audio
- * 预排时间轴后唯一的停顿来源就是这里，70ms 听起来等于没有——用户反馈"换行和省略号
- * 不会断句、没有停顿"。现在按真实口语的换气长度给：句末 ~0.3s、换行 ~0.35s、
- * 省略号 ~0.5s、逗号 ~0.08s。
+ * 两轮调整的历史，别再来回踩：
+ * ① 旧 `new Audio()` 队列时代句末只留 70ms，但每段本身带着几百毫秒静音 padding，
+ *    听起来"一顿一顿"，于是调到 300ms/350ms/500ms；
+ * ② 2026-11 改成**整段合成**（speechLimits：首段 8~48 字、之后 26~140 字）之后，
+ *    切成几段的次数大幅减少，段内的换气由模型自己给：此时 300ms 反而变成新的机械感，
+ *    所以整体收窄到 句末 220ms / 换行 260ms / 段落 450ms / 省略号 400ms / 逗号 50ms。
+ * 判据只有一条：段与段之间听起来像"一口气说完中间换了个气"，而不是"停顿了"。
  */
-const PAUSE_SENTENCE = 0.3;
-const PAUSE_ELLIPSIS = 0.5;
-const PAUSE_NEWLINE = 0.35;
-const PAUSE_SOFT = 0.08;
-const PAUSE_HARD = 0.16;
+const PAUSE_SENTENCE = 0.22;
+const PAUSE_ELLIPSIS = 0.4;
+const PAUSE_NEWLINE = 0.26;
+const PAUSE_PARAGRAPH = 0.45;
+const PAUSE_SOFT = 0.05;
+const PAUSE_HARD = 0.12;
 /** 调度时留一点提前量，避免 `currentTime` 已经越过开始时间 */
 const SCHEDULE_LEAD = 0.035;
-/** 裁剪静音时首尾各保留的余量（秒） */
-const TRIM_HEAD_PAD = 0.015;
-const TRIM_TAIL_PAD = 0.025;
+/**
+ * 裁剪静音时首尾各保留的余量（秒）。
+ *
+ * 2026-11 加大过：原来头 15ms / 尾 25ms 太狠，把模型的起音换气和句尾余韵一起削掉了，
+ * 每段听起来都从「干净的原点」开始——这也是朗读感的来源之一。现在留够气口。
+ */
+const TRIM_HEAD_PAD = 0.025;
+const TRIM_TAIL_PAD = 0.06;
 
 /**
  * 找出音频里「真正有声音」的区间（纯函数，方便单测）。
@@ -81,7 +97,8 @@ export function findSpeechBounds(
     }
   }
   if (peak <= 0) return { offset: 0, duration: total / sampleRate };
-  const threshold = Math.max(0.002, Math.min(0.01, peak * 0.015));
+  // 阈值放低（0.015 → 0.008）：换气/气声的能量常常只有峰值的 1%，按 1.5% 判会整段裁掉
+  const threshold = Math.max(0.002, Math.min(0.01, peak * 0.008));
   const loudAt = (i: number) => {
     for (const ch of channels) {
       if (Math.abs(ch[i]) >= threshold) return true;
@@ -126,6 +143,7 @@ export function pauseForBoundary(boundary: string): number {
     case "sentence": return PAUSE_SENTENCE;
     case "ellipsis": return PAUSE_ELLIPSIS;
     case "newline": return PAUSE_NEWLINE;
+    case "paragraph": return PAUSE_PARAGRAPH;
     case "soft": return PAUSE_SOFT;
     default: return PAUSE_HARD;
   }
@@ -180,6 +198,64 @@ export function wrapCotTag(text: string, emotion: string, maxChars = 60): string
   return wrapped.length <= maxChars ? wrapped : null;
 }
 
+/**
+ * 清理要送去合成的文本（纯函数，可单测）。
+ *
+ * 括号旁白、Markdown 符号、代码块、URL 这些念出来都是噪音；换行在"整段合成"里
+ * 会变成逗号（段落内部的一次换气），但不能因此拼出「。，」这种双标点。
+ */
+export function sanitizeSpeechText(text: string): string {
+  return text
+    // 代码块整段不读：念出来全是符号和变量名，气泡里看着是代码，耳朵里是乱码。
+    // **必须排在剥 Markdown 符号之前**：` 会先被当符号删掉，围栏就再也匹配不上了
+    // （这就是"代码被逐字念出来"的根因）。占位词不用括号，否则下面那步会把它删掉。
+    .replace(/```[\s\S]*?```/g, "这段是代码")
+    .replace(/`([^`]+)`/g, "$1")
+    // 括号里的动作/旁白不读（"（笑）""(小声)"），否则会念出来很出戏
+    .replace(/[（(][^）)]*[）)]/g, "")
+    .replace(/[*_`#~|]/g, "")
+    // 分隔线/引用符号不读：否则 TTS 会把 "---" 念成"减号减号减号"
+    .replace(/^\s*[-=]{3,}\s*$/gm, "")
+    .replace(/^\s*>+\s?/gm, "")
+    // Markdown 列表符号/序号不读："- 第一点" → "第一点"
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*\d+[.)、]\s*/gm, "")
+    .replace(/\n---\n[\s\S]*$/, "")
+    // 语音标签：正常情况由服务端解析掉；万一这次请求退回了标准参数，
+    // 标签会被**原样念出来**（"cot text 开心"），所以这里再兜一层
+    .replace(/<\/?cot[^>]*>/gi, "")
+    // 链接只读文字，不念 URL
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, "（链接）")
+    // 表格竖线/分隔行不读
+    .replace(/^\s*\|?[\s:|-]{4,}\|?\s*$/gm, "")
+    .replace(/\|/g, " ")
+    // 段内残留的换行换成逗号：合成引擎按标点换气，直接压成空格就没有停顿了
+    // （短行会被"攒够长度再送"合并成一段，合并后行与行之间的换行就落在这里）
+    .replace(/\s*[\r\n]+\s*/g, "，")
+    // 换行紧跟在上一个标点后面时会拼出「。，」「？，」这种双标点：
+    // 合成引擎会当成两个停顿，读出来是一声多余的空拍，所以把它抹平。
+    .replace(/([。！？…，、；：,;:])\s*[，,]\s*/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * 拼 context_texts（纯函数，可单测）。
+ *
+ * 官方把这个字段当「对话上下文」用：给前一段原文，模型才能接住上一句的语速、
+ * 音高和情绪，不至于每段都从零起调——这正是"像朗读"的另一半原因。
+ * 前文**取尾部**而不是开头：真正决定接续的是紧挨着的那几句。
+ */
+export function composeContextTexts(previous: string, instruction: string, maxPrev = 80): string[] {
+  const out: string[] = [];
+  const prev = (previous || "").replace(/\s+/g, " ").trim();
+  if (prev) out.push(prev.length > maxPrev ? prev.slice(-maxPrev) : prev);
+  const ins = (instruction || "").trim();
+  if (ins) out.push(ins);
+  return out.slice(0, 4);
+}
+
 /** 情绪 → 中文语气口令（导出给单测与调试用） */
 export function emotionToneInstruction(emotion: string): string {
   return EMOTION_TONE[emotion] ?? EMOTION_TONE.neutral;
@@ -188,7 +264,13 @@ export function emotionToneInstruction(emotion: string): string {
 /** 火山一次请求里的语气参数（与 Rust 侧 TtsTone 同构，camelCase） */
 interface TtsTonePayload {
   model?: string;
+  /** 兼容旧字段：单条语气口令 */
   contextText?: string;
+  /**
+   * 对话上下文（官方 context_texts）：按顺序塞「上一段原文 + 语气口令」。
+   * 上一段原文让模型接得住前一句的语速和情绪，不用每段重新起调。
+   */
+  contextTexts?: string[];
   useTagParser?: boolean;
   speechRate?: number;
   pitch?: number;
@@ -214,6 +296,12 @@ class TTSPlayer {
   private emotionTag = "neutral";
   /** 多轮上下文 id：同一段回复共用，让几句之间的语气连贯 */
   private sectionId = "";
+  /** 这条回复已经送出去几段：决定下一段攒多长（见 speechLimits） */
+  private spokenSegments = 0;
+  /** 最近送合成的原文（最多两条）：作为 context_texts 喂给下一段，保住跨句语调 */
+  private recentTexts: string[] = [];
+  /** 被单独切出来、但还没找到"下一句"可拼的语气词（如「嗯……」） */
+  private pendingPrefix = "";
   muted = false;
 
   /** 兜底播放时正在响的元素（Web Audio 路径用不到） */
@@ -321,11 +409,22 @@ class TTSPlayer {
       this.buffer = this.buffer.split("\n---")[0];
       this.stopped = true;
     }
-    // 攒够一句再送：短句会合并，不会出现"好。/对。"各自合成一次的碎片感
+    // 攒够一段再送。门槛是**前紧后松**的：
+    //   第一段小（8~48 字，先出声再说），之后每段 26~140 字（把两三句合成一次）。
+    // 为什么必须变长：每句单独合成 = 每句重新起调、句间没有连读，这正是"像朗读"的根因。
+    // 单换行也不再断句（softNewline），只有空行（段落）才真的切。
     let seg: { segment: string; rest: string; boundary: SpeechBoundary } | null = null;
-    while ((seg = takeSpeechSegment(this.buffer))) {
+    while ((seg = takeSpeechSegment(this.buffer, speechLimits(this.spokenSegments)))) {
       this.buffer = seg.rest;
-      this.enqueue(seg.segment, seg.boundary);
+      // 单独一声「嗯……」先收着，等后面那句一起送：两次独立起调会变成两声"嗯"。
+      // 注意是"收着继续等"，不是"原地不动"——原地不动会让整条回复等到流结束才开口。
+      if (isBareFiller(seg.segment) && seg.rest.trim()) {
+        this.pendingPrefix += seg.segment;
+        break;
+      }
+      const text = this.pendingPrefix ? this.pendingPrefix + seg.segment : seg.segment;
+      this.pendingPrefix = "";
+      this.enqueue(text, seg.boundary);
     }
   }
 
@@ -333,8 +432,10 @@ class TTSPlayer {
     if (!this.enabled) return;
     if (!this.stopped) {
       const rest = flushSpeechSegment(this.buffer);
-      if (rest) this.enqueue(rest);
+      const tail = this.pendingPrefix ? this.pendingPrefix + rest : rest;
+      if (tail) this.enqueue(tail);
     }
+    this.pendingPrefix = "";
     this.buffer = "";
     this.stopped = false;
   }
@@ -344,6 +445,9 @@ class TTSPlayer {
     // 新一段回复 = 新的语气上下文，section_id 重新生成
     this.sectionId = "";
     this.emotionTag = "neutral";
+    this.spokenSegments = 0;
+    this.recentTexts = [];
+    this.pendingPrefix = "";
     this.queue = [];
     this.buffer = "";
     this.speaking = false;
@@ -368,38 +472,16 @@ class TTSPlayer {
   private enqueue(text: string, boundary?: SpeechBoundary) {
     const original = text.trim();
     // 有切分理由就按理由给停顿，没有（收尾的最后一小段）才回头按标点猜
-    const pause = boundary ? pauseForBoundary(boundary) : pauseAfterSegment(original);
-    let clean = text
-      // 括号里的动作/旁白不读（"（笑）""(小声)"），否则会念出来很出戏
-      .replace(/[（(][^）)]*[）)]/g, "")
-      .replace(/[*_`#~|]/g, "")
-      // 分隔线/引用符号不读：否则 TTS 会把 "---" 念成"减号减号减号"
-      .replace(/^\s*[-=]{3,}\s*$/gm, "")
-      .replace(/^\s*>+\s?/gm, "")
-      // Markdown 列表符号/序号不读："- 第一点" → "第一点"
-      .replace(/^\s*[-*+]\s+/gm, "")
-      .replace(/^\s*\d+[.)、]\s*/gm, "")
-      .replace(/\n---\n[\s\S]*$/, "")
-      // 语音标签：正常情况由服务端解析掉；万一这次请求退回了标准参数，
-      // 标签会被**原样念出来**（"cot text 开心"），所以这里再兜一层
-      .replace(/<\/?cot[^>]*>/gi, "")
-      // 代码块整段不读：念出来全是符号和变量名，气泡里看着是代码，耳朵里是乱码
-      .replace(/```[\s\S]*?```/g, "（这段是代码）")
-      .replace(/`([^`]+)`/g, "$1")
-      // 链接只读文字，不念 URL
-      .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-      .replace(/https?:\/\/\S+/g, "（链接）")
-      // 表格竖线/分隔行不读
-      .replace(/^\s*\|?[\s:|-]{4,}\|?\s*$/gm, "")
-      .replace(/\|/g, " ")
-      // 段内残留的换行换成逗号：合成引擎按标点换气，直接压成空格就没有停顿了
-      // （短行会被"攒够长度再送"合并成一段，合并后行与行之间的换行就落在这里）
-      .replace(/\s*[\r\n]+\s*/g, "，")
-      .replace(/\s+/g, " ")
-      .trim();
+    let pause = boundary ? pauseForBoundary(boundary) : pauseAfterSegment(original);
+    let clean = sanitizeSpeechText(text);
     // 补一个句末标点：没有收尾标点时 TTS 的语调会"悬着"，听起来就是断在半句上
     if (clean && !/[。！？!?…]$/.test(clean)) clean += "。";
     if (!clean || clean.length < 2) return;
+    // 「嗯……」被单独拆成一段时，拖音本身已经把时间占住了，再按省略号给 0.4 秒停顿
+    // 就成了"嗯——……"，所以这里把停顿收掉，只留一点点换气。
+    if (clean.length <= 6 && fillerStretchFor(clean)?.kind === "think") {
+      pause = Math.min(pause, 0.12);
+    }
     const item: QueueItem = {
       text: clean,
       bytes: null,
@@ -409,7 +491,12 @@ class TTSPlayer {
       decoded: null,
       gen: this.generation,
       pause,
+      // 前两段的原文作为语气上下文（不含自己）
+      context: this.recentTexts.slice(-2),
     };
+    this.spokenSegments++;
+    this.recentTexts.push(clean);
+    if (this.recentTexts.length > 4) this.recentTexts.shift();
     this.queue.push(item);
     this.preload(item);
     this.pump();
@@ -445,7 +532,7 @@ class TTSPlayer {
    * 由情绪决定语气口令、语速音调偏移；句子够短就用逐句语音标签（更精确），
    * 太长就退回自然语言口令。用户不需要也不应该去调这些细节。
    */
-  private buildTone(text: string): { text: string; tone?: TtsTonePayload } {
+  private buildTone(text: string, context: string[] = []): { text: string; tone?: TtsTonePayload } {
     const t = loadSettings().tts;
     if (!t.enhanced) return { text };
     const emo = EMOTION_TONE[this.emotionTag] ? this.emotionTag : "neutral";
@@ -459,16 +546,20 @@ class TTSPlayer {
     }
     base.sectionId = this.sectionId;
 
+    // 语气上下文按官方 context_texts 的用法给：先放前一段原文（让模型接住上文语速与情绪），
+    // 再放这一段的语气口令。最多三条，太长反而稀释指令。
+    base.contextTexts = composeContextTexts(context.join(""), emotionToneInstruction(emo));
+
     // 句子够短就逐句打标签（更贴合这一句的情绪），否则用整段口令
     const wrapped = wrapCotTag(text, emo, COT_MAX_CHARS);
     if (wrapped) return { text: wrapped, tone: { ...base, useTagParser: true } };
-    return { text, tone: { ...base, contextText: emotionToneInstruction(emo) } };
+    return { text, tone: base };
   }
 
   private async preload(item: QueueItem) {
     const gen = item.gen;
     try {
-      const { text: speakText, tone } = this.buildTone(item.text);
+      const { text: speakText, tone } = this.buildTone(item.text, item.context);
       // 排障用：把真正送进合成的文本打出来（下次"念出奇怪东西"能直接看到原文）
       if (typeof location !== "undefined" && (location.hostname === "127.0.0.1" || location.hostname === "localhost")) {
         console.debug("[TTS] 送合成：", speakText, tone ?? "(无语气参数)");
@@ -499,6 +590,8 @@ class TTSPlayer {
           for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
           const bounds = findSpeechBounds(channels, buffer.sampleRate);
           item.decoded = { buffer, offset: bounds.offset, duration: bounds.duration };
+          // 段首是「嗯……/哦，」这种语气词时，把那一小段音频拉长（不改音高）
+          this.applyFillerStretch(item);
         } catch (e) {
           if (gen !== this.generation) return;
           // 不懂这个格式/解码失败：这个端点后续都走兜底，别再每句都白试一次
@@ -506,7 +599,12 @@ class TTSPlayer {
           this.decodeBroken = true;
         }
       }
-      if (!item.decoded) item.audio = new Audio(item.blobUrl);
+      if (!item.decoded) {
+        // 走到这里说明这条走 HTMLAudioElement 兜底：那条路没有解码后的样本，
+        // 也就没有任何语气处理（拖音/哼都听不到）——"改了没感觉"的常见原因。
+        this.prosodyLog(`fallback(legacy) text=${item.text.slice(0, 12)}`);
+        item.audio = new Audio(item.blobUrl);
+      }
       item.ready = true;
       // 即使当前已经在播，也要再 pump 一次：Web Audio 路径要把后面这句**提前排进时间轴**，
       // 等前一句播完才排的话，两段之间会多出一次 onended→start 的空隙（又变回一顿一顿）。
@@ -519,6 +617,70 @@ class TTSPlayer {
       // 后面已经合成好的句子永远不播，整段回复静音。
       item.ready = true;
       this.pump();
+    }
+  }
+
+  /**
+   * 语气处理的诊断日志。
+   *
+   * 默认只在 localhost（dev）打，正式包里不吵；排查"改了没感觉"时打开控制台
+   * 就能看到每一段到底走了哪条路：解码成功没有、有没有命中语气词、拉长了多少。
+   */
+  private prosodyLog(msg: string) {
+    try {
+      if (typeof location !== "undefined" && (location.hostname === "127.0.0.1" || location.hostname === "localhost")) {
+        console.debug("[TTS][prosody]", msg);
+      }
+      // 桌宠窗口是透明无边框的小窗，devtools 没有快捷键可开，所以同时写进 pet.log：
+      // 用户只要打开 <仓库>/logs/pet.log 搜 [prosody] 就能看到每段到底走了哪条路。
+      // 该命令只在 debug 构建存在，发布版会直接 reject，忽略即可。
+      void invoke("debug_log_warn", { msg: `[prosody] ${msg}` }).catch(() => {});
+    } catch { /* 忽略 */ }
+  }
+
+  /**
+   * 手动试音（dev 用）：`ttsPlayer.speakTest("嗯……我想想。")`。
+   *
+   * 不经过模型，直接把这句话走完整条链路（合成 → 解码 → 语气处理 → 播放），
+   * 用来把"模型没说语气词"和"处理没生效"这两种情况区分开。
+   */
+  speakTest(text: string) {
+    this.stop();
+    this.pushDelta(text);
+    this.flush();
+  }
+
+  /**
+   * 语气词拖音：只在段首命中，且只动那一小段音频。
+   *
+   * 定位靠能量 VAD 而不是强制对齐：语气词永远在段首、后面必然跟一个停顿，
+   * 用「第一段连续发声」就能框住，成本低、不会错到别的字上去。
+   * 框出来的区间过长（>0.7s）说明这一句开头压根没有语气词停顿，宁可不拉。
+   */
+  private applyFillerStretch(item: QueueItem) {
+    const d = item.decoded;
+    const ctx = this.ctx;
+    const head = item.text.slice(0, 12);
+    if (!d || !ctx) { this.prosodyLog(`skip(no-audio) text=${head}`); return; }
+    const sr = d.buffer.sampleRate;
+    const chans: Float32Array[] = [];
+    for (let c = 0; c < d.buffer.numberOfChannels; c++) chans.push(d.buffer.getChannelData(c));
+    if (!chans.length) { this.prosodyLog(`skip(no-channel) text=${head}`); return; }
+    try {
+      const before = chans[0].length / sr;
+      const res = stretchFillerInChannels(chans, sr, item.text, Math.round(d.offset * sr));
+      if (!res.stretched) {
+        this.prosodyLog(`skip(no-match) text=${head}`);
+        return;
+      }
+      const after = res.channels[0].length / sr;
+      this.prosodyLog(`applied mode=${res.mode} factor=${res.factor} ${before.toFixed(2)}s→${after.toFixed(2)}s text=${head}`);
+      const buf = ctx.createBuffer(res.channels.length, res.channels[0].length, sr);
+      res.channels.forEach((ch, i) => buf.getChannelData(i).set(ch));
+      item.decoded = { buffer: buf, offset: 0, duration: buf.length / sr };
+    } catch (e) {
+      // 拉伸失败就当没这回事：正常念出来也比整句没声音强
+      console.warn("[TTS] prosody stretch failed:", e);
     }
   }
 
@@ -554,8 +716,8 @@ class TTSPlayer {
       const src = ctx.createBufferSource();
       src.buffer = next.decoded.buffer;
       const gen = next.gen;
-      const fadeIn = 0.006;
-      const fadeOut = 0.012;
+      const fadeIn = 0.005;
+      const fadeOut = 0.008;
       const dur = next.decoded.duration;
       const local = ctx.createGain();
       const start = Math.max(ctx.currentTime + SCHEDULE_LEAD, this.nextStartAt);

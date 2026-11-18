@@ -65,6 +65,34 @@ check("太短的换行行不切", sp.takeSpeechSegment("好\n") === null);
   check("流到一半的省略号先不切（等第二个 …）", sp.takeSpeechSegment("我在想要不要现在说这件事…") === null);
 }
 
+// ---------- 合成粒度：首段短、之后长（A 层「整段合成」） ----------
+{
+  const first = sp.speechLimits(0);
+  check("★ 首段门槛小（先出声）", first.minChars === 8 && first.maxChars === 48, JSON.stringify(first));
+  check("★ 首段也走单换行不断句", first.softNewline === true);
+  const steady = sp.speechLimits(1);
+  check("★ 之后的段要攒够 26 字才切", steady.minChars === 26, JSON.stringify(steady));
+  check("★ 之后的段上限 140 字", steady.maxChars === 140);
+
+  // 短句在「整段」模式下会被合并成一次合成，而不是各自起调
+  const multi = "好呀。那我先去看看怎么回事。要不要一起走，路上说也行，反正也不赶时间。";
+  const merged2 = sp.takeSpeechSegment(multi, sp.speechLimits(1));
+  check("★ 两三句合并成一段送合成", !!merged2 && merged2.segment.includes("好呀。") && merged2.segment.includes("一起走"),
+    JSON.stringify(merged2?.segment));
+
+  // 单换行（模型一行一句的回复）不再断句，空行才断
+  // 单换行在整段模式下被当作「句中停顿」，两行会一起送进同一次合成
+  // （切点在句末的「。」上，而不是切在换行处）
+  const nl = "第一行内容足够长了吧\n第二行也足够长了呀，再补一点凑够长度。";
+  const nlSeg = sp.takeSpeechSegment(nl, sp.speechLimits(1));
+  check("★ 单换行不在换行处切", !!nlSeg && nlSeg.boundary !== "newline", JSON.stringify(nlSeg?.boundary));
+  check("★ 两行合并进同一段", !!nlSeg && nlSeg.segment.includes("第一行") && nlSeg.segment.includes("第二行"),
+    JSON.stringify(nlSeg?.segment));
+  const para = sp.takeSpeechSegment("第一段说完了。\n\n第二段接着说，这里应该是一个新的段落。", sp.speechLimits(1));
+  check("★ 空行按段落切开", !!para && para.boundary === "paragraph", JSON.stringify(para));
+  check("段落切分去掉多余换行", !!para && !para.rest.startsWith("\n"), JSON.stringify(para?.rest));
+}
+
 // ---------- 英文/日文句号 ----------
 {
   const en = sp.takeSpeechSegment("This sentence is long enough. And here is another one.");
