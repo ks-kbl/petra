@@ -22,6 +22,7 @@ import {
 import { applyAffect, decay, defaultFavor, favorLine, toneLine, type Favor } from "./favor";
 import { detectTraits, type RoutineTrait } from "./personaRoutine";
 import { addressLine, addressTier, deriveAddressForms, type AddressForms } from "./address";
+import { depthFor, depthLine, sharpnessLine } from "./depth";
 import { deriveExpressionStyle, styleLine, type ExpressionStyle } from "./expressionStyle";
 import { refusalBudget, refusalLine, refusalTendency, shouldRefuse, REFUSAL_DAILY_MAX } from "./refusal";
 
@@ -292,7 +293,7 @@ export function plan(now = Date.now()): PlanItem[] {
  * 给模型看的「生活上下文」：状态 + 在做什么 + 纪念日 + 话头 + 口头禅。
  * 全部为空时返回空串（调用方据此不加任何东西）。
  */
-export function promptBlock(now = Date.now()): string {
+export function promptBlock(now = Date.now(), userText = ""): string {
   const d = load(now);
   const parts: string[] = [];
   const life = lifeLine({ ...d.state, sleep: stageFor(now) }, now);
@@ -307,6 +308,10 @@ export function promptBlock(now = Date.now()): string {
   if (tone) parts.push(`【语气】${tone}`);
   const fav = favorLine(d.favor);
   if (fav) parts.push(`【关系】${fav}`);
+  // 深度：按"这一轮该说多透"给，生气时一律短而准
+  parts.push(`【说话的深浅】${depthLine(depthFor({ text: userText, mood: moodValue }))}`);
+  const sharp = sharpnessLine(moodValue);
+  if (sharp) parts.push(`【锋锐度】${sharp}`);
   const p = planForPrompt(plan(now), now);
   if (p) parts.push(`【你今天在做的事】\n${p}`);
   const ann = upcomingAnniversaries(d.firstMetAt, now, 7);

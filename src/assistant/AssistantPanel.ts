@@ -2289,7 +2289,7 @@ async function send(text: string) {
       if (budget.rounds > 1) setBubbleText(loading, "");
       // token 优化：记忆按场景/话题召回（≤6 条），而非全量注入 system prompt
       // 生活上下文（状态/情绪/关系/在做的事）：只在有内容时拼，避免每条请求都变长
-      const lifeCtx = lifeRuntime.promptBlock(Date.now());
+      const lifeCtx = lifeRuntime.promptBlock(Date.now(), text);
       const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
       const personaWithLang = s.assistant.persona;

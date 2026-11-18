@@ -17,6 +17,7 @@ const persona = require("./build/assistant/personaRoutine.js");
 const addr = require("./build/assistant/address.js");
 const style = require("./build/assistant/expressionStyle.js");
 const refusal = require("./build/assistant/refusal.js");
+const depth = require("./build/assistant/depth.js");
 
 let fail = 0;
 const check = (name, cond, extra = "") => {
@@ -276,6 +277,23 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("★ 表达型影响闹脾气概率", refusal.refusalProbability(-0.8, refusal.refusalTendency("sarcastic"))
     > refusal.refusalProbability(-0.8, refusal.refusalTendency("pretend")));
   check("概率有上限（不会每次都拒）", refusal.refusalProbability(-1, 1.5) <= 0.5);
+}
+
+// ---------- 深浅与锋锐 ----------
+{
+  check("★ 问「为什么」→ 深聊档", depth.depthFor({ text: "为什么这个报错一直出现", mood: 0.1 }) === "deep");
+  check("★ 求方案 → 深聊档", depth.depthFor({ text: "帮我分析下这几个方案的区别", mood: 0.1 }) === "deep");
+  check("★ 打招呼 → 简答档", depth.depthFor({ text: "在吗", mood: 0.1 }) === "brief");
+  check("★ 普通闲聊 → 正常档", depth.depthFor({ text: "今天下午有点困", mood: 0.1 }) === "normal");
+  check("★ 气头上不给长篇大论", depth.depthFor({ text: "为什么这个报错一直出现", mood: -0.8 }) === "brief");
+  check("深聊档的要求里强调「给判断」", /判断/.test(depth.depthLine("deep")));
+  check("简答档明确要求别铺垫", /别铺垫/.test(depth.depthLine("brief")));
+
+  const sharp = depth.sharpnessLine(-0.8);
+  check("★ 生气时给锋锐技法", /复述|点破|冷静/.test(sharp), sharp);
+  check("★ 明确禁止脏字和人身攻击", /不许带脏字/.test(sharp) && /人身攻击/.test(sharp));
+  check("不生气时不给锋锐提示", depth.sharpnessLine(-0.1) === "");
+  check("★ 反敷衍规则覆盖空话与判断", /确实/.test(depth.ANTI_FLUFF_RULES) && /判断/.test(depth.ANTI_FLUFF_RULES));
 }
 
 console.log(`life: fail=${fail}`);
