@@ -45,7 +45,7 @@ const DIARY_KEY = "petra-diaries";
 let fail = 0;
 const check = (name, cond, extra = "") => {
   if (!cond) fail++;
-  console.log((cond ? "PASS " : "FAIL ") + name + (extra ? "  " + extra : ""));
+console.log((cond ? "PASS " : "FAIL ") + name + (extra ? "  " + extra : ""));
 };
 const dstr = (offsetDays) => {
   const d = new Date();
@@ -187,6 +187,33 @@ const evt = () => JSON.stringify([{ type: "chat", summary: "聊了天", timestam
   check("降级丢掉事件快照", !stored[0].events || stored[0].events.length === 0);
   check("告警只报一次", dm.takeDiaryStorageWarning() === null);
 
-  console.log("diary: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);
+    // ===== 日记要"记真的"：结构、锚点、禁编、素材少就写短 =====
+{
+  const prompt = dg.buildDiaryPrompt({
+    date: "2026-11-18", persona: "傲娇女仆", nickname: "老大",
+    events: [{ type: "chat", summary: "他说今天不想加班", timestamp: Date.now() }],
+    apps: [{ app: "VS Code", minutes: 120 }],
+    tracks: [],
+    previousTail: "",
+    quotes: ["他说今天不想加班", "这个报错又来了"],
+    recent: [{ date: "2026-11-17", summary: "一起修好了语音" }],
+  });
+  check("★ 要求分两段：真实事件 + 自己的想法", prompt.includes("真实发生了什么") && prompt.includes("我自己的想法"));
+  check("★ 明确禁止编造", prompt.includes("不许编"));
+  check("★ 要求至少一处具体锚点", prompt.includes("具体锚点"));
+  check("★ 用户原话被喂进提示词", prompt.includes("他说今天不想加班"));
+  check("★ 最近写过的话题会被提醒别重复", prompt.includes("别重复"));
+  check("素材丰富时给长一点的篇幅", prompt.includes("200~350"));
+}
+
+{
+  const thin = dg.buildDiaryPrompt({
+    date: "2026-11-18", events: [], apps: [], tracks: [], quotes: [], recent: [],
+  });
+  check("★ 没什么素材时允许写短（不许硬凑）", thin.includes("80~150"), thin.slice(0, 60));
+  check("素材少也仍然禁止编造", thin.includes("不许编"));
+}
+
+console.log("diary: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);
   process.exit(fail ? 1 : 0);
 })();

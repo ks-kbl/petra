@@ -17,6 +17,10 @@ export interface DigestInput {
   apps?: AppUsage[];
   tracks?: MusicTrack[];
   previousTail?: string;
+  /** 当天用户的几句原话（用来让日记"有出处"，而不是编） */
+  quotes?: string[];
+  /** 最近几篇日记的一句话摘要，避免每天重复同一个话题 */
+  recent?: { date: string; summary: string }[];
 }
 
 /** 事件正文的字符预算（按整行截断，不会切一半） */
@@ -135,25 +139,43 @@ export function buildDiaryPrompt(input: DigestInput): string {
   const digest = buildEventDigest(input.events ?? []);
   const timeline = buildTimeline(input);
   const droppedNote = digest.dropped > 0 ? `\n（另有 ${digest.dropped} 条零碎记录没有列出）` : "";
+  const quotes = (input.quotes ?? []).map(q => q.trim()).filter(Boolean).slice(0, 3);
+  // 素材很少的日子（没聊几句、没干什么）就别硬凑：硬凑出来的一定是编的
+  const thin = !timeline && !digest.text && quotes.length === 0;
 
   const sections: string[] = [];
-  sections.push(`请写一篇 ${dateLabel(date)}（${weekdayLabel(date)}）的日记，150~300 字。`);
+  sections.push(
+    thin
+      ? `请写一篇 ${dateLabel(date)}（${weekdayLabel(date)}）的短日记，80~150 字。`
+      : `请写一篇 ${dateLabel(date)}（${weekdayLabel(date)}）的日记，200~350 字。`,
+  );
   if (input.persona) sections.push(`人设风格：${input.persona}`);
   if (input.nickname) sections.push(`你对用户的称呼：${input.nickname}`);
 
   if (timeline) sections.push(`【今天的时间线】\n${timeline}`);
   if (digest.text) sections.push(`【我们聊过的事】\n${digest.text}${droppedNote}`);
+  if (quotes.length) {
+    sections.push(`【主人今天说过的原话】\n${quotes.map((q, i) => `${i + 1}. 「${q}」`).join("\n")}`);
+  }
+  if (input.recent?.length) {
+    sections.push(`【最近几天写过什么（别重复这些话题）】\n${input.recent.map(r => `- ${r.date}：${r.summary}`).join("\n")}`);
+  }
   if (input.previousTail) {
     sections.push(`【上一篇日记的结尾（可以自然衔接，但不要重复它的内容）】\n…${input.previousTail}`);
   }
 
   sections.push(
     [
-      "【写法要求】",
-      "1. 先在心里把上面的线索过一遍：主人今天是什么节奏？（忙还是闲、专注还是分心、早睡还是熬夜）哪件事最值得记下来？",
-      "2. 再动笔写正文：第一人称、口语化，像在跟主人说悄悄话。",
-      "3. 写具体的观察（例如\"你在编辑器里泡了一下午\"），可以有一点点推测、关心或吐槽，但不要编造没有发生的事。",
-      "4. 不要罗列清单、不要用标题、不要提\"数据/记录/统计/系统\"这类词，也不要调用任何工具；只输出日记正文。",
+      "【结构】动笔前先在心里把上面的线索过一遍：今天最值得记的是哪件事、我当时的感受是什么。然后分两段写，不要小标题：",
+      "第一段写「今天真实发生了什么」——挑一两件具体的事，写清是什么时候、跟什么有关。",
+      "第二段写「我自己的想法和感受」——你怎么看他这一天的状态，你当时是什么心情，有什么想说的或想不通的。",
+      "",
+      "【硬规则】",
+      "1. 上面素材里没有的事，一个字都不许编。特别是不许编「他说了……」这种没出现过的对话。",
+      "2. 第一段至少有一处具体锚点：一个时间、一个软件名、一句他的原话，或者一件明确发生的事。",
+      "3. 可以推测他的状态和心情，但要用「感觉/好像/大概」这类词，别当成事实陈述。",
+      "4. 素材很少就写短一点，写「今天很安静，他好像很忙」也完全可以，别为了凑字数瞎编。",
+      "5. 不要罗列清单、不要用标题、不要提「数据/记录/统计/系统」这类词，也不要调用任何工具；只输出日记正文。",
     ].join("\n"),
   );
 

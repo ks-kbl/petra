@@ -1,6 +1,7 @@
 import { lifeRuntime } from "./lifeRuntime";
 import { filterMentionable } from "./mentionScore";
 import { voiceCapabilityLine } from "./voiceTone";
+import { recentDiaryBrief } from "../features/diary/DiaryManager";
 import { buildQueryVariants, hitRelevance, RELEVANCE_FLOOR } from "./searchQuery";
 import { invoke } from "@tauri-apps/api/core";
 import { readingHoldMs } from "../ui/bubbleTiming";
@@ -2297,7 +2298,12 @@ async function send(text: string) {
         enabled: Boolean(s.tts.enabled),
         hasVoice: Boolean(s.tts.speakerId),
       });
-      const lifeCtx = [lifeRuntime.promptBlock(Date.now(), text), voiceCtx].filter(Boolean).join("\n\n");
+      const diaryBrief = recentDiaryBrief(3);
+      const lifeCtx = [
+        lifeRuntime.promptBlock(Date.now(), text),
+        voiceCtx,
+        diaryBrief ? `【你最近写过的日记（只有主题，要全文就用 view_diary）】\n${diaryBrief}` : "",
+      ].filter(Boolean).join("\n\n");
       const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
       const personaWithLang = s.assistant.persona;
