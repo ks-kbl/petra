@@ -126,7 +126,7 @@ import { ACTIVITY_LABEL, nextActivity, type ActivityLevel } from "./utils/settin
 import { astrobotOn } from "./bridges/astrobot";
 import { openAssistant, repositionAssistantBubbles, showWakeBubble } from "./assistant/AssistantPanel";
 import { pluginRuntime, configurePluginHost } from "./plugins/runtime";
-import { setLifecycle, triggerProactive, closeAssistant, clearBubbles, clearApiKeyCache, clearImageKeyCache, clearHistory, isAssistantBusy, sayPetLine, setModelRectProvider, fitBubbleHeights, rearmIdleTimer } from "./assistant/AssistantPanel";
+import { absorbDiaryFacts, setLifecycle, triggerProactive, closeAssistant, clearBubbles, clearApiKeyCache, clearImageKeyCache, clearHistory, isAssistantBusy, sayPetLine, setModelRectProvider, fitBubbleHeights, rearmIdleTimer } from "./assistant/AssistantPanel";
 import { getSpeechRecognizer } from "./asr/SpeechRecognizer";
 import { repositionLyricBubble } from "./music/LyricBubble";
 import {
@@ -2002,6 +2002,10 @@ async function boot() {
       else if (list.length > 1) toast(`📖 补写了 ${list.length} 篇日记~`);
       const warn = takeDiaryStorageWarning();
       if (warn) toast(warn, "warn");
+      // 日记里明确发生的事进记忆库，聊天时才想得起来
+      if (list.length) {
+        try { absorbDiaryFacts(list); } catch (e) { console.warn("[日记] 提炼记忆失败", e); }
+      }
     }).catch(() => {});
     // 跨天自动补写：整天开着应用跨过午夜，日期变化后自动为刚结束的那天写日记
     const pad2 = (n: number) => String(n).padStart(2, "0");
@@ -2016,6 +2020,9 @@ async function boot() {
       lastDay = cur;
       checkAndGenerateDiary().then(list => {
         if (list.length > 0) toast(`📖 昨天的日记写好啦~`);
+        if (list.length) {
+          try { absorbDiaryFacts(list); } catch (e) { console.warn("[日记] 提炼记忆失败", e); }
+        }
       }).catch(() => {});
     }, 60 * 1000);
   }

@@ -1,7 +1,9 @@
 import { lifeRuntime } from "./lifeRuntime";
 import { filterMentionable } from "./mentionScore";
 import { voiceCapabilityLine } from "./voiceTone";
-import { recentDiaryBrief } from "../features/diary/DiaryManager";
+import { recentDiaryBrief, weeklyDiaryMood } from "../features/diary/DiaryManager";
+import { extractDiaryFacts, memoryLineFor } from "./diaryMemory";
+import { textSimilarity } from "./memoryOps";
 import { buildQueryVariants, hitRelevance, RELEVANCE_FLOOR } from "./searchQuery";
 import { invoke } from "@tauri-apps/api/core";
 import { readingHoldMs } from "../ui/bubbleTiming";
@@ -2299,10 +2301,12 @@ async function send(text: string) {
         hasVoice: Boolean(s.tts.speakerId),
       });
       const diaryBrief = recentDiaryBrief(3);
+      const moodWeek = weeklyDiaryMood();
       const lifeCtx = [
         lifeRuntime.promptBlock(Date.now(), text),
         voiceCtx,
         diaryBrief ? `【你最近写过的日记（只有主题，要全文就用 view_diary）】\n${diaryBrief}` : "",
+        moodWeek ? `【这几天的情绪】${moodWeek}` : "",
       ].filter(Boolean).join("\n\n");
       const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
@@ -3152,6 +3156,40 @@ function extractKeywords(text: string): string[] {
  * 具体打分逻辑搬到了 memoryRank.ts（纯函数 + 单测）：BM25 + 近义扩展 + 2-gram 相似度，
  * 解决"用户说加班到三点、 памяти里有熬夜却召不回"的问题。
  */
+/**
+ * 把刚写完的日记里"明确的、具体的事件"吸收进记忆库。
+ *
+ * 为什么要专门做这一步：日记和记忆原本各存各的，她日记里写着"今天他终于把论文交了"，
+ * 聊天时却完全想不起来。这里只抽事实、不抽感想，带日期入记忆，并做相似度去重
+ * （同一天补写、重复启动都不会灌进去一堆重复条目）。
+ */
+export function absorbDiaryFacts(entries: { date: string; content: string }[]): number {
+  if (!entries.length) return 0;
+  loadMemory();
+  let added = 0;
+  const now = Date.now();
+  for (const entry of entries) {
+    for (const fact of extractDiaryFacts(entry)) {
+      const line = memoryLineFor(fact);
+      const dup = memory.some((m) => textSimilarity(m.content, line) > 0.82);
+      if (dup) continue;
+      memory.push({
+        id: `diary_${entry.date}_${added}_${now}`,
+        category: "event",
+        content: line,
+        keywords: ["日记", entry.date],
+        source: "ai_inferred",
+        createdAt: now,
+        lastUsedAt: now,
+        importance: 2,
+      });
+      added += 1;
+    }
+  }
+  if (added > 0) saveMemory();
+  return added;
+}
+
 function recallRelevantMemories(context: {
   timeOfDay?: string;
   currentApp?: string;

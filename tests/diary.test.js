@@ -39,6 +39,8 @@ global.localStorage = {
 const dm = require("./build/features/diary/DiaryManager.js");
 const tr = require("./build/features/diary/DiaryEventTracker.js");
 const dg = require("./build/features/diary/DiaryDigest.js");
+const moodMod = require("./build/features/diary/diaryMood.js");
+const factsMod = require("./build/assistant/diaryMemory.js");
 
 const SETTINGS_KEY = "live2d-pet-settings";
 const DIARY_KEY = "petra-diaries";
@@ -212,6 +214,36 @@ const evt = () => JSON.stringify([{ type: "chat", summary: "聊了天", timestam
   });
   check("★ 没什么素材时允许写短（不许硬凑）", thin.includes("80~150"), thin.slice(0, 60));
   check("素材少也仍然禁止编造", thin.includes("不许编"));
+}
+
+// ===== 日记情绪标签与一周小结 =====
+{
+  check("★ 判断出「很累」的日记", moodMod.diaryMoodOf("今天加班到很晚，累得眼睛都睁不开。").mood === "tired");
+  check("★ 判断出开心的日记", moodMod.diaryMoodOf("今天他很开心，笑了一晚上。").mood === "happy");
+  check("没什么情绪词时算平静", moodMod.diaryMoodOf("今天照常工作，没什么特别的。").mood === "calm");
+
+  const day = 86400000;
+  const now = Date.now();
+  const mk = (back, mood) => ({ date: new Date(now - back * day).toISOString().slice(0, 10), mood });
+  const tired = moodMod.weeklyMoodSummary([mk(1, "tired"), mk(2, "tired"), mk(3, "tired"), mk(4, "calm")], now);
+  check("★ 一周小结能说出「很累」", /累/.test(tired), tired);
+  const mixed = moodMod.weeklyMoodSummary([mk(1, "happy"), mk(2, "tired"), mk(3, "down"), mk(4, "angry")], now);
+  check("★ 情绪混杂时说「起伏」", /起伏/.test(mixed), mixed);
+  check("样本不足时不下结论", moodMod.weeklyMoodSummary([mk(1, "tired")], now) === "");
+  check("太老的日记不计入", moodMod.weeklyMoodSummary([mk(10, "tired"), mk(11, "tired"), mk(12, "tired")], now) === "");
+}
+
+// ===== 日记 → 记忆的提炼 =====
+{
+  const facts = factsMod.extractDiaryFacts({
+    date: "2026-11-18",
+    content: "今天他一直在改那个报错，晚上终于提交了版本。我觉得他有点累，但还挺高兴的。",
+  });
+  check("★ 从日记里抽出具体事件", facts.length >= 1, JSON.stringify(facts));
+  check("★ 抽出来的是「做了什么」而不是感想", facts.every((f) => !/我觉得|感觉/.test(f.content)), JSON.stringify(facts));
+  check("★ 记忆条目带日期", factsMod.memoryLineFor(facts[0]).startsWith("2026-11-18："), factsMod.memoryLineFor(facts[0]));
+  const empty = factsMod.extractDiaryFacts({ date: "2026-11-18", content: "今天很安静。感觉还行。" });
+  check("纯感受的日记不产出事实", empty.length === 0, JSON.stringify(empty));
 }
 
 console.log("diary: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);
