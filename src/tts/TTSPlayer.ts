@@ -386,7 +386,7 @@ class TTSPlayer {
   setMoodTone(t: { rate: number; pitch: number; volume: number }) {
     this.moodTone = {
       rate: Math.max(-8, Math.min(8, t.rate || 0)),
-      pitch: Math.max(-2, Math.min(2, t.pitch || 0)),
+      pitch: Math.max(-3, Math.min(3, t.pitch || 0)),
       volume: Math.max(0.5, Math.min(1, t.volume ?? 1)),
     };
     if (this.masterGain) this.masterGain.gain.value = this.muted ? 0 : this.moodTone.volume;
@@ -551,13 +551,22 @@ class TTSPlayer {
    */
   private buildTone(text: string, context: string[] = []): { text: string; tone?: TtsTonePayload } {
     const t = loadSettings().tts;
-    if (!t.enhanced) return { text };
     const emo = EMOTION_TONE[this.emotionTag] ? this.emotionTag : "neutral";
     const voice = EMOTION_VOICE[emo] ?? EMOTION_VOICE.neutral;
-    const base: TtsTonePayload = { model: "seed-tts-2.0-expressive" };
-    // 叠加"她今天的状态"：情绪基调 + 这句话本身的语气，都钳在合理范围里
+    // 语速/音调这两项**和"增强语气"开关无关**：它们是 audio_params 里的标准字段，
+    // 标准模型也吃。以前整段被 enhanced 开关挡住，于是"没开增强语气"的人永远听不出
+    // 情绪变化——这正是"切语气听不出来"的直接原因。
     const rate = Math.max(-10, Math.min(10, voice.rate + this.moodTone.rate));
     const pitch = Math.max(-4, Math.min(4, voice.pitch + this.moodTone.pitch));
+    if (!t.enhanced) {
+      // 不开增强语气：只给语速/音调，不碰表现力模型、context_texts、语音标签
+      if (!rate && !pitch) return { text };
+      const plain: TtsTonePayload = {};
+      if (rate) plain.speechRate = rate;
+      if (pitch) plain.pitch = pitch;
+      return { text, tone: plain };
+    }
+    const base: TtsTonePayload = { model: "seed-tts-2.0-expressive" };
     if (rate) base.speechRate = rate;
     if (pitch) base.pitch = pitch;
     // 同一段回复共用一个 section_id：几句之间语气接得上，不用用户操心

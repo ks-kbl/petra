@@ -280,7 +280,9 @@ export function stretchVoiced(
   const safe = Math.max(0.5, Math.min(2, factor));
   const outLen = Math.max(period * 2, Math.round(len * safe));
   const P = Math.max(2, Math.round(period));
-  const grain = P * 2;
+  // 3 个周期（原来是 2 个）：重叠区更长，相位过渡更平顺，
+  // 对鼻音这种准周期信号几乎没有代价，却能明显减少"金属味"。
+  const grain = P * 3;
   const win = new Float32Array(grain);
   for (let i = 0; i < grain; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (grain - 1));
   const result = channels.map(() => new Float32Array(outLen));
@@ -356,6 +358,9 @@ export function stretchFillerInChannels(
     : wsola(channels, sampleRate, span.start, span.end, mark.factor);
   // 长拖音才压音高：随口应的那声「嗯，」压了反而怪
   if (mark.kind === "think") stretched = pitchDown(stretched, 0.97);
+  // 拖音同样要过低通。之前只有短叹词过、拖音没过，所以"某些字还有电音"——
+  // 拉伸留下的高频毛刺正好落在人耳最敏感的那一段。
+  stretched = lowpass(stretched, sampleRate);
   return {
     channels: spliceStretched(channels, span, stretched, sampleRate),
     stretched: true,

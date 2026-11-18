@@ -19,6 +19,8 @@ export interface VoiceTone {
 }
 
 export interface VoiceToneInput {
+  /** 生气时的表达型（决定"冷怒"还是"爆发"） */
+  style?: "sarcastic" | "terse" | "pretend";
   /** 当前心情 -1~1 */
   mood: number;
   /** 精力 0~1 */
@@ -36,10 +38,16 @@ export function voiceToneFor(i: VoiceToneInput): VoiceTone {
   let volume = 1;
 
   if (i.mood <= -0.55) {
-    // 气头上：说得快一点、压一点，像是不耐烦
-    rate += 6; pitch -= 1;
+    // 气头上的两种"怒"，听感完全不同：
+    //   阴阳怪气 = 冷怒：音高压低、语速反而放慢（拖腔、带刺）
+    //   话变少   = 闷怒：更短更轻，不给气口
+    //   嘴硬装没事 = 憋着：几乎不变调，只把音高压一点
+    if (i.style === "terse") { rate += 1; pitch -= 1.5; volume -= 0.05; }
+    else if (i.style === "pretend") { rate -= 1; pitch -= 1; }
+    else { rate -= 1; pitch -= 2; } // sarcastic：慢半拍 + 明显压低，最像"阴阳"
   } else if (i.mood < -0.2) {
-    rate += 3; pitch -= 0.5;
+    if (i.style === "sarcastic") { rate += 1; pitch -= 1; }
+    else { rate += 2; pitch -= 0.5; }
   } else if (i.mood >= 0.5) {
     // 心情好：轻快、稍微上扬
     rate += 2; pitch += 1;
@@ -52,7 +60,7 @@ export function voiceToneFor(i: VoiceToneInput): VoiceTone {
 
   return {
     rate: clamp(Math.round(rate), -8, 8),
-    pitch: clamp(Number(pitch.toFixed(1)), -2, 2),
+    pitch: clamp(Number(pitch.toFixed(1)), -3, 3),
     volume: clamp(Number(volume.toFixed(2)), 0.8, 1),
   };
 }

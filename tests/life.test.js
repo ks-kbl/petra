@@ -314,7 +314,12 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   const happy = voice.voiceToneFor({ mood: 0.7, energy: 0.8, sleep: "awake" });
   const tired = voice.voiceToneFor({ mood: 0, energy: 0.15, sleep: "awake" });
   const neutral = voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "awake" });
-  check("★ 生气：语速更快、音调更压", angry.rate > neutral.rate && angry.pitch < neutral.pitch, JSON.stringify(angry));
+  check("★ 生气（默认阴阳型）：音高压低", angry.pitch < neutral.pitch, JSON.stringify(angry));
+  const sarcastic = voice.voiceToneFor({ mood: -0.8, energy: 0.6, style: "sarcastic" });
+  const terse = voice.voiceToneFor({ mood: -0.8, energy: 0.6, style: "terse" });
+  check("★ 阴阳怪气=冷怒：音压得最低", sarcastic.pitch <= terse.pitch, `${sarcastic.pitch} vs ${terse.pitch}`);
+  check("★ 三种怒的听感不同", JSON.stringify(sarcastic) !== JSON.stringify(terse));
+  check("音调不超过 ±3（避免变成另一个人）", Math.abs(sarcastic.pitch) <= 3 && Math.abs(happy.pitch) <= 3);
   check("★ 高兴：语速与音调都上扬", happy.rate > neutral.rate && happy.pitch > neutral.pitch, JSON.stringify(happy));
   check("★ 累：语速变慢、音量变轻", tired.rate < neutral.rate && tired.volume < 1, JSON.stringify(tired));
   check("幅度都很小（不像变声器）", Math.abs(angry.rate) <= 8 && Math.abs(happy.pitch) <= 2 && angry.volume >= 0.8);

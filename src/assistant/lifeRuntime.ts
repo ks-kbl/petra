@@ -357,6 +357,7 @@ export function voiceTone(now = Date.now()): VoiceTone {
     mood: currentMood(d.affect, now).value,
     energy: d.state.energy,
     sleep: stageFor(now),
+    style: d.style,
   });
 }
 
