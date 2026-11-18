@@ -1,5 +1,6 @@
 import { lifeRuntime } from "./lifeRuntime";
 import { filterMentionable } from "./mentionScore";
+import { voiceCapabilityLine } from "./voiceTone";
 import { invoke } from "@tauri-apps/api/core";
 import { readingHoldMs } from "../ui/bubbleTiming";
 import { chatStream, extractCommand, stripCommand, PROVIDERS, isProviderReady, type ChatMessage, type ToolCall, type MemoryEntry, type MemoryStore } from "./AssistantClient";
@@ -2289,7 +2290,13 @@ async function send(text: string) {
       if (budget.rounds > 1) setBubbleText(loading, "");
       // token 优化：记忆按场景/话题召回（≤6 条），而非全量注入 system prompt
       // 生活上下文（状态/情绪/关系/在做的事）：只在有内容时拼，避免每条请求都变长
-      const lifeCtx = lifeRuntime.promptBlock(Date.now(), text);
+      // 情绪 → 语音参数（生气快而压、低落慢而轻），并让模型知道"自己有没有嘴"
+      ttsPlayer.setMoodTone(lifeRuntime.voiceTone());
+      const voiceCtx = voiceCapabilityLine({
+        enabled: Boolean(s.tts.enabled),
+        hasVoice: Boolean(s.tts.speakerId),
+      });
+      const lifeCtx = [lifeRuntime.promptBlock(Date.now(), text), voiceCtx].filter(Boolean).join("\n\n");
       const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
       const personaWithLang = s.assistant.persona;
@@ -3289,7 +3296,10 @@ export function sayPetLine(text: string, holdMs = 6000): void {
  */
 function greetingLifeBlock(): string {
   const now = Date.now();
-  const parts = [lifeRuntime.promptBlock(now)];
+  const parts = [lifeRuntime.promptBlock(now), voiceCapabilityLine({
+    enabled: Boolean(loadSettings().tts.enabled),
+    hasVoice: Boolean(loadSettings().tts.speakerId),
+  })];
   if (lifeRuntime.upset(now)) {
     parts.push("【现在的态度】你还在生气：这次问候要短、可以带刺，不要主动开新话题、不要装作没事；被问到就直说在气什么。");
   }

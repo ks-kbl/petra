@@ -23,6 +23,7 @@ import { applyAffect, decay, defaultFavor, favorLine, toneLine, type Favor } fro
 import { detectTraits, type RoutineTrait } from "./personaRoutine";
 import { addressLine, addressTier, deriveAddressForms, type AddressForms } from "./address";
 import { depthFor, depthLine, sharpnessLine } from "./depth";
+import { voiceToneFor, type VoiceTone } from "./voiceTone";
 import { deriveExpressionStyle, styleLine, type ExpressionStyle } from "./expressionStyle";
 import { refusalBudget, refusalLine, refusalTendency, shouldRefuse, REFUSAL_DAILY_MAX } from "./refusal";
 
@@ -349,6 +350,16 @@ export function _resetForTest(): void {
  * 模块里那些函数是纯的/带缓存的，界面层不想关心缓存，也不想为了一个 tick
  * 引入八个 import，所以统一从这里进。
  */
+/** 情绪决定的语音参数（语速/音调/音量），推给 TTSPlayer */
+export function voiceTone(now = Date.now()): VoiceTone {
+  const d = load(now);
+  return voiceToneFor({
+    mood: currentMood(d.affect, now).value,
+    energy: d.state.energy,
+    sleep: stageFor(now),
+  });
+}
+
 export const lifeRuntime = {
   tick,
   load,
@@ -361,6 +372,7 @@ export const lifeRuntime = {
   setPersona,
   maybeRefuse,
   setRefusalCap,
+  voiceTone,
   recordAffect,
   /** 当前心情值（-1~1），只给内部过滤用，不进 UI */
   promptMood: (now = Date.now()) => currentMood(load(now).affect, now).value,

@@ -18,6 +18,7 @@ const addr = require("./build/assistant/address.js");
 const style = require("./build/assistant/expressionStyle.js");
 const refusal = require("./build/assistant/refusal.js");
 const depth = require("./build/assistant/depth.js");
+const voice = require("./build/assistant/voiceTone.js");
 
 let fail = 0;
 const check = (name, cond, extra = "") => {
@@ -294,6 +295,32 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("★ 明确禁止脏字和人身攻击", /不许带脏字/.test(sharp) && /人身攻击/.test(sharp));
   check("不生气时不给锋锐提示", depth.sharpnessLine(-0.1) === "");
   check("★ 反敷衍规则覆盖空话与判断", /确实/.test(depth.ANTI_FLUFF_RULES) && /判断/.test(depth.ANTI_FLUFF_RULES));
+}
+
+// ---------- 语音能力告知 ----------
+{
+  const on = voice.voiceCapabilityLine({ enabled: true, hasVoice: true });
+  const off = voice.voiceCapabilityLine({ enabled: false, hasVoice: true });
+  const noVoice = voice.voiceCapabilityLine({ enabled: true, hasVoice: false });
+  check("★ 开着语音：提醒句子别太长、少用符号", /别太长|符号/.test(on), on);
+  check("★ 关着语音：禁止说「念给你听」", /不要说|关着/.test(off) && /念给你听/.test(off), off);
+  check("★ 开了但没音色：明确不会出声", /不会出声/.test(noVoice), noVoice);
+  check("三种状态的文案互不相同", new Set([on, off, noVoice]).size === 3);
+}
+
+// ---------- 情绪 → 语音参数 ----------
+{
+  const angry = voice.voiceToneFor({ mood: -0.8, energy: 0.8, sleep: "awake" });
+  const happy = voice.voiceToneFor({ mood: 0.7, energy: 0.8, sleep: "awake" });
+  const tired = voice.voiceToneFor({ mood: 0, energy: 0.15, sleep: "awake" });
+  const neutral = voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "awake" });
+  check("★ 生气：语速更快、音调更压", angry.rate > neutral.rate && angry.pitch < neutral.pitch, JSON.stringify(angry));
+  check("★ 高兴：语速与音调都上扬", happy.rate > neutral.rate && happy.pitch > neutral.pitch, JSON.stringify(happy));
+  check("★ 累：语速变慢、音量变轻", tired.rate < neutral.rate && tired.volume < 1, JSON.stringify(tired));
+  check("幅度都很小（不像变声器）", Math.abs(angry.rate) <= 8 && Math.abs(happy.pitch) <= 2 && angry.volume >= 0.8);
+  check("刚睡醒会更慢", voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "waking" }).rate
+    < voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "awake" }).rate);
+  check("音量不会被压到听不见", voice.voiceToneFor({ mood: -1, energy: 0.05, sleep: "asleep" }).volume >= 0.8);
 }
 
 console.log(`life: fail=${fail}`);
