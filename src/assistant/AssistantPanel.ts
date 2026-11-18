@@ -1,3 +1,4 @@
+import { lifeRuntime } from "./lifeRuntime";
 import { invoke } from "@tauri-apps/api/core";
 import { readingHoldMs } from "../ui/bubbleTiming";
 import { chatStream, extractCommand, stripCommand, PROVIDERS, isProviderReady, type ChatMessage, type ToolCall, type MemoryEntry, type MemoryStore } from "./AssistantClient";
@@ -2163,6 +2164,8 @@ async function send(text: string) {
   if (recognizer?.isRecording()) recognizer.cancel();
   if (busy) return;
   markConversationActivity();
+  // 生活状态：用户开口就算一次互动（涨心情、掉精力、顺手复核话头、学口头禅）
+  lifeRuntime.noteUserMessage(text, Date.now());
   const s = loadSettings();
   const ttsKey = await invoke<string>("get_tts_key").catch(() => "");
   ttsPlayer.setConfig(s.tts.enabled, ttsKey, s.tts.speakerId, s.assistant.outputLanguage ?? "");
@@ -3336,6 +3339,7 @@ export async function triggerProactive(): Promise<boolean> {
   const previous = previousUnansweredGreeting(greetLog, Date.now());
   const todayTopics = recentGreetingTopics(greetLog, Date.now(), 3);
   const prompt = buildGreetingPrompt({
+    lifeBlock: lifeRuntime.promptBlock(Date.now()),
     timeStr,
     dayOfWeek,
     windowInfo,
@@ -3374,6 +3378,8 @@ export async function triggerProactive(): Promise<boolean> {
     if (!greeting) throw new Error("模型没有生成问候内容");
     const { main: mainText, trans: transText } = splitTranslation(greeting);
     if (!mainText.trim()) throw new Error("模型没有生成问候正文");
+    // 投递记账：额度、上次时间、以及"这句是问句"的话头登记
+    lifeRuntime.markDelivered(mainText, Date.now());
 
     // 生成期间用户已经打开对话框开始聊天：本次问候作废，不要打断用户
     if (isUserConversationActive()) {

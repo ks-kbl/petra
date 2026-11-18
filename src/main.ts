@@ -138,6 +138,7 @@ import { startHourlyChime, stopHourlyChime, formatQuietRange } from "./features/
 import { mountHandAxisControls } from "./live2d/psd/HandAxisPicker";
 import { buildHourlyQuietMenuItems } from "./features/hourly/HourlyQuietRows";
 import { listModels, listImageModels, PROVIDERS, getUsageStats, resetUsageStats, chatStream, pickDefaultChatModel, probeChatConnection } from "./assistant/AssistantClient";
+import { lifeRuntime } from "./assistant/lifeRuntime";
 import { clampGreetInterval, greetIntervalMs, greetingAnchorAfterReset, hasGreetingIntervalElapsed, nextGreetingDueAt } from "./assistant/greetingSchedule";
 import { BUILTIN_PERSONAS, findBuiltinPersona } from "./assistant/builtinPersonas";
 import { getApiKey, setApiKey, normalizeOpenAIBase, presetKeyScope, currentKeyScope } from "./assistant/apiKey";
@@ -1420,6 +1421,20 @@ async function fireScheduledGreeting(dueAt: number): Promise<void> {
     retryGreetingLater(dueAt);
     return;
   }
+  // 主动消息闸门：免打扰时段、今日额度、冷却、繁忙……拦下来就按建议延后，不丢
+  {
+    const g = lifeRuntime.gate(Date.now(), {
+      dailyLimit: 8,
+      cooldownMs: greetIntervalMs(settings.assistant.greetInterval),
+      userBusy: false,
+      idleSeconds: idleSec,
+      idleMode: settings.idleMode,
+    });
+    if (!g.allowed) {
+      retryGreetingLater(dueAt, g.retryInMs ?? 60 * 1000);
+      return;
+    }
+  }
   // 期间可能已经被别的路径问候过（回归问候），到点就别重复
   if (!hasGreetingIntervalElapsed(lastGreetAt, settings.assistant.greetInterval, Date.now())) {
     scheduleNextGreeting();
@@ -1626,6 +1641,8 @@ async function boot() {
   scheduleNextGreeting();           // 启动就排下一次
 
   setInterval(async () => {
+    // 生活状态随时间演进：不管助手开没开都要走，否则关掉一会儿再开像"时间停止了"
+    lifeRuntime.tick(Date.now());
     if (!settings.assistant.enabled) return;
     if (settings.idleMode) return; // 待机期间不弹主动问候/对话框
     let idleSec = 0;
