@@ -294,6 +294,19 @@ class TTSPlayer {
   private wakeResumeTimer: number | null = null;
   /** 当前这段回复的情绪（由 AssistantPanel 在流式解析出情绪标签时喂进来） */
   private emotionTag = "neutral";
+  /**
+   * 情绪决定的语音参数（语速/音调偏移 + 音量倍率）。
+   * 由 lifeRuntime 按当前心情算出来推进来；和"这句回复的情绪标签"是两回事：
+   * 前者是"她今天的状态"，后者是"这句话的语气"。
+   */
+  private moodTone = { rate: 0, pitch: 0, volume: 1 };
+  /**
+   * 语气处理（拖音/短叹词/低通）总开关。
+   *
+   * 只给"对照试听"用：用户听到电音时，可以一键关掉它再听一遍，
+   * 立刻判断电音是处理带来的还是端点给的音频本身就脏。正式流程永远开着。
+   */
+  private prosodyEnabled = true;
   /** 多轮上下文 id：同一段回复共用，让几句之间的语气连贯 */
   private sectionId = "";
   /** 这条回复已经送出去几段：决定下一段攒多长（见 speechLimits） */
@@ -368,14 +381,31 @@ class TTSPlayer {
    */
   setMuted(muted: boolean) {
     this.muted = muted;
-    if (this.masterGain) this.masterGain.gain.value = muted ? 0 : 1;
-    if (this.current) this.current.volume = muted ? 0 : 1;
+    if (this.masterGain) this.masterGain.gain.value = muted ? 0 : this.moodTone.volume;
+    if (this.current) this.current.volume = muted ? 0 : this.moodTone.volume;
   }
 
   /**
    * 设置当前回复的情绪（happy / shy / sad / angry / surprised / neutral）。
    * 只影响**之后**合成的句子：情绪标签通常出现在回复开头，所以整段基本都能带上。
    */
+  /** 情绪状态 → 语音参数（生气快而压、低落慢而轻）；音量立刻作用在正在播的声音上 */
+  setMoodTone(t: { rate: number; pitch: number; volume: number }) {
+    this.moodTone = {
+      rate: Math.max(-8, Math.min(8, t.rate || 0)),
+      pitch: Math.max(-3, Math.min(3, t.pitch || 0)),
+      volume: Math.max(0.5, Math.min(1, t.volume ?? 1)),
+    };
+    if (this.masterGain) this.masterGain.gain.value = this.muted ? 0 : this.moodTone.volume;
+    if (this.current) this.current.volume = this.muted ? 0 : this.moodTone.volume;
+  }
+
+  /** 对照试听用：临时关掉/打开语气处理 */
+  setProsodyEnabled(on: boolean) {
+    this.prosodyEnabled = on;
+    this.prosodyLog(`prosody ${on ? "on" : "off"}`);
+  }
+
   setEmotion(tag: string) {
     const t = (tag || "neutral").trim();
     if (t !== this.emotionTag) this.emotionTag = t;
@@ -512,7 +542,7 @@ class TTSPlayer {
       if (!Ctor) { this.ctxBroken = true; return false; }
       const ctx = new Ctor();
       const gain = ctx.createGain();
-      gain.gain.value = this.muted ? 0 : 1;
+      gain.gain.value = this.muted ? 0 : this.moodTone.volume;
       gain.connect(ctx.destination);
       this.ctx = ctx;
       this.masterGain = gain;
@@ -534,12 +564,24 @@ class TTSPlayer {
    */
   private buildTone(text: string, context: string[] = []): { text: string; tone?: TtsTonePayload } {
     const t = loadSettings().tts;
-    if (!t.enhanced) return { text };
     const emo = EMOTION_TONE[this.emotionTag] ? this.emotionTag : "neutral";
     const voice = EMOTION_VOICE[emo] ?? EMOTION_VOICE.neutral;
+    // 语速/音调这两项**和"增强语气"开关无关**：它们是 audio_params 里的标准字段，
+    // 标准模型也吃。以前整段被 enhanced 开关挡住，于是"没开增强语气"的人永远听不出
+    // 情绪变化——这正是"切语气听不出来"的直接原因。
+    const rate = Math.max(-10, Math.min(10, voice.rate + this.moodTone.rate));
+    const pitch = Math.max(-4, Math.min(4, voice.pitch + this.moodTone.pitch));
+    if (!t.enhanced) {
+      // 不开增强语气：只给语速/音调，不碰表现力模型、context_texts、语音标签
+      if (!rate && !pitch) return { text };
+      const plain: TtsTonePayload = {};
+      if (rate) plain.speechRate = rate;
+      if (pitch) plain.pitch = pitch;
+      return { text, tone: plain };
+    }
     const base: TtsTonePayload = { model: "seed-tts-2.0-expressive" };
-    if (voice.rate) base.speechRate = voice.rate;
-    if (voice.pitch) base.pitch = voice.pitch;
+    if (rate) base.speechRate = rate;
+    if (pitch) base.pitch = pitch;
     // 同一段回复共用一个 section_id：几句之间语气接得上，不用用户操心
     if (!this.sectionId) {
       this.sectionId = `petra-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -560,6 +602,7 @@ class TTSPlayer {
     const gen = item.gen;
     try {
       const { text: speakText, tone } = this.buildTone(item.text, item.context);
+      this.prosodyLog(`tone=${tone ? `rate:${tone.speechRate ?? 0},pitch:${tone.pitch ?? 0}` : "none"} text=${String(speakText).slice(0, 10)}`);
       // 排障用：把真正送进合成的文本打出来（下次"念出奇怪东西"能直接看到原文）
       if (typeof location !== "undefined" && (location.hostname === "127.0.0.1" || location.hostname === "localhost")) {
         console.debug("[TTS] 送合成：", speakText, tone ?? "(无语气参数)");
@@ -661,6 +704,7 @@ class TTSPlayer {
     const d = item.decoded;
     const ctx = this.ctx;
     const head = item.text.slice(0, 12);
+    if (!this.prosodyEnabled) { this.prosodyLog(`skip(disabled) text=${head}`); return; }
     if (!d || !ctx) { this.prosodyLog(`skip(no-audio) text=${head}`); return; }
     const sr = d.buffer.sampleRate;
     const chans: Float32Array[] = [];
@@ -775,7 +819,7 @@ class TTSPlayer {
     this.setWakePaused(true);
     this.speaking = true;
     this.current = audio;
-    audio.volume = this.muted ? 0 : 1;
+    audio.volume = this.muted ? 0 : this.moodTone.volume;
     const gen = next.gen;
     // 收尾时清掉引用：只有"还是当前这段"时才清，避免把下一段的引用误清掉
     const done = () => {

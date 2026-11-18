@@ -681,12 +681,14 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { path: "assistant.model", label: "模型", type: "text", placeholder: "留空则使用供应商默认模型" },
             { path: "assistant.customBaseUrl", label: "自定义接口地址", type: "text", placeholder: "仅选择自定义供应商时填写" },
             { type: "actions", items: [{ id: "__data:models-fetch", label: "获取模型列表", passKey: true }] },
+            { type: "apihelp" },
             { type: "secret", key: "assistant", label: "API Key", desc: "填写时不会显示，填写后覆盖当前预设设置" },
             { type: "usage" },
           ],
         },
         { title: "生图模型接入", desc: "", type: "imageaccess" },
         { title: "不会接 API？", desc: "", type: "promo" },
+        { title: "语音自检", desc: "", type: "ttsprobe" },
         { title: "最近生成的图", desc: "", type: "genimages" },
         { title: "预设", desc: "", type: "presets" },
         { title: "主动问候调度", desc: "", type: "greetstat" },
@@ -995,6 +997,15 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (spec.thanks) {
         wrap.appendChild(el("div", "vid-thanks", spec.thanks));
       }
+      return wrap;
+    }
+    if (spec.type === "apihelp") {
+      // 解释「API 是什么、怎么接」——收在一个按钮里，不占版面
+      const wrap = el("div", "tut-entry");
+      const b = el("button", "btn btn-sm", "API 是什么？我该怎么填？");
+      b.onclick = () => showApiHelp();
+      wrap.appendChild(b);
+      wrap.appendChild(el("div", "vid-note", "第一次接、或者不知道该填哪个，点上面这个。"));
       return wrap;
     }
     if (spec.type === "note") {
@@ -2042,6 +2053,63 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     document.body.appendChild(mask);
   }
 
+  /**
+   * 「API 是什么、怎么接」的接入指南。
+   *
+   * 为什么做成弹层而不是卡片正文：这东西第一次接的人需要看，接完就再也不会看，
+   * 常驻在页面上只会挤占真正的设置项。收进一个按钮里，需要时才展开。
+   *
+   * 内容按"完全不懂的人"的顺序排：是什么 → 三种来源怎么选 → 三步操作 → 常见坑。
+   */
+  function showApiHelp() {
+    const mask = el("div", "modal-mask");
+    const box = el("div", "modal-box");
+    box.style.maxWidth = "560px";
+    box.style.maxHeight = "78vh";
+    box.style.overflowY = "auto";
+    box.appendChild(el("div", "modal-title", "API 是什么？怎么接？"));
+
+    const add = (title, text) => {
+      const h = el("div", "modal-line");
+      h.style.fontWeight = "600";
+      h.style.marginTop = "6px";
+      h.textContent = title;
+      box.appendChild(h);
+      const p = el("div", "modal-line");
+      p.innerHTML = text;
+      box.appendChild(p);
+    };
+
+    add("一句话", "模型 API 就是一张「按次计费的门禁卡」：你带着这张卡去敲厂商的服务器，它才让你用它的模型说话。卡就是 <b>API Key</b>，门牌号就是 <b>接口地址（端点）</b>。");
+    add("三种来源，按情况选", [
+      "· <b>官方直连</b>：DeepSeek、智谱、通义这些自家平台。稳定、文档清楚，缺点是得自己注册、自己充钱。",
+      "· <b>中转站</b>：一个 Key 能用很多家模型（包括国外的），便宜、不用翻墙。缺点是质量参差，跑路的风险自己判断。",
+      "· <b>本地模型</b>（Ollama 等）：完全免费、断网也能用，缺点是要显卡、效果通常不如云端。",
+      "不确定就先试官方直连——最不容易踩坑。",
+    ].join("<br>"));
+    add("三步走", [
+      "1. <b>去拿 Key</b>：注册后在后台找到「API Key / 密钥」，复制那一串 sk- 开头的字符。",
+      "2. <b>选供应商</b>：上面选好对应的厂商（中转站选「自定义」，把它的地址填进「自定义接口地址」，一般以 <b>/v1</b> 结尾）。",
+      "3. <b>粘 Key → 点「获取模型列表」→ 选一个模型 → 保存</b>。模型名留空也可以，会用该供应商的默认模型。",
+    ].join("<br>"));
+    add("几个一定会遇到的坑", [
+      "· 地址要不要带 <b>/v1</b>：OpenAI 兼容接口一般都带。填错会报 404 或直接连不上。",
+      "· <b>Key 存在哪</b>：只存在本机、打码显示，不写日志、不进对话历史。换电脑要重新填。",
+      "· <b>400 报错</b>：先看模型名对不对（有的中转站要带前缀），再看到底填没填错地址。",
+      "· <b>模型不支持图片</b>：你说「看这个」时如果模型没有视觉能力，会自动去掉图片继续回你，不会整轮失败。",
+    ].join("<br>"));
+    add("接完怎么确认能用", "随便发一句「在吗」。能回就通了；报错的话把提示里的状态码发到反馈里，群里能看进度。");
+
+    const btns = el("div", "btn-row");
+    const ok = el("button", "btn btn-primary btn-sm", "知道了");
+    ok.onclick = () => mask.remove();
+    btns.appendChild(ok);
+    box.appendChild(btns);
+    mask.appendChild(box);
+    mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
+    document.body.appendChild(mask);
+  }
+
   /** 反馈发出去之后的致谢 + 加群提示 */
   function showFeedbackThanks() {
     showModal("反馈已发送", [
@@ -2205,11 +2273,58 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     b.onclick = () => runAction("__selfcheck", "功能自检");
     row.appendChild(b);
     card.appendChild(row);
+    // 她自己的生活状态（只有文字、没有数值）：排查"怎么感觉她不像之前那样"时有用
+    const life = state.meta.life;
+    if (life) {
+      const box = el("div", "promo-rules");
+      box.appendChild(el("div", "pr-title", "她现在的状态"));
+      Object.entries(life).forEach(([k, v]) => {
+        box.appendChild(el("div", null, `${k}：${v}`));
+      });
+      card.appendChild(box);
+    }
     const r = state.meta.selfcheck;
     if (r) {
       const ok = !r.missing || r.missing.length === 0;
       card.appendChild(el("div", "rdesc", `${r.at} 检查过：菜单项 ${r.total} 条` + (ok ? "，全部可用 ✓" : `，缺失 ${r.missing.length} 条：${r.missing.join("、")}`)));
     }
+    return card;
+  }
+
+  /**
+   * 语音自检：一句一场景地点播，并带一个"关掉语气处理"的对照组。
+   *
+   * 为什么要对照组：用户听到"电音"时，最需要区分的是"我们的处理带来的"
+   * 还是"端点给的音频本身就脏"。点一下关掉处理再听，答案立刻就有了。
+   */
+  function ttsProbeCard() {
+    const card = el("div", "card wide");
+    card.appendChild(el("h2", null, "语音自检"));
+    card.appendChild(el("p", "cd", "点按钮直接用当前音色念一句（不经过模型、不花对话 token）。听到怪声时，最后那个「关掉语气处理」是关键对照。"));
+
+    const cases = [
+      { label: "正常说一句", text: "今天天气不错，我们出去走走吧。", prosody: true },
+      { label: "拖音（嗯……）", text: "嗯……这个我得先想想。", prosody: true },
+      { label: "生气（哼）", text: "哼，我才不信呢。", prosody: true },
+      { label: "好奇（诶？）", text: "诶？你刚才说什么？", prosody: true },
+    ];
+    const row = el("div", "btn-row");
+    cases.forEach((c) => {
+      const b = el("button", "btn btn-sm", c.label);
+      b.onclick = () => runAction("__data:tts-probe", "语音试听", { text: c.text, prosody: c.prosody });
+      row.appendChild(b);
+    });
+    card.appendChild(row);
+
+    const row2 = el("div", "btn-row");
+    const plain = el("button", "btn btn-sm", "关掉语气处理，再念第一句（对照）");
+    plain.onclick = () => runAction("__data:tts-probe", "语音对照试听", {
+      text: "嗯……这个我得先想想。",
+      prosody: false,
+    });
+    row2.appendChild(plain);
+    card.appendChild(row2);
+    card.appendChild(el("div", "rdesc", "同一句「嗯……」带处理和不带处理各听一遍：如果只有带处理的那遍怪，是拉伸算法的问题；两遍都怪，就是音色/端点给的音频本身的问题。"));
     return card;
   }
 
@@ -2566,6 +2681,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (cardSpec.type === "quick") return grid.appendChild(quickCard());
       if (cardSpec.type === "actions-all") return grid.appendChild(actionsAllCard());
       if (cardSpec.type === "selfcheck") return grid.appendChild(selfCheckCard());
+      if (cardSpec.type === "ttsprobe") return grid.appendChild(ttsProbeCard());
       if (cardSpec.type === "plugins") return grid.appendChild(pluginsCard());
       if (cardSpec.type === "dsh-guide") return grid.appendChild(dshGuideCard());
       if (cardSpec.type === "mcp") return grid.appendChild(mcpCard());

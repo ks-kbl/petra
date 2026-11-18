@@ -1,3 +1,10 @@
+import { lifeRuntime } from "./lifeRuntime";
+import { filterMentionable } from "./mentionScore";
+import { voiceCapabilityLine } from "./voiceTone";
+import { recentDiaryBrief, weeklyDiaryMood } from "../features/diary/DiaryManager";
+import { extractDiaryFacts, memoryLineFor } from "./diaryMemory";
+import { textSimilarity } from "./memoryOps";
+import { buildQueryVariants, hitRelevance, RELEVANCE_FLOOR } from "./searchQuery";
 import { invoke } from "@tauri-apps/api/core";
 import { readingHoldMs } from "../ui/bubbleTiming";
 import { chatStream, extractCommand, stripCommand, PROVIDERS, isProviderReady, type ChatMessage, type ToolCall, type MemoryEntry, type MemoryStore } from "./AssistantClient";
@@ -2163,6 +2170,8 @@ async function send(text: string) {
   if (recognizer?.isRecording()) recognizer.cancel();
   if (busy) return;
   markConversationActivity();
+  // 生活状态：用户开口就算一次互动（涨心情、掉精力、顺手复核话头、学口头禅）
+  lifeRuntime.noteUserMessage(text, Date.now());
   const s = loadSettings();
   const ttsKey = await invoke<string>("get_tts_key").catch(() => "");
   ttsPlayer.setConfig(s.tts.enabled, ttsKey, s.tts.speakerId, s.assistant.outputLanguage ?? "");
@@ -2241,6 +2250,17 @@ async function send(text: string) {
   lastSentAt = Date.now();
   // 情感反馈：先分析用户消息（零 token），立即驱动角色表情/动作 + 心情
   const userEmo = classifyEmotion(text);
+  // 生气了可以"不干活"：只拒社交类请求，第二次必做、每天最多 2 次、
+  // 说「认真的」立刻照做（边界见 refusal.ts）。拒绝也要说清楚为什么。
+  {
+    const refuseLine = lifeRuntime.maybeRefuse(text, Date.now());
+    if (refuseLine) {
+      const b = addBubble("ai", refuseLine);
+      scheduleFade(b, 9000);
+      busy = false;
+      return;
+    }
+  }
   reactNow(userEmo);
   boostMood("chat");
   if (userEmo !== "neutral") boostMood(userEmo);
@@ -2273,6 +2293,21 @@ async function send(text: string) {
     while (budget.nextRound()) {
       if (budget.rounds > 1) setBubbleText(loading, "");
       // token 优化：记忆按场景/话题召回（≤6 条），而非全量注入 system prompt
+      // 生活上下文（状态/情绪/关系/在做的事）：只在有内容时拼，避免每条请求都变长
+      // 情绪 → 语音参数（生气快而压、低落慢而轻），并让模型知道"自己有没有嘴"
+      ttsPlayer.setMoodTone(lifeRuntime.voiceTone());
+      const voiceCtx = voiceCapabilityLine({
+        enabled: Boolean(s.tts.enabled),
+        hasVoice: Boolean(s.tts.speakerId),
+      });
+      const diaryBrief = recentDiaryBrief(3);
+      const moodWeek = weeklyDiaryMood();
+      const lifeCtx = [
+        lifeRuntime.promptBlock(Date.now(), text),
+        voiceCtx,
+        diaryBrief ? `【你最近写过的日记（只有主题，要全文就用 view_diary）】\n${diaryBrief}` : "",
+        moodWeek ? `【这几天的情绪】${moodWeek}` : "",
+      ].filter(Boolean).join("\n\n");
       const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
       const personaWithLang = s.assistant.persona;
@@ -2288,6 +2323,7 @@ async function send(text: string) {
       const expiredNote = expiredTaskNote(history, Date.now());
       const extraCtxWithLang =
         buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") +
+        (lifeCtx ? "\n\n" + lifeCtx : "") +
         "\n\n" + imageCtx + "\n\n" + recentImageBlock() +
         (autoScreenAttached ? "\n\n" + AUTO_SCREEN_NOTE : "") +
         (expiredNote ? "\n\n" + expiredNote : "") +
@@ -2733,16 +2769,53 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     if (tc.name === "cancel_shutdown") {
       await invokeTool(tc, "cancel_shutdown");
     }
+    if (tc.name === "read_web_page") {
+      const url = String(tc.args.url || "").trim();
+      if (!url) {
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "缺少 url，请补上再调用一次。" });
+      } else {
+        try {
+          const page = await invoke<{ url: string; title: string; text: string; truncated: boolean }>("read_web_page", { url });
+          const head = [`【${page.title || "网页正文"}】`, page.url];
+          if (page.truncated) head.push("（正文较长，只读了前面一部分）");
+          pushHistory({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: `${head.join("\n")}\n\n${page.text}`,
+          });
+        } catch (e) {
+          pushHistory({ role: "tool", tool_call_id: tc.id, content: `读不了这个页面：${e}` });
+        }
+      }
+    }
     if (tc.name === "search_web") {
       const query = String(tc.args.query || "").trim();
       if (!query) {
         pushHistory({ role: "tool", tool_call_id: tc.id, content: "搜索词是空的，请带上 query 再调用一次。" });
       } else {
         try {
-          const hits = await invoke<{ title: string; url: string; snippet: string; engine?: string }[]>("web_search", {
-            query,
-            limit: 5,
+          // 查询改写：把整句拆成 2~3 个更像搜索词的变体，一起搜再合并重排
+          const modelQueries = Array.isArray(tc.args.queries)
+            ? (tc.args.queries as unknown[]).map((q) => String(q)).filter(Boolean)
+            : [];
+          const variants = [...new Set([...(modelQueries.length ? modelQueries : [query]), ...buildQueryVariants(query)])].slice(0, 3);
+          let hits = await invoke<{ title: string; url: string; snippet: string; engine?: string; score?: number }[]>("web_search_multi", {
+            queries: variants,
+            limit: 6,
           });
+          // 相关性自检：结果基本不沾边就换一组更短的关键词再搜一次，而不是把垃圾交给模型
+          let relevance = hitRelevance(hits, query);
+          if (relevance < RELEVANCE_FLOOR && variants.length > 1) {
+            const retryQueries = variants.slice(1);
+            try {
+              const retry = await invoke<{ title: string; url: string; snippet: string; engine?: string; score?: number }[]>("web_search_multi", {
+                queries: retryQueries,
+                limit: 6,
+              });
+              const retryRel = hitRelevance(retry, query);
+              if (retryRel > relevance) { hits = retry; relevance = retryRel; }
+            } catch { /* 重搜失败就用原来的结果 */ }
+          }
           const text = (hits || [])
             .map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}\n   ${h.snippet}`)
             .join("\n");
@@ -2752,7 +2825,10 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           pushHistory({
             role: "tool",
             tool_call_id: tc.id,
-            content: text ? `搜索「${query}」的结果${from}：\n${text}` : `搜索「${query}」没有结果`,
+            content: text
+              ? `搜索「${query}」的结果${from}：\n${text}\n\n`
+                + `（如果这些摘要不足以回答问题，用 read_web_page 读第 1~2 条的正文；一次最多读两页）`
+              : `搜索「${query}」没有结果`,
           });
         } catch (e) {
           // 搜索失败要让模型知道，它可以换个关键词再试或直接说查不到，别让用户等成"卡住"
@@ -3080,6 +3156,40 @@ function extractKeywords(text: string): string[] {
  * 具体打分逻辑搬到了 memoryRank.ts（纯函数 + 单测）：BM25 + 近义扩展 + 2-gram 相似度，
  * 解决"用户说加班到三点、 памяти里有熬夜却召不回"的问题。
  */
+/**
+ * 把刚写完的日记里"明确的、具体的事件"吸收进记忆库。
+ *
+ * 为什么要专门做这一步：日记和记忆原本各存各的，她日记里写着"今天他终于把论文交了"，
+ * 聊天时却完全想不起来。这里只抽事实、不抽感想，带日期入记忆，并做相似度去重
+ * （同一天补写、重复启动都不会灌进去一堆重复条目）。
+ */
+export function absorbDiaryFacts(entries: { date: string; content: string }[]): number {
+  if (!entries.length) return 0;
+  loadMemory();
+  let added = 0;
+  const now = Date.now();
+  for (const entry of entries) {
+    for (const fact of extractDiaryFacts(entry)) {
+      const line = memoryLineFor(fact);
+      const dup = memory.some((m) => textSimilarity(m.content, line) > 0.82);
+      if (dup) continue;
+      memory.push({
+        id: `diary_${entry.date}_${added}_${now}`,
+        category: "event",
+        content: line,
+        keywords: ["日记", entry.date],
+        source: "ai_inferred",
+        createdAt: now,
+        lastUsedAt: now,
+        importance: 2,
+      });
+      added += 1;
+    }
+  }
+  if (added > 0) saveMemory();
+  return added;
+}
+
 function recallRelevantMemories(context: {
   timeOfDay?: string;
   currentApp?: string;
@@ -3264,6 +3374,23 @@ export function sayPetLine(text: string, holdMs = 6000): void {
   scheduleFade(b, holdMs);
 }
 
+/**
+ * 问候用的生活上下文：状态 + 情绪 + 关系 + 在做的事。
+ * 正在气头上时追加一条硬约束——这是我们定的"度"：
+ * 照常开口，但短、冲、不主动开新话题，不玩消失。
+ */
+function greetingLifeBlock(): string {
+  const now = Date.now();
+  const parts = [lifeRuntime.promptBlock(now), voiceCapabilityLine({
+    enabled: Boolean(loadSettings().tts.enabled),
+    hasVoice: Boolean(loadSettings().tts.speakerId),
+  })];
+  if (lifeRuntime.upset(now)) {
+    parts.push("【现在的态度】你还在生气：这次问候要短、可以带刺，不要主动开新话题、不要装作没事；被问到就直说在气什么。");
+  }
+  return parts.filter(Boolean).join("\n\n");
+}
+
 export async function triggerProactive(): Promise<boolean> {
   // 已经在回复 / 用户正开着对话框聊天：取消本次问候（用户要求：正在聊天时不插话）
   if (busy || isUserConversationActive()) return false;
@@ -3318,7 +3445,13 @@ export async function triggerProactive(): Promise<boolean> {
 
   // 召回相关记忆（桌宠自己的窗口不当作"主人在用的软件"）
   const currentApp = rawWindow && !isOwnWindow(rawWindow) ? appNameFromTitle(rawWindow) : "";
-  const relevantMemories = recallRelevantMemories({ timeOfDay, currentApp, currentTitle: rawWindow });
+  const recallRaw = recallRelevantMemories({ timeOfDay, currentApp, currentTitle: rawWindow });
+  // 记忆按时间分类过滤：上午的"正在上网课"到了晚上就不该再提（现场情境已过期），
+  // 太久远的小事也不再翻出来——这正是"提不提"的判断，见 mentionScore.ts
+  const relevantMemories = filterMentionable(
+    recallRaw.map((m) => ({ ...m, at: m.createdAt })),
+    { now: Date.now(), mood: lifeRuntime.promptMood() },
+  );
 
   const memoryBlock = relevantMemories.length > 0
     ? "\n关于用户的记忆：\n" + relevantMemories.map(m => `- [${m.category}] ${m.content}`).join("\n")
@@ -3336,6 +3469,7 @@ export async function triggerProactive(): Promise<boolean> {
   const previous = previousUnansweredGreeting(greetLog, Date.now());
   const todayTopics = recentGreetingTopics(greetLog, Date.now(), 3);
   const prompt = buildGreetingPrompt({
+    lifeBlock: greetingLifeBlock(),
     timeStr,
     dayOfWeek,
     windowInfo,
@@ -3374,6 +3508,8 @@ export async function triggerProactive(): Promise<boolean> {
     if (!greeting) throw new Error("模型没有生成问候内容");
     const { main: mainText, trans: transText } = splitTranslation(greeting);
     if (!mainText.trim()) throw new Error("模型没有生成问候正文");
+    // 投递记账：额度、上次时间、以及"这句是问句"的话头登记
+    lifeRuntime.markDelivered(mainText, Date.now());
 
     // 生成期间用户已经打开对话框开始聊天：本次问候作废，不要打断用户
     if (isUserConversationActive()) {

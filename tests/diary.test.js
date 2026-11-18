@@ -39,13 +39,15 @@ global.localStorage = {
 const dm = require("./build/features/diary/DiaryManager.js");
 const tr = require("./build/features/diary/DiaryEventTracker.js");
 const dg = require("./build/features/diary/DiaryDigest.js");
+const moodMod = require("./build/features/diary/diaryMood.js");
+const factsMod = require("./build/assistant/diaryMemory.js");
 
 const SETTINGS_KEY = "live2d-pet-settings";
 const DIARY_KEY = "petra-diaries";
 let fail = 0;
 const check = (name, cond, extra = "") => {
   if (!cond) fail++;
-  console.log((cond ? "PASS " : "FAIL ") + name + (extra ? "  " + extra : ""));
+console.log((cond ? "PASS " : "FAIL ") + name + (extra ? "  " + extra : ""));
 };
 const dstr = (offsetDays) => {
   const d = new Date();
@@ -187,6 +189,63 @@ const evt = () => JSON.stringify([{ type: "chat", summary: "聊了天", timestam
   check("降级丢掉事件快照", !stored[0].events || stored[0].events.length === 0);
   check("告警只报一次", dm.takeDiaryStorageWarning() === null);
 
-  console.log("diary: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);
+    // ===== 日记要"记真的"：结构、锚点、禁编、素材少就写短 =====
+{
+  const prompt = dg.buildDiaryPrompt({
+    date: "2026-11-18", persona: "傲娇女仆", nickname: "老大",
+    events: [{ type: "chat", summary: "他说今天不想加班", timestamp: Date.now() }],
+    apps: [{ app: "VS Code", minutes: 120 }],
+    tracks: [],
+    previousTail: "",
+    quotes: ["他说今天不想加班", "这个报错又来了"],
+    recent: [{ date: "2026-11-17", summary: "一起修好了语音" }],
+  });
+  check("★ 要求分两段：真实事件 + 自己的想法", prompt.includes("真实发生了什么") && prompt.includes("我自己的想法"));
+  check("★ 明确禁止编造", prompt.includes("不许编"));
+  check("★ 要求至少一处具体锚点", prompt.includes("具体锚点"));
+  check("★ 用户原话被喂进提示词", prompt.includes("他说今天不想加班"));
+  check("★ 最近写过的话题会被提醒别重复", prompt.includes("别重复"));
+  check("素材丰富时给长一点的篇幅", prompt.includes("200~350"));
+}
+
+{
+  const thin = dg.buildDiaryPrompt({
+    date: "2026-11-18", events: [], apps: [], tracks: [], quotes: [], recent: [],
+  });
+  check("★ 没什么素材时允许写短（不许硬凑）", thin.includes("80~150"), thin.slice(0, 60));
+  check("素材少也仍然禁止编造", thin.includes("不许编"));
+}
+
+// ===== 日记情绪标签与一周小结 =====
+{
+  check("★ 判断出「很累」的日记", moodMod.diaryMoodOf("今天加班到很晚，累得眼睛都睁不开。").mood === "tired");
+  check("★ 判断出开心的日记", moodMod.diaryMoodOf("今天他很开心，笑了一晚上。").mood === "happy");
+  check("没什么情绪词时算平静", moodMod.diaryMoodOf("今天照常工作，没什么特别的。").mood === "calm");
+
+  const day = 86400000;
+  const now = Date.now();
+  const mk = (back, mood) => ({ date: new Date(now - back * day).toISOString().slice(0, 10), mood });
+  const tired = moodMod.weeklyMoodSummary([mk(1, "tired"), mk(2, "tired"), mk(3, "tired"), mk(4, "calm")], now);
+  check("★ 一周小结能说出「很累」", /累/.test(tired), tired);
+  const mixed = moodMod.weeklyMoodSummary([mk(1, "happy"), mk(2, "tired"), mk(3, "down"), mk(4, "angry")], now);
+  check("★ 情绪混杂时说「起伏」", /起伏/.test(mixed), mixed);
+  check("样本不足时不下结论", moodMod.weeklyMoodSummary([mk(1, "tired")], now) === "");
+  check("太老的日记不计入", moodMod.weeklyMoodSummary([mk(10, "tired"), mk(11, "tired"), mk(12, "tired")], now) === "");
+}
+
+// ===== 日记 → 记忆的提炼 =====
+{
+  const facts = factsMod.extractDiaryFacts({
+    date: "2026-11-18",
+    content: "今天他一直在改那个报错，晚上终于提交了版本。我觉得他有点累，但还挺高兴的。",
+  });
+  check("★ 从日记里抽出具体事件", facts.length >= 1, JSON.stringify(facts));
+  check("★ 抽出来的是「做了什么」而不是感想", facts.every((f) => !/我觉得|感觉/.test(f.content)), JSON.stringify(facts));
+  check("★ 记忆条目带日期", factsMod.memoryLineFor(facts[0]).startsWith("2026-11-18："), factsMod.memoryLineFor(facts[0]));
+  const empty = factsMod.extractDiaryFacts({ date: "2026-11-18", content: "今天很安静。感觉还行。" });
+  check("纯感受的日记不产出事实", empty.length === 0, JSON.stringify(empty));
+}
+
+console.log("diary: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);
   process.exit(fail ? 1 : 0);
 })();

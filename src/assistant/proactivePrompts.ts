@@ -40,6 +40,11 @@ export interface GreetingPromptParts {
   previousGreeting?: { summary?: string; greeting: string } | null;
   /** 今天已经问候过的话题摘要（用于避免一天内反复说同一件事） */
   recentGreetingTopics?: string[];
+  /**
+   * 她自己的生活上下文：当前状态、今天在做的事、纪念日、话头、口头禅。
+   * 由 lifeRuntime.promptBlock() 生成，全为空时传空串。
+   */
+  lifeBlock?: string;
 }
 
 /**
@@ -79,7 +84,11 @@ export function buildGreetingPrompt(p: GreetingPromptParts): string {
     "4. 今天已经问候过的话题也不要反复说；只有和本次观察确实相关时才可延续。\n" +
     "5. 只输出一个 JSON 对象，不要 Markdown 代码块、不要额外解释；键名固定为 summary 和 greeting，不要翻译：\n" +
     "{\"summary\":\"本轮观察摘要（中文，1-2句，内部记录用）\",\"greeting\":\"要发给用户的问候\"}";
-  return `${head}${sources}${p.memoryBlock}${p.comfortLine}${prev}${recent}\n\n${body}${trailingReminder(p.outputLanguage)}`;
+  const lifeText = (p.lifeBlock ?? "").trim();
+  const life = lifeText
+    ? `\n\n【你自己的生活】\n${lifeText}\n（这些是你自己的状态和今天在做的事，可以用来当话题由头；但不要像报日程表一样逐条念，也别报具体数值。）`
+    : "";
+  return `${head}${sources}${p.memoryBlock}${p.comfortLine}${prev}${recent}${life}\n\n${body}${trailingReminder(p.outputLanguage)}`;
 }
 
 export interface GreetingResult {

@@ -5,6 +5,7 @@
  * 由大模型根据当天的时间线（常用软件/听歌/小游戏/提醒）+ 聊天摘要来撰写。
  */
 
+import { diaryMoodOf, weeklyMoodSummary, type DiaryMood } from "./diaryMood";
 import {
   getEvents,
   getAppUsage,
@@ -33,6 +34,8 @@ export interface DiaryEntry {
   events?: DiaryEvent[];
   aiGenerated: boolean;
   createdAt: number;
+  /** 这篇日记的情绪标签（规则判定，用于一周情绪小结） */
+  mood?: DiaryMood;
 }
 
 const STORAGE_KEY = "petra-diaries";
@@ -154,15 +157,50 @@ function previousDiaryTail(date: string): string {
 
 /** 收集某天的全部素材（事件 + 应用用量 + 听歌 + 上一篇结尾） */
 function collectDigestInput(date: string, persona: string, nickname: string): DigestInput {
+  const events = getEvents(date);
   return {
     date,
     persona,
     nickname,
-    events: getEvents(date),
+    events,
     apps: getAppUsage(date),
     tracks: getMusicTracks(date),
     previousTail: previousDiaryTail(date),
+    // 聊天事件里带着当时那句话的摘要，直接当"原话"用：日记里引一句原话，
+    // 比写十句"他今天很忙"都更像真的
+    quotes: events
+      .filter((e) => e.type === "chat" && (e.summary ?? "").length >= 6)
+      .slice(-3)
+      .map((e) => e.summary.trim()),
+    recent: loadDiaries()
+      .filter((d) => d.date < date)
+      .sort((a, b) => (a.date < b.date ? 1 : -1))
+      .slice(0, 3)
+      .map((d) => ({ date: d.date, summary: (d.content || "").replace(/\s+/g, " ").slice(0, 40) })),
   };
+}
+
+/**
+ * 最近写过什么（一句话摘要版），给对话上下文用。
+ *
+ * 她要"知道自己写过什么"：不是把全文塞进 prompt，而是记住"哪天写了、主题是什么"，
+ * 用户问起时再用 view_diary 取全文。
+ */
+/** 最近一周的情绪小结（样本不足时返回空串） */
+export function weeklyDiaryMood(now = Date.now()): string {
+  const entries = loadDiaries().map((d) => ({ date: d.date, mood: d.mood }));
+  return weeklyMoodSummary(entries, now);
+}
+
+export function recentDiaryBrief(limit = 3): string {
+  const list = loadDiaries()
+    .slice()
+    .sort((a, b) => (a.date < b.date ? 1 : -1))
+    .slice(0, limit);
+  if (!list.length) return "";
+  return list
+    .map((d) => `${d.date}：${(d.content || "").replace(/\s+/g, " ").trim().slice(0, 50)}`)
+    .join("\n");
 }
 
 interface GenResult {
@@ -256,6 +294,8 @@ export async function checkAndGenerateDiary(opts: { manual?: boolean } = {}): Pr
     if (!content) continue; // 生成失败：保留素材，下次启动重试
 
     const entry: DiaryEntry = { date, content, aiGenerated: true, createdAt: Date.now() };
+    // 情绪标签在写的时候就定下来：一周之后能回答"这周你好像一直很累"
+    entry.mood = diaryMoodOf(content).mood;
     if (translation) entry.translation = translation;
     const diaries = loadDiaries();
     diaries.push(entry);

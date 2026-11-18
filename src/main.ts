@@ -126,7 +126,7 @@ import { ACTIVITY_LABEL, nextActivity, type ActivityLevel } from "./utils/settin
 import { astrobotOn } from "./bridges/astrobot";
 import { openAssistant, repositionAssistantBubbles, showWakeBubble } from "./assistant/AssistantPanel";
 import { pluginRuntime, configurePluginHost } from "./plugins/runtime";
-import { setLifecycle, triggerProactive, closeAssistant, clearBubbles, clearApiKeyCache, clearImageKeyCache, clearHistory, isAssistantBusy, sayPetLine, setModelRectProvider, fitBubbleHeights, rearmIdleTimer } from "./assistant/AssistantPanel";
+import { absorbDiaryFacts, setLifecycle, triggerProactive, closeAssistant, clearBubbles, clearApiKeyCache, clearImageKeyCache, clearHistory, isAssistantBusy, sayPetLine, setModelRectProvider, fitBubbleHeights, rearmIdleTimer } from "./assistant/AssistantPanel";
 import { getSpeechRecognizer } from "./asr/SpeechRecognizer";
 import { repositionLyricBubble } from "./music/LyricBubble";
 import {
@@ -138,6 +138,7 @@ import { startHourlyChime, stopHourlyChime, formatQuietRange } from "./features/
 import { mountHandAxisControls } from "./live2d/psd/HandAxisPicker";
 import { buildHourlyQuietMenuItems } from "./features/hourly/HourlyQuietRows";
 import { listModels, listImageModels, PROVIDERS, getUsageStats, resetUsageStats, chatStream, pickDefaultChatModel, probeChatConnection } from "./assistant/AssistantClient";
+import { lifeRuntime } from "./assistant/lifeRuntime";
 import { clampGreetInterval, greetIntervalMs, greetingAnchorAfterReset, hasGreetingIntervalElapsed, nextGreetingDueAt } from "./assistant/greetingSchedule";
 import { BUILTIN_PERSONAS, findBuiltinPersona } from "./assistant/builtinPersonas";
 import { getApiKey, setApiKey, normalizeOpenAIBase, presetKeyScope, currentKeyScope } from "./assistant/apiKey";
@@ -1420,6 +1421,20 @@ async function fireScheduledGreeting(dueAt: number): Promise<void> {
     retryGreetingLater(dueAt);
     return;
   }
+  // 主动消息闸门：免打扰时段、今日额度、冷却、繁忙……拦下来就按建议延后，不丢
+  {
+    const g = lifeRuntime.gate(Date.now(), {
+      dailyLimit: 8,
+      cooldownMs: greetIntervalMs(settings.assistant.greetInterval),
+      userBusy: false,
+      idleSeconds: idleSec,
+      idleMode: settings.idleMode,
+    });
+    if (!g.allowed) {
+      retryGreetingLater(dueAt, g.retryInMs ?? 60 * 1000);
+      return;
+    }
+  }
   // 期间可能已经被别的路径问候过（回归问候），到点就别重复
   if (!hasGreetingIntervalElapsed(lastGreetAt, settings.assistant.greetInterval, Date.now())) {
     scheduleNextGreeting();
@@ -1626,6 +1641,11 @@ async function boot() {
   scheduleNextGreeting();           // 启动就排下一次
 
   setInterval(async () => {
+    // 生活状态随时间演进：不管助手开没开都要走，否则关掉一会儿再开像"时间停止了"
+    lifeRuntime.tick(Date.now());
+    // 人设决定"她过什么日子"：换人设会重算生活特征
+    lifeRuntime.setPersona(settings.assistant.persona);
+    lifeRuntime.setPersona(settings.assistant.persona);
     if (!settings.assistant.enabled) return;
     if (settings.idleMode) return; // 待机期间不弹主动问候/对话框
     let idleSec = 0;
@@ -1982,6 +2002,10 @@ async function boot() {
       else if (list.length > 1) toast(`📖 补写了 ${list.length} 篇日记~`);
       const warn = takeDiaryStorageWarning();
       if (warn) toast(warn, "warn");
+      // 日记里明确发生的事进记忆库，聊天时才想得起来
+      if (list.length) {
+        try { absorbDiaryFacts(list); } catch (e) { console.warn("[日记] 提炼记忆失败", e); }
+      }
     }).catch(() => {});
     // 跨天自动补写：整天开着应用跨过午夜，日期变化后自动为刚结束的那天写日记
     const pad2 = (n: number) => String(n).padStart(2, "0");
@@ -1996,6 +2020,9 @@ async function boot() {
       lastDay = cur;
       checkAndGenerateDiary().then(list => {
         if (list.length > 0) toast(`📖 昨天的日记写好啦~`);
+        if (list.length) {
+          try { absorbDiaryFacts(list); } catch (e) { console.warn("[日记] 提炼记忆失败", e); }
+        }
       }).catch(() => {});
     }, 60 * 1000);
   }
@@ -3891,6 +3918,8 @@ function buildPanelMeta() {
       nextAt: nextGreetingDueAt(lastGreetAt, settings.assistant.greetInterval, Date.now(), 0),
       timerArmed: greetTimer !== null,
     },
+    // 她自己的生活状态（只有文字，没有数值）：面板「自检」卡里只读展示
+    life: lifeRuntime.snapshot(),
     platform: PLATFORM === "win" ? "Windows" : PLATFORM === "mac" ? "macOS" : "Linux",
     model: currentModel.name || currentModel.type,
     providers: Object.entries(PROVIDERS).map(([id, p]) => ({ id, label: p.label, model: p.defaultModel })),
@@ -4456,6 +4485,24 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
         panelAssistantModels = [];
         await pushPanelState();
         toast("已填好合作中转站的端点，接下来粘贴 Key、再点「获取模型列表」");
+        break;
+      }
+      case "tts-probe": {
+        // 语气自检：把某一句按"带处理/不带处理"念一遍，用来判断电音是不是处理带来的
+        const text = String(p.text ?? "").trim();
+        const prosody = p.prosody !== false;
+        if (!text) break;
+        if (!settings.tts.enabled) { toast("先开启语音输出再试听", "info"); break; }
+        const key = await invoke<string>("get_tts_key").catch(() => "");
+        if (!String(settings.tts.speakerId ?? "").trim()) {
+          toast("还没填「音色 ID」：控制面板 → 语音 → 音色 ID", "warn");
+          break;
+        }
+        ttsPlayer.setConfig(true, key, settings.tts.speakerId, settings.assistant.outputLanguage ?? "");
+        ttsPlayer.setProsodyEnabled(prosody);
+        ttsPlayer.setMoodTone({ rate: 0, pitch: 0, volume: 1 });
+        ttsPlayer.speakTest(text);
+        toast(prosody ? "正在试听（带语气处理）" : "正在试听（已关掉语气处理，用作对照）", "info");
         break;
       }
       case "check-update":
