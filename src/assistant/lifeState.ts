@@ -136,9 +136,8 @@ export function lifeLine(state: LifeState, now = Date.now()): string {
     parts.push("你状态平常，不特别亢奋也不累");
   }
 
-  if (state.mood > 0.4) parts.push("心情不错");
-  else if (state.mood < -0.3) parts.push("心情有点低");
-  else parts.push("情绪平稳");
+  // 注意：这里**不报心情**。心情由 affect.ts 的事件表统一负责（有原因、会衰减），
+  // 两处各说一句会出现"情绪平稳 + 你现在正在生气"这种自相矛盾的上下文。
 
   const since = state.lastInteractionAt ? now - state.lastInteractionAt : 0;
   if (state.lastInteractionAt && since < 30 * MINUTE) parts.push("刚和主人说过话");

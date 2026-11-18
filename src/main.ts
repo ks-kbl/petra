@@ -1643,6 +1643,9 @@ async function boot() {
   setInterval(async () => {
     // 生活状态随时间演进：不管助手开没开都要走，否则关掉一会儿再开像"时间停止了"
     lifeRuntime.tick(Date.now());
+    // 人设决定"她过什么日子"：换人设会重算生活特征
+    lifeRuntime.setPersona(settings.assistant.persona);
+    lifeRuntime.setPersona(settings.assistant.persona);
     if (!settings.assistant.enabled) return;
     if (settings.idleMode) return; // 待机期间不弹主动问候/对话框
     let idleSec = 0;

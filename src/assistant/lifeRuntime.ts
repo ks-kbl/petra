@@ -15,6 +15,12 @@ import { upcomingAnniversaries } from "./anniversary";
 import { habitsLine, learnHabits } from "./speechHabits";
 import { addLoop, loopLine, markAnswered, type PendingLoop } from "./openLoopReview";
 import { evaluateGate, type GateResult } from "./proactiveGate";
+import {
+  addEvent, currentMood, isUpset, looksLikeApology, moodLine, pruneEvents, soften, insultStrength,
+  type AffectEvent, type AffectKind,
+} from "./affect";
+import { applyAffect, decay, defaultFavor, favorLine, toneLine, type Favor } from "./favor";
+import { detectTraits, type RoutineTrait } from "./personaRoutine";
 
 const STORE_KEY = "petra.life.v1";
 /** 最近保留多少条用户原话用于学口头禅 */
@@ -37,6 +43,12 @@ interface Persisted {
   loops: PendingLoop[];
   habits: string[];
   recentUser: string[];
+  /** 情绪事件表（有原因、有半衰期） */
+  affect: AffectEvent[];
+  /** 长期好感度 */
+  favor: Favor;
+  /** 从人设识别出的生活特征 */
+  traits: RoutineTrait[];
 }
 
 let data: Persisted | null = null;
@@ -60,6 +72,9 @@ function fresh(now: number): Persisted {
     loops: [],
     habits: [],
     recentUser: [],
+    affect: [],
+    favor: defaultFavor(now),
+    traits: [],
   };
 }
 
@@ -80,6 +95,9 @@ export function load(now = Date.now()): Persisted {
           loops: Array.isArray(j.loops) ? (j.loops as PendingLoop[]).slice(-6) : [],
           habits: Array.isArray(j.habits) ? (j.habits as string[]).slice(0, 3) : [],
           recentUser: Array.isArray(j.recentUser) ? (j.recentUser as string[]).slice(-RECENT_USER_MAX) : [],
+          affect: Array.isArray(j.affect) ? (j.affect as AffectEvent[]).slice(-8) : [],
+          favor: j.favor && typeof j.favor.score === "number" ? (j.favor as Favor) : base.favor,
+          traits: Array.isArray(j.traits) ? (j.traits as RoutineTrait[]) : [],
         };
         return data;
       }
@@ -99,6 +117,8 @@ function save(): void {
 export function tick(now = Date.now()): void {
   const d = load(now);
   d.state = advanceLifeState(d.state, now);
+  d.affect = pruneEvents(d.affect, now);
+  d.favor = decay(d.favor, now);
   const today = dayKey(now);
   if (d.deliveries.day !== today) {
     d.deliveries = { day: today, count: 0, lastAt: d.deliveries.lastAt };
@@ -117,6 +137,57 @@ export function noteUserMessage(text: string, now = Date.now()): void {
     d.habits = learnHabits(d.recentUser, d.habits);
   }
   d.loops = markAnswered(d.loops, now);
+  // 道歉/哄人：负面情绪的半衰期打折（心软），好感小涨
+  if (looksLikeApology(t)) {
+    d.affect = soften(d.affect, 0.5);
+    d.favor = applyAffect(d.favor, 0.3, now);
+  }
+  // 可能伤人的话：先按启发式记一条，强度低的会在下一轮被自己冲淡；
+  // **半衰期由人设定**（懒散/爱吃的人设心软得快，其它人设记久一点）
+  const hurt = insultStrength(t);
+  if (hurt > 0) {
+    const soft = d.traits.includes("lazy") || d.traits.includes("food");
+    d.affect = addEvent(d.affect, {
+      id: `${now}:${t.slice(0, 10)}`,
+      kind: hurt >= 0.6 ? "hurt" : "annoyed",
+      reason: t.slice(0, 40),
+      intensity: -hurt,
+      startedAt: now,
+      halfLifeMin: hurt >= 0.6 ? (soft ? 70 : 150) : 40,
+    }, now);
+    d.favor = applyAffect(d.favor, -hurt * 0.5, now);
+  }
+  save();
+}
+
+/** 由人设推导生活特征（换人设会重算，并清掉当天的节目单缓存） */
+export function setPersona(persona: string, now = Date.now()): void {
+  const d = load(now);
+  const traits = detectTraits(persona);
+  if (traits.join(",") === d.traits.join(",")) return;
+  d.traits = traits;
+  planCache = null;
+  save();
+}
+
+/** 记一条模型判断出来的情绪（半衰期由模型给，界面不暴露） */
+export function recordAffect(
+  kind: AffectKind,
+  reason: string,
+  intensity: number,
+  halfLifeMin: number,
+  now = Date.now(),
+): void {
+  const d = load(now);
+  d.affect = addEvent(d.affect, {
+    id: `${now}:${reason.slice(0, 10)}`,
+    kind,
+    reason: reason.slice(0, 40),
+    intensity: Math.max(-1, Math.min(1, intensity)),
+    startedAt: now,
+    halfLifeMin: Math.max(5, Math.min(1440, halfLifeMin)),
+  }, now);
+  d.favor = applyAffect(d.favor, intensity, now);
   save();
 }
 
@@ -151,7 +222,7 @@ export function gate(
 /** 当天的节目单（按日期缓存） */
 export function plan(now = Date.now()): PlanItem[] {
   const key = dayKey(now);
-  if (!planCache || planCache.day !== key) planCache = { day: key, plan: buildDayPlan(key) };
+  if (!planCache || planCache.day !== key) planCache = { day: key, plan: buildDayPlan(key, load(now).traits) };
   return planCache.plan;
 }
 
@@ -164,6 +235,12 @@ export function promptBlock(now = Date.now()): string {
   const parts: string[] = [];
   const life = lifeLine({ ...d.state, sleep: stageFor(now) }, now);
   if (life) parts.push(`【你现在的状态】${life}`);
+  const mood = moodLine(d.affect, now);
+  if (mood) parts.push(`【你的情绪】${mood}`);
+  const tone = toneLine(d.favor, currentMood(d.affect, now).value);
+  if (tone) parts.push(`【语气】${tone}`);
+  const fav = favorLine(d.favor);
+  if (fav) parts.push(`【关系】${fav}`);
   const p = planForPrompt(plan(now), now);
   if (p) parts.push(`【你今天在做的事】\n${p}`);
   const ann = upcomingAnniversaries(d.firstMetAt, now, 7);
@@ -210,4 +287,10 @@ export const lifeRuntime = {
   snapshot,
   markDelivered,
   noteUserMessage,
+  setPersona,
+  recordAffect,
+  /** 当前心情值（-1~1），只给内部过滤用，不进 UI */
+  promptMood: (now = Date.now()) => currentMood(load(now).affect, now).value,
+  /** 正在气头上：问候要走"短、冲、不主动开新话题"分支 */
+  upset: (now = Date.now()) => isUpset(load(now).affect, now),
 };

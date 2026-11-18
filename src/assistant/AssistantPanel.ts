@@ -1,4 +1,5 @@
 import { lifeRuntime } from "./lifeRuntime";
+import { filterMentionable } from "./mentionScore";
 import { invoke } from "@tauri-apps/api/core";
 import { readingHoldMs } from "../ui/bubbleTiming";
 import { chatStream, extractCommand, stripCommand, PROVIDERS, isProviderReady, type ChatMessage, type ToolCall, type MemoryEntry, type MemoryStore } from "./AssistantClient";
@@ -2276,6 +2277,8 @@ async function send(text: string) {
     while (budget.nextRound()) {
       if (budget.rounds > 1) setBubbleText(loading, "");
       // token 优化：记忆按场景/话题召回（≤6 条），而非全量注入 system prompt
+      // 生活上下文（状态/情绪/关系/在做的事）：只在有内容时拼，避免每条请求都变长
+      const lifeCtx = lifeRuntime.promptBlock(Date.now());
       const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
       const personaWithLang = s.assistant.persona;
@@ -2291,6 +2294,7 @@ async function send(text: string) {
       const expiredNote = expiredTaskNote(history, Date.now());
       const extraCtxWithLang =
         buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") +
+        (lifeCtx ? "\n\n" + lifeCtx : "") +
         "\n\n" + imageCtx + "\n\n" + recentImageBlock() +
         (autoScreenAttached ? "\n\n" + AUTO_SCREEN_NOTE : "") +
         (expiredNote ? "\n\n" + expiredNote : "") +
@@ -3267,6 +3271,20 @@ export function sayPetLine(text: string, holdMs = 6000): void {
   scheduleFade(b, holdMs);
 }
 
+/**
+ * 问候用的生活上下文：状态 + 情绪 + 关系 + 在做的事。
+ * 正在气头上时追加一条硬约束——这是我们定的"度"：
+ * 照常开口，但短、冲、不主动开新话题，不玩消失。
+ */
+function greetingLifeBlock(): string {
+  const now = Date.now();
+  const parts = [lifeRuntime.promptBlock(now)];
+  if (lifeRuntime.upset(now)) {
+    parts.push("【现在的态度】你还在生气：这次问候要短、可以带刺，不要主动开新话题、不要装作没事；被问到就直说在气什么。");
+  }
+  return parts.filter(Boolean).join("\n\n");
+}
+
 export async function triggerProactive(): Promise<boolean> {
   // 已经在回复 / 用户正开着对话框聊天：取消本次问候（用户要求：正在聊天时不插话）
   if (busy || isUserConversationActive()) return false;
@@ -3321,7 +3339,13 @@ export async function triggerProactive(): Promise<boolean> {
 
   // 召回相关记忆（桌宠自己的窗口不当作"主人在用的软件"）
   const currentApp = rawWindow && !isOwnWindow(rawWindow) ? appNameFromTitle(rawWindow) : "";
-  const relevantMemories = recallRelevantMemories({ timeOfDay, currentApp, currentTitle: rawWindow });
+  const recallRaw = recallRelevantMemories({ timeOfDay, currentApp, currentTitle: rawWindow });
+  // 记忆按时间分类过滤：上午的"正在上网课"到了晚上就不该再提（现场情境已过期），
+  // 太久远的小事也不再翻出来——这正是"提不提"的判断，见 mentionScore.ts
+  const relevantMemories = filterMentionable(
+    recallRaw.map((m) => ({ ...m, at: m.createdAt })),
+    { now: Date.now(), mood: lifeRuntime.promptMood() },
+  );
 
   const memoryBlock = relevantMemories.length > 0
     ? "\n关于用户的记忆：\n" + relevantMemories.map(m => `- [${m.category}] ${m.content}`).join("\n")
@@ -3339,7 +3363,7 @@ export async function triggerProactive(): Promise<boolean> {
   const previous = previousUnansweredGreeting(greetLog, Date.now());
   const todayTopics = recentGreetingTopics(greetLog, Date.now(), 3);
   const prompt = buildGreetingPrompt({
-    lifeBlock: lifeRuntime.promptBlock(Date.now()),
+    lifeBlock: greetingLifeBlock(),
     timeStr,
     dayOfWeek,
     windowInfo,

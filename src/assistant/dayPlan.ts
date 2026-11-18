@@ -7,6 +7,8 @@
  * 不需要联网、不需要额外模型调用，也不进任何用户可见的配置项。
  */
 
+import { NEUTRAL_FRAGMENTS, TRAIT_FRAGMENTS, type RoutineTrait } from "./personaRoutine";
+
 export interface PlanItem {
   /** 当天的分钟数（例如 8:30 → 510） */
   at: number;
@@ -73,10 +75,22 @@ export function dayKey(d: Date | number = new Date()): string {
   return `${t.getFullYear()}-${m}-${day}`;
 }
 
-/** 生成某一天的节目单：每个时段按日期哈希各挑一条 */
-export function buildDayPlan(dateKey: string): PlanItem[] {
+/**
+ * 生成某一天的节目单：每个时段按日期哈希各挑一条。
+ *
+ * @param traits 人设特征（见 personaRoutine.detectTraits）。传了就把该特征的
+ *               生活片段并进候选池——大肥鱼会躺床吃零食，健身人设会去跑步，
+ *               同一套机制长在谁身上就过谁的日子。不传则用中性池。
+ */
+export function buildDayPlan(dateKey: string, traits: RoutineTrait[] = []): PlanItem[] {
+  const traitFragments = traits.flatMap((t) => TRAIT_FRAGMENTS[t] ?? []);
   return SLOTS.map((slot, i) => {
-    const pick = slot.pool[hash(`${dateKey}#${i}`) % slot.pool.length];
+    const base = slot.pool.length ? slot.pool : NEUTRAL_FRAGMENTS;
+    // 有特征时，池子里一半是"这个人"的片段，一半是通用的日常
+    const pool = traitFragments.length
+      ? [...traitFragments, ...base]
+      : [...base, ...NEUTRAL_FRAGMENTS];
+    const pick = pool[hash(`${dateKey}#${i}`) % pool.length];
     return { at: slot.at, title: pick.title, line: pick.line };
   });
 }

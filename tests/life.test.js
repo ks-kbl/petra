@@ -10,6 +10,10 @@ const gateMod = require("./build/assistant/proactiveGate.js");
 const loopMod = require("./build/assistant/openLoopReview.js");
 const habitMod = require("./build/assistant/speechHabits.js");
 const runtime = require("./build/assistant/lifeRuntime.js");
+const affect = require("./build/assistant/affect.js");
+const favorMod = require("./build/assistant/favor.js");
+const mention = require("./build/assistant/mentionScore.js");
+const persona = require("./build/assistant/personaRoutine.js");
 
 let fail = 0;
 const check = (name, cond, extra = "") => {
@@ -133,6 +137,83 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   runtime.lifeRuntime.markDelivered("你吃饭了吗？", at(12));
   const snap = runtime.lifeRuntime.snapshot(at(12));
   check("★ 快照只有文字字段", Object.values(snap).every((v) => typeof v === "string"), JSON.stringify(snap));
+}
+
+// ---------- 情绪事件：有原因、有半衰期、会衰减 ----------
+{
+  const now = at(14, 20);
+  const e = { id: "a1", kind: "hurt", reason: "被叫胖", intensity: -0.8, startedAt: now, halfLifeMin: 90 };
+  let events = affect.addEvent([], e, now);
+  check("★ 情绪事件带着原因", events.length === 1 && events[0].reason === "被叫胖");
+  check("刚发生时强度最高", Math.abs(affect.decayedIntensity(events[0], now) + 0.8) < 1e-6);
+  const afterHalf = affect.decayedIntensity(events[0], now + 90 * 60000);
+  check("★ 一个半衰期后只剩一半", Math.abs(afterHalf + 0.4) < 0.02, afterHalf.toFixed(2));
+  const m1 = affect.currentMood(events, now);
+  check("★ 气头上心情是负的", m1.value < -0.5 && m1.dominant.reason === "被叫胖");
+  const m2 = affect.currentMood(events, now + 4 * 3600 * 1000);
+  check("★ 四小时后气基本消了", Math.abs(m2.value) < 0.15, m2.value.toFixed(2));
+  check("★ 生气时会给出「短、冲、不开新话题」的约束", /短|冲|不要主动开新话题/.test(affect.moodLine(events, now)));
+  check("没情绪时不产生提示", affect.moodLine([], now) === "");
+
+  // 同一原因重复触发是刷新时间，不是叠强度
+  const twice = affect.addEvent(events, { ...e, id: "a2", startedAt: now + 60000 }, now + 60000);
+  check("★ 同一原因不叠加强度", twice.length === 1, String(twice.length));
+
+  // 超过 24 小时自动作废
+  check("★ 情绪最多挂 24 小时", affect.pruneEvents(events, now + 25 * 3600 * 1000).length === 0);
+
+  // 哄一句：半衰期打折
+  const softened = affect.soften(events, 0.5);
+  check("★ 被哄之后气消得更快", softened[0].halfLifeMin === 45, String(softened[0].halfLifeMin));
+  check("认出道歉", affect.looksLikeApology("对不起嘛，别生气了"));
+  check("普通话不算道歉", !affect.looksLikeApology("今天天气不错"));
+  check("★ 认出伤人的话", affect.insultStrength("你是不是胖了") > 0.5);
+  check("玩笑话强度低", affect.insultStrength("你是不是傻") < 0.5 && affect.insultStrength("你是不是傻") > 0);
+}
+
+// ---------- 好感度：长期账户 ----------
+{
+  const f0 = favorMod.defaultFavor(at(9));
+  const up = favorMod.applyAffect(f0, 0.8, at(10));
+  const down = favorMod.applyAffect(f0, -0.8, at(10));
+  check("★ 好事涨好感、坏事掉好感", up.score > f0.score && down.score < f0.score);
+  check("★ 单次变化有上限（一次吵架不会清零）", Math.abs(down.score - f0.score) <= 0.13, down.score.toFixed(3));
+  const back = favorMod.decay({ score: 0.9, updatedAt: 0 }, at(9) + 30 * 86400000);
+  check("★ 长期会向中间值回落", back.score < 0.9 && back.score > 0.5, back.score.toFixed(2));
+  check("很亲近时有对应说法", /亲近|黏/.test(favorMod.favorLine({ score: 0.9, updatedAt: 0 })));
+  check("★ 心情差 + 关系好 = 凶两句再找台阶", /台阶/.test(favorMod.toneLine({ score: 0.8, updatedAt: 0 }, -0.6)));
+  check("★ 心情差 + 关系远 = 冷", /冷/.test(favorMod.toneLine({ score: 0.2, updatedAt: 0 }, -0.6)));
+}
+
+// ---------- 记忆该不该提 ----------
+{
+  const now = at(21, 0);
+  const situational = { content: "用户正在上化学网课", category: "event", at: at(10, 0) };
+  const fresh = { content: "用户正在上化学网课", category: "event", at: now - 10 * 60000 };
+  check("★ 上午的「正在上网课」晚上不提", !mention.scoreMention(situational, { now }).should);
+  check("★ 十分钟前的现场情况可以提", mention.scoreMention(fresh, { now }).should);
+  const milestone = { content: "第一次一起熬夜", category: "event", at: at(0, 0, 1) };
+  check("★ 里程碑不过期", mention.scoreMention(milestone, { now }).should);
+  const oldSmall = { content: "用户提过一句喜欢这首歌", category: "preference", at: now - 200 * 86400000 };
+  check("★ 太久远的小事降权", mention.scoreMention(oldSmall, { now }).score < 0.18);
+  const happyOld = { content: "用户那天笑得很开心", category: "event", at: now - 3600000 };
+  check("★ 气头上不翻开心旧事", mention.scoreMention(happyOld, { now, mood: -0.6 }).score
+    < mention.scoreMention(happyOld, { now, mood: 0 }).score);
+  check("过滤后保持原顺序", mention.filterMentionable([fresh, situational], { now }).length === 1);
+}
+
+// ---------- 人设决定过什么日子 ----------
+{
+  const fish = persona.detectTraits("赛博女仆鲸鱼娘，贱兮兮，爱吃，摸鱼专业户，自称本鱼");
+  check("★ 从大肥鱼人设识别出「爱吃」「摸鱼」", fish.includes("food") && fish.includes("lazy"), JSON.stringify(fish));
+  const coach = persona.detectTraits("健身教练，每天跑步锻炼，性格严厉");
+  check("★ 另一种人设识别出「运动」", coach.includes("sport"), JSON.stringify(coach));
+  const planFish = planMod.buildDayPlan("2026-11-18", fish);
+  const planNeutral = planMod.buildDayPlan("2026-11-18", []);
+  const fishText = planFish.map((p) => p.title).join("|");
+  check("★ 大肥鱼的日子里有吃/躺/摸鱼", /吃|奶茶|躺|赖床|吃|饿/.test(fishText), fishText);
+  check("★ 同一天、不同人设，日子不一样", JSON.stringify(planFish) !== JSON.stringify(planNeutral));
+  check("没人设时也能生成", planNeutral.length === 6);
 }
 
 console.log(`life: fail=${fail}`);
