@@ -681,6 +681,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { path: "assistant.model", label: "模型", type: "text", placeholder: "留空则使用供应商默认模型" },
             { path: "assistant.customBaseUrl", label: "自定义接口地址", type: "text", placeholder: "仅选择自定义供应商时填写" },
             { type: "actions", items: [{ id: "__data:models-fetch", label: "获取模型列表", passKey: true }] },
+            { type: "apihelp" },
             { type: "secret", key: "assistant", label: "API Key", desc: "填写时不会显示，填写后覆盖当前预设设置" },
             { type: "usage" },
           ],
@@ -995,6 +996,15 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (spec.thanks) {
         wrap.appendChild(el("div", "vid-thanks", spec.thanks));
       }
+      return wrap;
+    }
+    if (spec.type === "apihelp") {
+      // 解释「API 是什么、怎么接」——收在一个按钮里，不占版面
+      const wrap = el("div", "tut-entry");
+      const b = el("button", "btn btn-sm", "API 是什么？我该怎么填？");
+      b.onclick = () => showApiHelp();
+      wrap.appendChild(b);
+      wrap.appendChild(el("div", "vid-note", "第一次接、或者不知道该填哪个，点上面这个。"));
       return wrap;
     }
     if (spec.type === "note") {
@@ -2037,6 +2047,63 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     const ok = el("button", "btn btn-primary btn-sm", okText);
     ok.onclick = () => { mask.remove(); };
     box.appendChild(ok);
+    mask.appendChild(box);
+    mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
+    document.body.appendChild(mask);
+  }
+
+  /**
+   * 「API 是什么、怎么接」的接入指南。
+   *
+   * 为什么做成弹层而不是卡片正文：这东西第一次接的人需要看，接完就再也不会看，
+   * 常驻在页面上只会挤占真正的设置项。收进一个按钮里，需要时才展开。
+   *
+   * 内容按"完全不懂的人"的顺序排：是什么 → 三种来源怎么选 → 三步操作 → 常见坑。
+   */
+  function showApiHelp() {
+    const mask = el("div", "modal-mask");
+    const box = el("div", "modal-box");
+    box.style.maxWidth = "560px";
+    box.style.maxHeight = "78vh";
+    box.style.overflowY = "auto";
+    box.appendChild(el("div", "modal-title", "API 是什么？怎么接？"));
+
+    const add = (title, text) => {
+      const h = el("div", "modal-line");
+      h.style.fontWeight = "600";
+      h.style.marginTop = "6px";
+      h.textContent = title;
+      box.appendChild(h);
+      const p = el("div", "modal-line");
+      p.innerHTML = text;
+      box.appendChild(p);
+    };
+
+    add("一句话", "模型 API 就是一张「按次计费的门禁卡」：你带着这张卡去敲厂商的服务器，它才让你用它的模型说话。卡就是 <b>API Key</b>，门牌号就是 <b>接口地址（端点）</b>。");
+    add("三种来源，按情况选", [
+      "· <b>官方直连</b>：DeepSeek、智谱、通义这些自家平台。稳定、文档清楚，缺点是得自己注册、自己充钱。",
+      "· <b>中转站</b>：一个 Key 能用很多家模型（包括国外的），便宜、不用翻墙。缺点是质量参差，跑路的风险自己判断。",
+      "· <b>本地模型</b>（Ollama 等）：完全免费、断网也能用，缺点是要显卡、效果通常不如云端。",
+      "不确定就先试官方直连——最不容易踩坑。",
+    ].join("<br>"));
+    add("三步走", [
+      "1. <b>去拿 Key</b>：注册后在后台找到「API Key / 密钥」，复制那一串 sk- 开头的字符。",
+      "2. <b>选供应商</b>：上面选好对应的厂商（中转站选「自定义」，把它的地址填进「自定义接口地址」，一般以 <b>/v1</b> 结尾）。",
+      "3. <b>粘 Key → 点「获取模型列表」→ 选一个模型 → 保存</b>。模型名留空也可以，会用该供应商的默认模型。",
+    ].join("<br>"));
+    add("几个一定会遇到的坑", [
+      "· 地址要不要带 <b>/v1</b>：OpenAI 兼容接口一般都带。填错会报 404 或直接连不上。",
+      "· <b>Key 存在哪</b>：只存在本机、打码显示，不写日志、不进对话历史。换电脑要重新填。",
+      "· <b>400 报错</b>：先看模型名对不对（有的中转站要带前缀），再看到底填没填错地址。",
+      "· <b>模型不支持图片</b>：你说「看这个」时如果模型没有视觉能力，会自动去掉图片继续回你，不会整轮失败。",
+    ].join("<br>"));
+    add("接完怎么确认能用", "随便发一句「在吗」。能回就通了；报错的话把提示里的状态码发到反馈里，群里能看进度。");
+
+    const btns = el("div", "btn-row");
+    const ok = el("button", "btn btn-primary btn-sm", "知道了");
+    ok.onclick = () => mask.remove();
+    btns.appendChild(ok);
+    box.appendChild(btns);
     mask.appendChild(box);
     mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
     document.body.appendChild(mask);
