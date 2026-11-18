@@ -300,6 +300,13 @@ class TTSPlayer {
    * 前者是"她今天的状态"，后者是"这句话的语气"。
    */
   private moodTone = { rate: 0, pitch: 0, volume: 1 };
+  /**
+   * 语气处理（拖音/短叹词/低通）总开关。
+   *
+   * 只给"对照试听"用：用户听到电音时，可以一键关掉它再听一遍，
+   * 立刻判断电音是处理带来的还是端点给的音频本身就脏。正式流程永远开着。
+   */
+  private prosodyEnabled = true;
   /** 多轮上下文 id：同一段回复共用，让几句之间的语气连贯 */
   private sectionId = "";
   /** 这条回复已经送出去几段：决定下一段攒多长（见 speechLimits） */
@@ -391,6 +398,12 @@ class TTSPlayer {
     };
     if (this.masterGain) this.masterGain.gain.value = this.muted ? 0 : this.moodTone.volume;
     if (this.current) this.current.volume = this.muted ? 0 : this.moodTone.volume;
+  }
+
+  /** 对照试听用：临时关掉/打开语气处理 */
+  setProsodyEnabled(on: boolean) {
+    this.prosodyEnabled = on;
+    this.prosodyLog(`prosody ${on ? "on" : "off"}`);
   }
 
   setEmotion(tag: string) {
@@ -589,6 +602,7 @@ class TTSPlayer {
     const gen = item.gen;
     try {
       const { text: speakText, tone } = this.buildTone(item.text, item.context);
+      this.prosodyLog(`tone=${tone ? `rate:${tone.speechRate ?? 0},pitch:${tone.pitch ?? 0}` : "none"} text=${String(speakText).slice(0, 10)}`);
       // 排障用：把真正送进合成的文本打出来（下次"念出奇怪东西"能直接看到原文）
       if (typeof location !== "undefined" && (location.hostname === "127.0.0.1" || location.hostname === "localhost")) {
         console.debug("[TTS] 送合成：", speakText, tone ?? "(无语气参数)");
@@ -690,6 +704,7 @@ class TTSPlayer {
     const d = item.decoded;
     const ctx = this.ctx;
     const head = item.text.slice(0, 12);
+    if (!this.prosodyEnabled) { this.prosodyLog(`skip(disabled) text=${head}`); return; }
     if (!d || !ctx) { this.prosodyLog(`skip(no-audio) text=${head}`); return; }
     const sr = d.buffer.sampleRate;
     const chans: Float32Array[] = [];

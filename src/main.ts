@@ -3911,6 +3911,8 @@ function buildPanelMeta() {
       nextAt: nextGreetingDueAt(lastGreetAt, settings.assistant.greetInterval, Date.now(), 0),
       timerArmed: greetTimer !== null,
     },
+    // 她自己的生活状态（只有文字，没有数值）：面板「自检」卡里只读展示
+    life: lifeRuntime.snapshot(),
     platform: PLATFORM === "win" ? "Windows" : PLATFORM === "mac" ? "macOS" : "Linux",
     model: currentModel.name || currentModel.type,
     providers: Object.entries(PROVIDERS).map(([id, p]) => ({ id, label: p.label, model: p.defaultModel })),
@@ -4476,6 +4478,24 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
         panelAssistantModels = [];
         await pushPanelState();
         toast("已填好合作中转站的端点，接下来粘贴 Key、再点「获取模型列表」");
+        break;
+      }
+      case "tts-probe": {
+        // 语气自检：把某一句按"带处理/不带处理"念一遍，用来判断电音是不是处理带来的
+        const text = String(p.text ?? "").trim();
+        const prosody = p.prosody !== false;
+        if (!text) break;
+        if (!settings.tts.enabled) { toast("先开启语音输出再试听", "info"); break; }
+        const key = await invoke<string>("get_tts_key").catch(() => "");
+        if (!String(settings.tts.speakerId ?? "").trim()) {
+          toast("还没填「音色 ID」：控制面板 → 语音 → 音色 ID", "warn");
+          break;
+        }
+        ttsPlayer.setConfig(true, key, settings.tts.speakerId, settings.assistant.outputLanguage ?? "");
+        ttsPlayer.setProsodyEnabled(prosody);
+        ttsPlayer.setMoodTone({ rate: 0, pitch: 0, volume: 1 });
+        ttsPlayer.speakTest(text);
+        toast(prosody ? "正在试听（带语气处理）" : "正在试听（已关掉语气处理，用作对照）", "info");
         break;
       }
       case "check-update":
