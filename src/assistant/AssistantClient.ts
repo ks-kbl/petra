@@ -38,6 +38,14 @@ const RETRY_DELAYS_MS = [600, 1800];
  * 第一次 400 后自动降级为纯文本请求，后续直接按兼容模式发，避免每条消息都失败一次。
  */
 const NO_TOOLS_ENDPOINTS = new Set<string>();
+/**
+ * 已确认「不接受图片输入」的端点（base||model）。
+ *
+ * 用户切到纯文本模型（deepseek-chat、各种本地小模型）后，看屏幕/贴图会让整条请求
+ * 直接 400「Unsupported image_url format」，连问题本身都答不了。降级过一次就记住，
+ * 之后不再往这条端点塞图片，省掉每次都先失败一轮。
+ */
+const NO_VISION_ENDPOINTS = new Set<string>();
 
 export function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
@@ -191,6 +199,19 @@ export function shouldRetryWithoutTools(status: number, body: string): boolean {
   return t.length < 80 || /bad request|invalid request|参数|不支持/i.test(t);
 }
 
+/**
+ * 图片被端点拒绝：这张图不该让整轮对话失败，剥掉图片再试一次。
+ *
+ * 触发条件是"报错里提到了图片/多模态"，或者干脆是那种没细节的 400——
+ * 后者也值得试一次，因为纯文本模型回的就是一句笼统的 Bad Request。
+ */
+export function shouldRetryWithoutImages(status: number, body: string): boolean {
+  if (![400, 422].includes(status)) return false;
+  const t = (body || "").toLowerCase();
+  if (/image|vision|multimodal|modality|图片|图像|多模态/.test(t)) return true;
+  return t.length < 80 || /bad request|invalid request|参数/i.test(t);
+}
+
 /** 个别兼容端点不接受 stream=true（或只支持非流式）。识别这类报错后降级重试 */
 export function shouldRetryNonStream(status: number, body: string): boolean {
   if (![400, 422].includes(status)) return false;
@@ -291,6 +312,7 @@ const BASE_PROMPT =
   "【联网】只在这几种情况下搜：新闻时事、版本号、价格行情、赛事比分、人物近况、政策法规、你不确定的具体事实。搜之前先想清楚**用户在问的那个具体东西**是什么，查询词要「主体＋具体点」（例：问「黄老板是不是下岗了」就搜「黄仁勋 卸任 英伟达 CEO」，不要搜「英伟达 显卡 价格」）。一次没搜到就换一个更短更准的说法再试，最多两次，还不行就如实说没查到，不要硬编、也不要换着花样反复搜。搜到结果用自己的话转述，别念整段摘要。纯闲聊、情绪、算数、常识、写代码这类不需要搜，直接答。\n" +
   "【记忆】用户透露偏好/习惯/情绪就调用 remember；同一件事有新进展就用同主题再记一次（会覆盖旧的），用户纠正你时一定要记对的那条。记住是为了把话接得更准，不要拿出来炫耀「我记得」。\n" +
   "【旧任务】对话历史里几天前的计时、提醒、待办、约定默认已经结束或过期；除非用户明确问起，否则不要把它们当成当前正在做的事，也不要主动复述。\n" +
+  "【口语】你是被人**听见**的，不是在写字：允许偶尔用语气词开头——「嗯……」「哦」「唉」「那个……」——表达犹豫、思考、撒娇。真犹豫的时候就把「嗯……」拖长一点再往下说；生气、嫌弃、不服气的时候，可以单独来一声「哼」或「切」；没听清、觉得奇怪、好奇的时候用「诶？」「啊？」「嗯？」这种上挑的问法；恍然大悟就用「哦！」。**语气靠标点表达**：问号是往上挑，省略号是拖着想，感叹号是忽然一下——别把这几样混着写。但一两句里最多出现一次，别每句都加，也别用它凑字数。\n" +
   "不要主动提工具能力，不要说\"作为AI\"之类的话。";
 
 const TOOLS = [
@@ -894,6 +916,22 @@ export function toWireMessages(
  *
  * 没有截图 / 历史里没有 user 消息时原样返回。
  */
+/** 图发不出去时贴给模型的说明：必须让它承认看不到，而不是猜 */
+const IMAGE_UNAVAILABLE_NOTE =
+  "【系统】本轮用户发了图片，但当前模型不支持图片输入，图片没有发送（不要假装看到了画面；" +
+  "如果你需要画面信息，请让用户用文字描述，或换一个支持看图的模型）。";
+
+/** 把一段说明贴到最后一条 user 消息上（纯文本，不改变多模态结构） */
+function attachTextNote(messages: ChatMessage[], note: string): unknown {
+  if (!note) return messages;
+  let idx = -1;
+  for (let n = messages.length - 1; n >= 0; n--) {
+    if (messages[n].role === "user") { idx = n; break; }
+  }
+  if (idx < 0) return messages;
+  return messages.map((m, n) => (n === idx ? { ...m, content: `${m.content ?? ""}\n\n${note}` } : m));
+}
+
 function attachScreenImage(messages: ChatMessage[], images?: string[] | string): unknown {
   const list = Array.isArray(images) ? images.filter(Boolean) : images ? [images] : [];
   if (!list.length) return messages;
@@ -1123,6 +1161,9 @@ export async function chatStream(
   const compatKey = `${base}||${m}`;
   let useTools = enableTools && !NO_TOOLS_ENDPOINTS.has(compatKey);
   let useStream = true;
+  /** 本轮要发的图片（截图/用户贴图）；端点已知不吃图时直接不发 */
+  const wantImages = Boolean(requestOptions.screenImage) || Boolean(requestOptions.userImages?.length);
+  let useImages = wantImages && !NO_VISION_ENDPOINTS.has(compatKey);
 
   const bodyFor = (toolsOn: boolean, streamOn: boolean): string => {
     const messages = toWireMessages(
@@ -1132,10 +1173,15 @@ export async function chatStream(
     );
     return JSON.stringify({
       model: m,
-      messages: attachScreenImage(
-        messages,
-        [...(requestOptions.screenImage ? [requestOptions.screenImage] : []), ...(requestOptions.userImages ?? [])],
-      ),
+      messages: useImages
+        ? attachScreenImage(
+            messages,
+            [...(requestOptions.screenImage ? [requestOptions.screenImage] : []), ...(requestOptions.userImages ?? [])],
+          )
+        // 本轮本来要发图、但被剥掉了，才需要说明；没图可发时保持原样不动
+        : wantImages
+          ? attachTextNote(messages, IMAGE_UNAVAILABLE_NOTE)
+          : messages,
       // 不支持工具的端点（不少本地模型/中转站/推理模型）一旦带上 tools 就会 400；
       // 降级后这里自动不带，历史里的 tool_calls 也由 stripToolData 清掉。
       ...(toolsOn && toolDefs.length ? { tools: toolDefs } : {}),
@@ -1221,6 +1267,11 @@ export async function chatStream(
       res = attemptRes;
       break;
     }
+    // 0) 图片不被支持 → 剥掉图片再来一次（纯文本模型/中转站的常见情况）
+    if (useImages && shouldRetryWithoutImages(lastStatus, errText)) {
+      useImages = false;
+      continue;
+    }
     // 1) 工具字段不被支持 → 去掉 tools / tool 历史再试。
     // 先不写入 NO_TOOLS_ENDPOINTS：只有这次降级真的成功才记住，
     // 免得把"模型名写错 / 参数问题"的 400 也当成端点不支持工具而永久禁用。
@@ -1252,6 +1303,8 @@ export async function chatStream(
   }
   // 只有"带 tools 失败、去掉 tools 后成功"才把端点记为不支持工具
   if (enableTools && !useTools) NO_TOOLS_ENDPOINTS.add(compatKey);
+  // 只有"带图失败、去图成功"才记住这个端点不吃图
+  if (wantImages && !useImages) NO_VISION_ENDPOINTS.add(compatKey);
 
   const finalMessages = useTools ? baseMessages : stripToolData(baseMessages);
   const inputTokens = estimateTokens(JSON.stringify(finalMessages))

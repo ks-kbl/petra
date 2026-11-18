@@ -208,6 +208,40 @@ const json = (obj, status = 200) =>
     global.fetch = originalFetch;
   }
 
+  // ---- 5) 图片不被支持：剥掉图片再试，并把"看不到"告诉模型 ----
+  {
+    // 纯函数：识别哪些 400 值得去图重试
+    check("★ 报错提到 image_url → 去图重试", ac.shouldRetryWithoutImages(400, '{"error":{"message":".messages[102].content[1]: Unsupported image_url format"}}'));
+    check("★ 笼统的 Bad Request 也试一次", ac.shouldRetryWithoutImages(400, "Bad Request"));
+    check("401/429 不重试", !ac.shouldRetryWithoutImages(401, "image_url") && !ac.shouldRetryWithoutImages(429, "image_url"));
+
+    const bodies = [];
+    global.fetch = async (_url, init) => {
+      const body = JSON.parse(init.body);
+      bodies.push(body);
+      const hasImage = JSON.stringify(body.messages).includes("image_url");
+      if (hasImage) {
+        return new Response(
+          JSON.stringify({ error: { message: ".messages[3].content[1]: Unsupported image_url format" } }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "看不到图，但话我收到了" } }] })}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    };
+    const res = await ac.chatStream(
+      "custom", "k", "text-only-model", [{ role: "user", content: "这个截图里写了啥" }],
+      "人设", [], "https://no-vision.example.com", () => {}, false,
+      "", "",
+      { screenImage: "data:image/png;base64,AAAA" },
+    );
+    check("★ 带图 400 后自动去图重试并成功", res.text.includes("看不到图"), res.text);
+    check("★ 第一次请求带图、第二次不带", bodies.length === 2 && JSON.stringify(bodies[0]).includes("image_url") && !JSON.stringify(bodies[1]).includes("image_url"), `bodies=${bodies.length}`);
+    check("★ 去图时明确告诉模型看不到画面", JSON.stringify(bodies[1]).includes("不支持图片输入"), "");
+  }
+
   console.log("assistant-compat: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);
   process.exit(fail ? 1 : 0);
 })().catch((e) => {

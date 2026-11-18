@@ -3485,7 +3485,9 @@ function buildMenu(engine: BehaviorEngine, opts?: { ignoreIdle?: boolean }): Men
         };
         // 试听也要带上语气设置：用户想验的正是"增强语气到底有没有效果"
         ttsPlayer.setEmotion("happy");
-        ttsPlayer.pushDelta(testText[lang] ?? "你好，语音测试成功，今天也要开心一点哦。");
+        // 中文试听句特意覆盖三种语气处理：拖音（嗯……）、上挑（诶？）、下压（哼），
+        // 用户点一次就能听全，也方便对比"改了到底有没有效果"
+        ttsPlayer.pushDelta(testText[lang] ?? "嗯……这个我得先想想。诶？你刚才说什么？哼，我才不信呢。");
         ttsPlayer.flush();
       },
     },
