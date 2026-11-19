@@ -334,5 +334,30 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("音量不会被压到听不见", voice.voiceToneFor({ mood: -1, energy: 0.05, sleep: "asleep" }).volume >= 0.8);
 }
 
+// ---------- 滑动窗口：上午别刷屏、下午不要哑火 ----------
+{
+  const now = Date.parse("2026-11-19T14:00:00");
+  const mk = (backMin) => ({ ...({}), now: now - backMin * 60000 });
+  const base = {
+    lastDeliveryAt: 0, deliveredToday: 2, dailyLimit: 24, cooldownMs: 20 * 60000,
+    userBusy: false, idleSeconds: 10, idleMode: false, now,
+  };
+  // 90 分钟内说过一次 → 先别说
+  const short = gateMod.evaluateGate({ ...base, recentDeliveries: [now - 40 * 60000] });
+  check("★ 90 分钟内已经说过就不再开口", !short.allowed && /90 分钟/.test(short.reason), short.reason);
+  // 6 小时内已经 4 次 → 先别说
+  const long = gateMod.evaluateGate({
+    ...base, lastDeliveryAt: now - 100 * 60000,
+    recentDeliveries: [100, 180, 260, 340].map((m) => now - m * 60000),
+  });
+  check("★ 6 小时内 4 次就压住", !long.allowed && /有点多/.test(long.reason), long.reason);
+  // 上一个窗口都过期了 → 应该放行（不能像日额度那样"用完就整天哑火"）
+  const ok = gateMod.evaluateGate({
+    ...base, lastDeliveryAt: now - 200 * 60000,
+    recentDeliveries: [200, 260].map((m) => now - m * 60000),
+  });
+  check("★ 窗口过期后恢复正常（不会一下午哑火）", ok.allowed, JSON.stringify(ok));
+}
+
 console.log(`life: fail=${fail}`);
 process.exit(fail ? 1 : 0);

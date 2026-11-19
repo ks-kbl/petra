@@ -13,6 +13,14 @@ export interface GateInput {
   lastDeliveryAt: number;
   /** 今天已经主动发了几次 */
   deliveredToday: number;
+  /**
+   * 最近的投递时刻（ms，任意顺序，函数内部自己算窗口）。
+   *
+   * 为什么不用"每天 N 次"：默认间隔 20 分钟时，一天能说 40 多次，
+   * 用一个日额度（比如 8 次）会在上午就把额度用完，然后**一下午一句话都没有**——
+   * 用户看到的就是"定时问候坏了"。改成滑动窗口：短时间内别刷屏，长时段内保持存在感。
+   */
+  recentDeliveries?: number[];
   /** 今天最多几次 */
   dailyLimit: number;
   /** 两次之间的最小间隔（ms） */
@@ -56,12 +64,31 @@ export function nextQuietEnd(now: number): number {
   return d.getTime() + 15 * 60 * 1000;
 }
 
+/** 短窗口：90 分钟内最多一次 */
+export const SHORT_WINDOW_MS = 90 * 60 * 1000;
+/** 长窗口：6 小时内最多 4 次 */
+export const LONG_WINDOW_MS = 6 * 60 * 60 * 1000;
+export const LONG_WINDOW_LIMIT = 4;
+
 export function evaluateGate(i: GateInput): GateResult {
   if (i.idleMode) return { allowed: false, reason: "待机模式", retryInMs: 60_000 };
   if (i.userBusy) return { allowed: false, reason: "用户正在聊天", retryInMs: 60_000 };
   if (inQuietHours(i.now)) return { allowed: false, reason: "免打扰时段", retryInMs: Math.max(60_000, nextQuietEnd(i.now) - i.now) };
   if (i.idleSeconds > 300) return { allowed: false, reason: "用户不在", retryInMs: 120_000 };
-  if (i.deliveredToday >= i.dailyLimit) return { allowed: false, reason: "今日额度已用完", retryInMs: 30 * 60_000 };
+  const recent = (i.recentDeliveries ?? []).filter((t) => Number.isFinite(t) && t <= i.now);
+  // ① 短窗口：90 分钟内最多 1 次（比"间隔"更宽，但能挡住连发）
+  const inShort = recent.filter((t) => i.now - t < SHORT_WINDOW_MS);
+  if (inShort.length >= 1) {
+    return { allowed: false, reason: "90 分钟内已经说过一次", retryInMs: SHORT_WINDOW_MS - (i.now - inShort[inShort.length - 1]) };
+  }
+  // ② 长窗口：6 小时内最多 4 次（保证下午/晚上不会彻底哑火，也不会唠叨）
+  const inLong = recent.filter((t) => i.now - t < LONG_WINDOW_MS);
+  if (inLong.length >= LONG_WINDOW_LIMIT) {
+    const oldest = Math.min(...inLong);
+    return { allowed: false, reason: "6 小时内说得有点多了", retryInMs: LONG_WINDOW_MS - (i.now - oldest) };
+  }
+  // ③ 日硬顶：兜住极端情况（不算正常节奏）
+  if (i.deliveredToday >= i.dailyLimit) return { allowed: false, reason: "今日次数超上限", retryInMs: 60 * 60_000 };
   if (i.lastDeliveryAt && i.now - i.lastDeliveryAt < i.cooldownMs) {
     return { allowed: false, reason: "距上次太近", retryInMs: i.cooldownMs - (i.now - i.lastDeliveryAt) };
   }
