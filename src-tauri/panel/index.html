@@ -1002,10 +1002,11 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     if (spec.type === "apihelp") {
       // 解释「API 是什么、怎么接」——收在一个按钮里，不占版面
       const wrap = el("div", "tut-entry");
-      const b = el("button", "btn btn-sm", "API 是什么？我该怎么填？");
+      // 和其他主动作按钮一致：渐变紫底 + 白字，一眼能认出"这个可以点"
+      const b = el("button", "btn btn-sm btn-primary", "💡 API 是什么？我该怎么填？");
       b.onclick = () => showApiHelp();
       wrap.appendChild(b);
-      wrap.appendChild(el("div", "vid-note", "第一次接、或者不知道该填哪个，点上面这个。"));
+      wrap.appendChild(el("div", "vid-note", "第一次接 API，或者不知道该填哪一栏，点上面这个 —— 里面有三种来源怎么选、三步操作和常见坑。"));
       return wrap;
     }
     if (spec.type === "note") {
