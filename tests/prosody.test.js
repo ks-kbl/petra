@@ -316,5 +316,38 @@ const zeroCrossingsPerSecond = (buf, rate) => {
   check("★ 9kHz 低通保留的高频远多于 3.6kHz", cut9k > cut36 * 2, `${cut36.toFixed(3)} vs ${cut9k.toFixed(3)}`);
 }
 
+// ---------- 全表体检：每种音都要选对低通、时长、起音 ----------
+{
+  const cases = [
+    // [文本, 期望最低低通, 期望最短时长, 说明]
+    ["哼！", 4000, 0.2, "鼻音：可以压"],
+    ["呵，是吗。", 7500, 0.22, "送气冷笑：要保住 h"],
+    ["切，谁稀罕。", 8500, 0.24, "塞擦音：要保住 q"],
+    ["嘁。", 8500, 0.24, "塞擦音"],
+    ["啧。", 8500, 0.22, "塞擦音"],
+    ["呸！", 9000, 0.2, "爆破音：要保住冲音"],
+    ["噗。", 9000, 0.2, "爆破音"],
+    ["嘶——", 10000, 0.24, "擦音：全靠高频"],
+    ["嘘——", 10000, 0.24, "擦音：全靠高频"],
+    ["诶？", 6000, 0.26, "元音起头，正常低通"],
+    ["咦？", 6500, 0.26, "元音起头"],
+    ["哦！", 5500, 0.26, "元音"],
+    ["啊？", 5500, 0.24, "元音"],
+    ["哈？", 7500, 0.24, "送气：要保住 h"],
+  ];
+  for (const [text, minCut, minDur, why] of cases) {
+    const hit = sp.interjectionFor(text);
+    const name = text.replace(/[，。！？—]/g, "");
+    check(`★ ${name} 能被识别（${why}）`, !!hit, text);
+    if (!hit) continue;
+    check(`★ ${name} 低通不低于 ${minCut}`, (hit.spec.cutoff ?? 6000) >= minCut, String(hit.spec.cutoff ?? "默认6000"));
+    check(`★ ${name} 时长不短于 ${minDur}s`, hit.spec.duration >= minDur, String(hit.spec.duration));
+  }
+  // 爆破音/擦音的起音必须很冲，否则冲音被包络抹平
+  for (const t of ["呸！", "噗。", "嘶——", "嘘——"]) {
+    check(`★ ${t[0]} 的起音够冲（≤2ms）`, (sp.interjectionFor(t)?.spec.attack ?? 1) <= 0.002, String(sp.interjectionFor(t)?.spec.attack));
+  }
+}
+
 console.log(`prosody: fail=${fail}`);
 process.exit(fail ? 1 : 0);

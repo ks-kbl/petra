@@ -360,7 +360,9 @@ export function stretchFillerInChannels(
   if (mark.kind === "think") stretched = pitchDown(stretched, 0.97);
   // 拖音同样要过低通。之前只有短叹词过、拖音没过，所以"某些字还有电音"——
   // 拉伸留下的高频毛刺正好落在人耳最敏感的那一段。
-  stretched = lowpass(stretched, sampleRate);
+  // 3600 太狠：这段可能连着"嗯这个"一起被拉伸，压到 3.6k 会把后面的字也闷掉。
+  // 提到 6000 只去毛刺、不动清晰度。
+  stretched = lowpass(stretched, sampleRate, 6000);
   return {
     channels: spliceStretched(channels, span, stretched, sampleRate),
     stretched: true,
@@ -487,8 +489,9 @@ const RECIPES: Record<string, Partial<Record<Punct, InterjectionSpec>>> = {
     plain: { duration: 0.24, contour: [{ u: 0, pitch: 1.18 }, { u: 1, pitch: 0.82 }], attack: 0.004, kind: "angry", cutoff: 5000 },
   },
   // 冷笑
+  // 呵是**送气**的（h 开头），高频气流决定它听起来是"呵"还是"呃"
   "呵": {
-    plain: { duration: 0.18, contour: [{ u: 0, pitch: 1.08 }, { u: 1, pitch: 0.9 }], attack: 0.006, kind: "sneer" },
+    plain: { duration: 0.26, contour: [{ u: 0, pitch: 1.06 }, { u: 1, pitch: 0.92 }], attack: 0.004, kind: "sneer", cutoff: 8000 },
   },
   // 咂嘴式不屑
   // 切 / 嘁 / 啧 是**塞擦音**：辨识度靠那口高频气流，所以
@@ -499,6 +502,23 @@ const RECIPES: Record<string, Partial<Record<Punct, InterjectionSpec>>> = {
   },
   "嘁": {
     plain: { duration: 0.26, contour: [{ u: 0, pitch: 1.06 }, { u: 1, pitch: 0.92 }], attack: 0.004, kind: "scoff", cutoff: 9000 },
+  },
+  // 爆破音 / 嘘声：辨识度全在起音那几十毫秒的冲音上，
+  // 所以 ①起音压到 1~2ms（4ms 就够把它抹平）②低通接近关掉 ③时长不能压太短
+  "呸": {
+    plain: { duration: 0.24, contour: [{ u: 0, pitch: 1.12 }, { u: 1, pitch: 0.9 }], attack: 0.001, kind: "scoff", cutoff: 9500 },
+  },
+  "啐": {
+    plain: { duration: 0.22, contour: [{ u: 0, pitch: 1.1 }, { u: 1, pitch: 0.92 }], attack: 0.001, kind: "scoff", cutoff: 9500 },
+  },
+  "噗": {
+    plain: { duration: 0.22, contour: [{ u: 0, pitch: 1.05 }, { u: 1, pitch: 0.92 }], attack: 0.001, kind: "scoff", cutoff: 9500 },
+  },
+  "嘶": {
+    plain: { duration: 0.28, contour: [{ u: 0, pitch: 1.06 }, { u: 1, pitch: 0.96 }], attack: 0.002, kind: "scoff", cutoff: 11000 },
+  },
+  "嘘": {
+    plain: { duration: 0.3, contour: [{ u: 0, pitch: 1.04 }, { u: 1, pitch: 0.98 }], attack: 0.002, kind: "scoff", cutoff: 11000 },
   },
   "啧": {
     plain: { duration: 0.24, contour: [{ u: 0, pitch: 1.1 }, { u: 1, pitch: 0.95 }], attack: 0.003, kind: "scoff", cutoff: 9000 },
@@ -513,6 +533,14 @@ const RECIPES: Record<string, Partial<Record<Punct, InterjectionSpec>>> = {
     exclaim: { duration: 0.32, contour: [{ u: 0, pitch: 0.98 }, { u: 0.55, pitch: 1.2 }, { u: 1, pitch: 1.0 }], attack: 0.006, kind: "surprised" },
   },
   // 哦：恍然大悟是「先升后落」，追问是「往上挑」
+  // 咦（yí）是纯元音起头，跟"诶"同类，不需要特殊低通
+  "咦": {
+    question: { duration: 0.3, contour: [{ u: 0, pitch: 0.96 }, { u: 1, pitch: 1.22 }], attack: 0.008, kind: "curious", cutoff: 7000 },
+    exclaim: { duration: 0.32, contour: [{ u: 0, pitch: 0.98 }, { u: 0.55, pitch: 1.2 }, { u: 1, pitch: 1.0 }], attack: 0.006, kind: "surprised", cutoff: 7000 },
+  },
+  "哟": {
+    plain: { duration: 0.28, contour: [{ u: 0, pitch: 1.0 }, { u: 1, pitch: 1.15 }], attack: 0.006, kind: "curious", cutoff: 7000 },
+  },
   "哦": {
     exclaim: { duration: 0.3, contour: [{ u: 0, pitch: 0.94 }, { u: 0.5, pitch: 1.2 }, { u: 1, pitch: 0.98 }], attack: 0.006, kind: "realize" },
     question: { duration: 0.28, contour: [{ u: 0, pitch: 0.96 }, { u: 1, pitch: 1.2 }], attack: 0.008, kind: "curious" },
@@ -524,8 +552,8 @@ const RECIPES: Record<string, Partial<Record<Punct, InterjectionSpec>>> = {
   },
   // 哈：反问是上挑，笑一声是往下走
   "哈": {
-    question: { duration: 0.26, contour: [{ u: 0, pitch: 0.98 }, { u: 1, pitch: 1.18 }], attack: 0.006, kind: "curious" },
-    exclaim: { duration: 0.2, contour: [{ u: 0, pitch: 1.1 }, { u: 1, pitch: 0.9 }], attack: 0.005, kind: "scoff" },
+    question: { duration: 0.3, contour: [{ u: 0, pitch: 0.98 }, { u: 1, pitch: 1.18 }], attack: 0.005, kind: "curious", cutoff: 8000 },
+    exclaim: { duration: 0.26, contour: [{ u: 0, pitch: 1.1 }, { u: 1, pitch: 0.9 }], attack: 0.004, kind: "scoff", cutoff: 8000 },
   },
   // 嗯：追问「嗯？」要上挑；其余标点交给拖音那条线（不在这里抢）
   "嗯": {
