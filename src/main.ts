@@ -4500,7 +4500,7 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
         }
         ttsPlayer.setConfig(true, key, settings.tts.speakerId, settings.assistant.outputLanguage ?? "");
         ttsPlayer.setProsodyEnabled(prosody);
-        ttsPlayer.setMoodTone({ rate: 0, pitch: 0, volume: 1 });
+        ttsPlayer.setMoodTone({ rate: 0, tilt: 0, volume: 1 });
         ttsPlayer.speakTest(text);
         toast(prosody ? "正在试听（带语气处理）" : "正在试听（已关掉语气处理，用作对照）", "info");
         break;

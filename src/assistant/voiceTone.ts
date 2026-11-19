@@ -12,8 +12,15 @@
 export interface VoiceTone {
   /** 语速偏移（-8~8，火山接口的 speech_rate） */
   rate: number;
-  /** 音调偏移（-2~2） */
-  pitch: number;
+  /**
+   * 频谱倾斜 0~1（越大越"闷"）。
+   *
+   * 原本这里用的是服务端变调（additions.post_process.pitch），但那是服务器做的
+   * 重采样+时移，24k 音频上非常容易金属化——用户听到的"电音"很可能就是它。
+   * 改成**本地低通造成的"闷"**来表达"压着嗓子的怒气"，换个频段做事，
+   * 代价是牺牲一点亮度，换来完全没有变调伪影。
+   */
+  tilt: number;
   /** 播放音量倍率（0.8~1） */
   volume: number;
 }
@@ -34,7 +41,7 @@ const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v
 /** 按心情与精力给一组语音参数 */
 export function voiceToneFor(i: VoiceToneInput): VoiceTone {
   let rate = 0;
-  let pitch = 0;
+  let tilt = 0;
   let volume = 1;
 
   if (i.mood <= -0.55) {
@@ -42,25 +49,25 @@ export function voiceToneFor(i: VoiceToneInput): VoiceTone {
     //   阴阳怪气 = 冷怒：音高压低、语速反而放慢（拖腔、带刺）
     //   话变少   = 闷怒：更短更轻，不给气口
     //   嘴硬装没事 = 憋着：几乎不变调，只把音高压一点
-    if (i.style === "terse") { rate += 1; pitch -= 1.5; volume -= 0.05; }
-    else if (i.style === "pretend") { rate -= 1; pitch -= 1; }
-    else { rate -= 1; pitch -= 2; } // sarcastic：慢半拍 + 明显压低，最像"阴阳"
+    if (i.style === "terse") { rate += 1; tilt += 0.35; volume -= 0.05; }
+    else if (i.style === "pretend") { rate -= 1; tilt += 0.2; }
+    else { rate -= 1; tilt += 0.5; } // sarcastic：慢半拍 + 明显发闷，最像"阴着说话"
   } else if (i.mood < -0.2) {
-    if (i.style === "sarcastic") { rate += 1; pitch -= 1; }
-    else { rate += 2; pitch -= 0.5; }
+    if (i.style === "sarcastic") { rate += 1; tilt += 0.25; }
+    else { rate += 2; tilt += 0.1; }
   } else if (i.mood >= 0.5) {
     // 心情好：轻快、稍微上扬
-    rate += 2; pitch += 1;
+    rate += 2;
   }
 
-  if (i.sleep === "waking") { rate -= 3; volume -= 0.05; }
-  if (i.sleep === "asleep") { rate -= 5; volume -= 0.1; }
-  if (i.energy < 0.3) { rate -= 4; pitch -= 0.5; volume -= 0.05; }
+  if (i.sleep === "waking") { rate -= 3; volume -= 0.05; tilt += 0.1; }
+  if (i.sleep === "asleep") { rate -= 5; volume -= 0.1; tilt += 0.15; }
+  if (i.energy < 0.3) { rate -= 4; volume -= 0.05; tilt += 0.15; }
   else if (i.energy > 0.8 && i.mood >= 0) { rate += 1; }
 
   return {
     rate: clamp(Math.round(rate), -8, 8),
-    pitch: clamp(Number(pitch.toFixed(1)), -3, 3),
+    tilt: Math.max(0, Math.min(0.6, Number(tilt.toFixed(2)))),
     volume: clamp(Number(volume.toFixed(2)), 0.8, 1),
   };
 }
