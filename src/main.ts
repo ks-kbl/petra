@@ -1407,6 +1407,21 @@ function retryGreetingLater(dueAt: number, ms = 60 * 1000): void {
   }, Math.max(5_000, ms));
 }
 
+/**
+ * 主动问候的统一闸门。
+ *
+ * 所有主动开口的路径（定时 / 回归）都必须过这里——之前回归问候是**绕过闸门**的，
+ * 于是日额度能被它悄悄突破（实测一天发了 9 次，额度写的是 8）。
+ */
+function greetingGate(now: number, idleSec: number): { allowed: boolean; retryInMs?: number; reason?: string } {
+  return lifeRuntime.gate(now, {
+    cooldownMs: greetIntervalMs(settings.assistant.greetInterval),
+    userBusy: false,
+    idleSeconds: idleSec,
+    idleMode: settings.idleMode,
+  });
+}
+
 async function fireScheduledGreeting(dueAt: number): Promise<void> {
   if (!settings.assistant.enabled) return;
   // 待机模式（缩到任务栏睡觉）期间不打扰：隔一分钟再看，别每秒空转
@@ -1421,16 +1436,11 @@ async function fireScheduledGreeting(dueAt: number): Promise<void> {
     retryGreetingLater(dueAt);
     return;
   }
-  // 主动消息闸门：免打扰时段、今日额度、冷却、繁忙……拦下来就按建议延后，不丢
+  // 主动消息闸门：免打扰时段、滑动窗口、冷却、繁忙……拦下来就按建议延后，不丢
   {
-    const g = lifeRuntime.gate(Date.now(), {
-      dailyLimit: 8,
-      cooldownMs: greetIntervalMs(settings.assistant.greetInterval),
-      userBusy: false,
-      idleSeconds: idleSec,
-      idleMode: settings.idleMode,
-    });
+    const g = greetingGate(Date.now(), idleSec);
     if (!g.allowed) {
+      if (g.reason) console.warn(`[proactive] 这次先不说话：${g.reason}`);
       retryGreetingLater(dueAt, g.retryInMs ?? 60 * 1000);
       return;
     }
@@ -1579,6 +1589,8 @@ async function boot() {
         intervalMs: greetIntervalMsNow(),
         dueAt: nextGreetingDueAt(lastGreetAt, settings.assistant.greetInterval, Date.now(), 0),
         timerArmed: greetTimer !== null,
+      // 今天已经主动说了几次（配合"滑动窗口"看节奏是否正常）
+      todayCount: Number(lifeRuntime.snapshot().今天已问候 || 0),
       }),
       // 打开小助手输入框，便于验证空闲收起与关闭按钮
       openAssistantBar: () => void openAssistant(),
@@ -1670,6 +1682,13 @@ async function boot() {
         // 回归问候同样要守用户设的间隔：离开 15 分钟以上回来，但距上次问候还没到
         // 设定间隔时就不补，交给精确定时器（否则用户会觉得"间隔忽长忽短"）
         if (awayMs > 15 * 60 * 1000 && hasGreetingIntervalElapsed(lastGreetAt, settings.assistant.greetInterval, now)) {
+          // 回归问候也要过闸门：否则免打扰/额度都能被它绕过
+          const g = greetingGate(now, idleSec);
+          if (!g.allowed) {
+            if (g.reason) console.warn(`[proactive] 回归问候先跳过：${g.reason}`);
+            lastActiveAt = now;
+            return;
+          }
           const sent = await triggerProactive();
           markGreeted(now);
           if (sent) trackEvent({ type: "greeting", summary: "主动问候了用户" });
@@ -4500,7 +4519,7 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
         }
         ttsPlayer.setConfig(true, key, settings.tts.speakerId, settings.assistant.outputLanguage ?? "");
         ttsPlayer.setProsodyEnabled(prosody);
-        ttsPlayer.setMoodTone({ rate: 0, pitch: 0, volume: 1 });
+        ttsPlayer.setMoodTone({ rate: 0, tilt: 0, volume: 1 });
         ttsPlayer.speakTest(text);
         toast(prosody ? "正在试听（带语气处理）" : "正在试听（已关掉语气处理，用作对照）", "info");
         break;

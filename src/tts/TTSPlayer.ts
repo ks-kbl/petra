@@ -20,7 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { loadSettings } from "../utils/settings";
 import { holdWake, releaseWake } from "../audio/wakeGate";
 import { takeSpeechSegment, flushSpeechSegment, speechLimits, type SpeechBoundary } from "./sentenceSplit";
-import { stretchFillerInChannels, fillerStretchFor, isBareFiller } from "./prosody";
+import { stretchFillerInChannels, fillerStretchFor, isBareFiller, lowpass } from "./prosody";
 
 interface QueueItem {
   text: string;
@@ -299,7 +299,7 @@ class TTSPlayer {
    * 由 lifeRuntime 按当前心情算出来推进来；和"这句回复的情绪标签"是两回事：
    * 前者是"她今天的状态"，后者是"这句话的语气"。
    */
-  private moodTone = { rate: 0, pitch: 0, volume: 1 };
+  private moodTone = { rate: 0, tilt: 0, volume: 1 };
   /**
    * 语气处理（拖音/短叹词/低通）总开关。
    *
@@ -390,10 +390,10 @@ class TTSPlayer {
    * 只影响**之后**合成的句子：情绪标签通常出现在回复开头，所以整段基本都能带上。
    */
   /** 情绪状态 → 语音参数（生气快而压、低落慢而轻）；音量立刻作用在正在播的声音上 */
-  setMoodTone(t: { rate: number; pitch: number; volume: number }) {
+  setMoodTone(t: { rate: number; tilt: number; volume: number }) {
     this.moodTone = {
       rate: Math.max(-8, Math.min(8, t.rate || 0)),
-      pitch: Math.max(-3, Math.min(3, t.pitch || 0)),
+      tilt: Math.max(0, Math.min(0.6, t.tilt || 0)),
       volume: Math.max(0.5, Math.min(1, t.volume ?? 1)),
     };
     if (this.masterGain) this.masterGain.gain.value = this.muted ? 0 : this.moodTone.volume;
@@ -570,7 +570,9 @@ class TTSPlayer {
     // 标准模型也吃。以前整段被 enhanced 开关挡住，于是"没开增强语气"的人永远听不出
     // 情绪变化——这正是"切语气听不出来"的直接原因。
     const rate = Math.max(-10, Math.min(10, voice.rate + this.moodTone.rate));
-    const pitch = Math.max(-4, Math.min(4, voice.pitch + this.moodTone.pitch));
+    // **不再发 pitch**：服务端变调是"电音"的最后一个嫌疑，直接不用它。
+    // 情绪里的"压嗓子"改由本地的 tilt（低通）表达，见 applyMoodTilt。
+    const pitch = 0;
     if (!t.enhanced) {
       // 不开增强语气：只给语速/音调，不碰表现力模型、context_texts、语音标签
       if (!rate && !pitch) return { text };
@@ -634,6 +636,7 @@ class TTSPlayer {
           const bounds = findSpeechBounds(channels, buffer.sampleRate);
           item.decoded = { buffer, offset: bounds.offset, duration: bounds.duration };
           // 段首是「嗯……/哦，」这种语气词时，把那一小段音频拉长（不改音高）
+          this.applyMoodTilt(item);
           this.applyFillerStretch(item);
         } catch (e) {
           if (gen !== this.generation) return;
@@ -700,6 +703,33 @@ class TTSPlayer {
    * 用「第一段连续发声」就能框住，成本低、不会错到别的字上去。
    * 框出来的区间过长（>0.7s）说明这一句开头压根没有语气词停顿，宁可不拉。
    */
+  /**
+   * 情绪造成的"闷"：整段过一次低通。
+   *
+   * 用**本地 DSP**替代服务端变调：低通不会产生变调伪影，只是让声音暗一点，
+   * 配合"慢半拍 + 阴阳怪气"的表达，听起来就是压着嗓子生气。
+   * tilt 0 = 不动；0.6 = 截止约 2600Hz（明显发闷，但字仍听得清）。
+   */
+  private applyMoodTilt(item: QueueItem) {
+    const tilt = this.moodTone.tilt;
+    const d = item.decoded;
+    const ctx = this.ctx;
+    if (tilt < 0.05 || !d || !ctx) return;
+    try {
+      const sr = d.buffer.sampleRate;
+      const chans: Float32Array[] = [];
+      for (let c = 0; c < d.buffer.numberOfChannels; c++) chans.push(d.buffer.getChannelData(c));
+      // 单极低通（6dB/oct）+ 起手 9kHz：只削掉"亮"的那层毛边，
+      // 不是把中高频整体压掉。tilt 0.22 → ≈8.2kHz，人耳听感是"暗一点"而不是"闷"。
+      const cutoff = 9000 - 4000 * Math.min(1, tilt);
+      const out = lowpass(chans, sr, cutoff, 1);
+      const buf = ctx.createBuffer(out.length, out[0].length, sr);
+      out.forEach((ch, i) => buf.getChannelData(i).set(ch));
+      item.decoded = { buffer: buf, offset: d.offset, duration: d.duration };
+      this.prosodyLog(`tilt=${tilt.toFixed(2)} cutoff=${Math.round(cutoff)}Hz`);
+    } catch { /* 失败就按原声播 */ }
+  }
+
   private applyFillerStretch(item: QueueItem) {
     const d = item.decoded;
     const ctx = this.ctx;

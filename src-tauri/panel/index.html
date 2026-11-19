@@ -1002,10 +1002,11 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     if (spec.type === "apihelp") {
       // 解释「API 是什么、怎么接」——收在一个按钮里，不占版面
       const wrap = el("div", "tut-entry");
-      const b = el("button", "btn btn-sm", "API 是什么？我该怎么填？");
+      // 和其他主动作按钮一致：渐变紫底 + 白字，一眼能认出"这个可以点"
+      const b = el("button", "btn btn-sm btn-primary", "💡 API 是什么？我该怎么填？");
       b.onclick = () => showApiHelp();
       wrap.appendChild(b);
-      wrap.appendChild(el("div", "vid-note", "第一次接、或者不知道该填哪个，点上面这个。"));
+      wrap.appendChild(el("div", "vid-note", "第一次接 API，或者不知道该填哪一栏，点上面这个 —— 里面有三种来源怎么选、三步操作和常见坑。"));
       return wrap;
     }
     if (spec.type === "note") {
@@ -1909,7 +1910,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   function greetStatNode() {
     const card = el("div", "card");
     card.appendChild(el("h2", null, "主动问候调度"));
-    card.appendChild(el("p", "cd", "只读：下一次什么时候问候。排查「设了 N 分钟却一直不来」先看这里。"));
+    card.appendChild(el("p", "cd", "只读：下一次什么时候问候。**节奏完全按你设的间隔**，没有每日次数限制；只在待机、你正在聊天、人不在电脑前时跳过。排查「一直不来」先看这里。"));
     const wrap = el("div", "row");
     const t = el("div", "rtext");
     t.appendChild(el("div", "rlabel", "下次问候"));
@@ -1928,6 +1929,8 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (g.idleMode) parts.push("待机模式中（不打扰）");
       parts.push(`间隔 ${g.intervalMinutes} 分钟`);
       if (g.lastAt) parts.push(`上次 ${fmt(g.lastAt)}`);
+      // 今天说了几次：只是参考数字，不是上限
+      if (typeof g.todayCount === "number") parts.push(`今天已说 ${g.todayCount} 次`);
       parts.push(`定时器${g.timerArmed ? "已装" : "未装"}`);
       desc = `${fmt(g.nextAt)}（还有 ${mins} 分 ${secs} 秒） · ${parts.join(" · ")}`;
     }

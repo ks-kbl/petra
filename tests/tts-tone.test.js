@@ -12,7 +12,7 @@ let mod;
 try {
   Module._load = function (request, parent, ...rest) {
     if (request === "@tauri-apps/api/core") {
-      return { invoke: async (_cmd, args) => { sent.push(args); return ""; } };
+      return { invoke: async (cmd, args) => { if (cmd === "tts_synthesize") sent.push(args); return ""; } };
     }
     return originalLoad.call(this, request, parent, ...rest);
   };
@@ -61,13 +61,13 @@ ok("超过上限一个字拒绝", wrapCotTag("啊".repeat(61 - base), "happy", 6
   const { ttsPlayer } = mod;
   sent.length = 0;
   ttsPlayer.setConfig(true, "k", "s");
-  ttsPlayer.setMoodTone({ rate: 6, pitch: -2, volume: 0.9 });
+  ttsPlayer.setMoodTone({ rate: 6, tilt: 0.5, volume: 0.9 });
   ttsPlayer.pushDelta("嗯……行吧，随便你。");
   ttsPlayer.flush();
   await new Promise((r) => setTimeout(r, 10));
   const tone = sent[0]?.tone;
   ok("★ 增强语气关着时，情绪语速仍然发出去", !!tone && tone.speechRate === 6, JSON.stringify(tone));
-  ok("★ 情绪音调也发出去", !!tone && tone.pitch === -2, JSON.stringify(tone));
+  ok("★ 不再向服务端发变调（电音根源）", !tone || tone.pitch === undefined, JSON.stringify(tone));
   ok("★ 但不会偷偷开表现力模型", !tone || !tone.model, JSON.stringify(tone));
 }
 

@@ -38,6 +38,8 @@ interface Deliveries {
   count: number;
   /** 上次投递时刻 */
   lastAt: number;
+  /** 最近若干次投递的时刻（滑动窗口用，只留最近 12 条） */
+  recent: number[];
 }
 
 interface Persisted {
@@ -79,7 +81,7 @@ function fresh(now: number): Persisted {
   return {
     state: defaultLifeState(now),
     firstMetAt: now,
-    deliveries: { day: dayKey(now), count: 0, lastAt: 0 },
+    deliveries: { day: dayKey(now), count: 0, lastAt: 0, recent: [] },
     loops: [],
     habits: [],
     recentUser: [],
@@ -138,7 +140,7 @@ export function tick(now = Date.now()): void {
   d.favor = decay(d.favor, now);
   const today = dayKey(now);
   if (d.deliveries.day !== today) {
-    d.deliveries = { day: today, count: 0, lastAt: d.deliveries.lastAt };
+    d.deliveries = { ...d.deliveries, day: today, count: 0 };
   }
   save();
 }
@@ -258,9 +260,10 @@ export function recordAffect(
 /** 主动问候发出去了：记额度、记时间；如果以问句结尾，登记成待复核话头 */
 export function markDelivered(text: string, now = Date.now()): void {
   const d = load(now);
-  if (d.deliveries.day !== dayKey(now)) d.deliveries = { day: dayKey(now), count: 0, lastAt: 0 };
+  if (d.deliveries.day !== dayKey(now)) d.deliveries = { ...d.deliveries, day: dayKey(now), count: 0 };
   d.deliveries.count += 1;
   d.deliveries.lastAt = now;
+  d.deliveries.recent = [...(d.deliveries.recent ?? []), now].slice(-12);
   d.loops = addLoop(d.loops, text, now);
   save();
 }
@@ -268,14 +271,12 @@ export function markDelivered(text: string, now = Date.now()): void {
 /** 主动消息的闸门：把运行时状态塞进纯函数 */
 export function gate(
   now: number,
-  cfg: { dailyLimit: number; cooldownMs: number; userBusy: boolean; idleSeconds: number; idleMode: boolean },
+  cfg: { cooldownMs: number; userBusy: boolean; idleSeconds: number; idleMode: boolean },
 ): GateResult {
   const d = load(now);
   return evaluateGate({
     now,
     lastDeliveryAt: d.deliveries.lastAt,
-    deliveredToday: d.deliveries.day === dayKey(now) ? d.deliveries.count : 0,
-    dailyLimit: cfg.dailyLimit,
     cooldownMs: cfg.cooldownMs,
     userBusy: cfg.userBusy,
     idleSeconds: cfg.idleSeconds,

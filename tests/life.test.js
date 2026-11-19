@@ -87,17 +87,20 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("★ 只预告一周内的", ann.upcomingAnniversaries(first, at(5, 0, 5), 3).every((a) => a.daysUntil <= 3));
 }
 
-// ---------- 主动消息闸门 ----------
+// ---------- 主动消息闸门：只管"别打断"，不管频率 ----------
 {
-  const ok = gateMod.evaluateGate({ now: at(15), lastDeliveryAt: 0, deliveredToday: 0, dailyLimit: 5, cooldownMs: 60000, userBusy: false, idleSeconds: 10, idleMode: false });
-  check("白天的正常状态放行", ok.allowed);
-  const night = gateMod.evaluateGate({ now: at(2), lastDeliveryAt: 0, deliveredToday: 0, dailyLimit: 5, cooldownMs: 60000, userBusy: false, idleSeconds: 10, idleMode: false });
-  check("★ 深夜免打扰", !night.allowed && /免打扰/.test(night.reason), night.reason);
-  check("免打扰会给一个「之后再说」的时间", !!night.retryInMs && night.retryInMs > 60000);
-  check("额度用完不再发", !gateMod.evaluateGate({ now: at(15), lastDeliveryAt: 0, deliveredToday: 5, dailyLimit: 5, cooldownMs: 0, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
-  check("冷却期内不发", !gateMod.evaluateGate({ now: at(15), lastDeliveryAt: at(15) - 30000, deliveredToday: 1, dailyLimit: 5, cooldownMs: 60000, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
-  check("用户正在聊天不发", !gateMod.evaluateGate({ now: at(15), lastDeliveryAt: 0, deliveredToday: 0, dailyLimit: 5, cooldownMs: 0, userBusy: true, idleSeconds: 0, idleMode: false }).allowed);
-  check("用户离开不发", !gateMod.evaluateGate({ now: at(15), lastDeliveryAt: 0, deliveredToday: 0, dailyLimit: 5, cooldownMs: 0, userBusy: false, idleSeconds: 900, idleMode: false }).allowed);
+  const at15 = at(15);
+  const ok = gateMod.evaluateGate({ now: at15, lastDeliveryAt: 0, cooldownMs: 20 * 60000, userBusy: false, idleSeconds: 10, idleMode: false });
+  check("正常状态放行", ok.allowed);
+  check("★ 没有「每天几次」的限制（凌晨也放行）",
+    gateMod.evaluateGate({ now: at(2), lastDeliveryAt: 0, cooldownMs: 0, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
+  check("★ 间隔就是冷却：没到点不发",
+    !gateMod.evaluateGate({ now: at15, lastDeliveryAt: at15 - 10 * 60000, cooldownMs: 20 * 60000, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
+  check("★ 到点就发（哪怕今天已经说过很多次）",
+    gateMod.evaluateGate({ now: at15, lastDeliveryAt: at15 - 25 * 60000, cooldownMs: 20 * 60000, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
+  check("用户正在聊天不发", !gateMod.evaluateGate({ now: at15, lastDeliveryAt: 0, cooldownMs: 0, userBusy: true, idleSeconds: 0, idleMode: false }).allowed);
+  check("用户离开不发", !gateMod.evaluateGate({ now: at15, lastDeliveryAt: 0, cooldownMs: 0, userBusy: false, idleSeconds: 900, idleMode: false }).allowed);
+  check("待机模式不发", !gateMod.evaluateGate({ now: at15, lastDeliveryAt: 0, cooldownMs: 0, userBusy: false, idleSeconds: 0, idleMode: true }).allowed);
 }
 
 // ---------- 话头复核 ----------
@@ -137,8 +140,9 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   // 时间点（08:30）是节目单的锚点，允许出现；但「状态」那一段不能有数值
   const statePart = block.split("【你今天在做的事】")[0];
   check("★ 状态描述不含数字（不能把精力当百分比念）", !/[0-9０-９]/.test(statePart), statePart);
-  const g = runtime.lifeRuntime.gate(at(3), { dailyLimit: 8, cooldownMs: 0, userBusy: false, idleSeconds: 0, idleMode: false });
-  check("★ 运行时闸门同样拦深夜", !g.allowed, g.reason);
+  // 现在没有"免打扰时段"了：节奏完全按用户设的间隔走（用户明确要求）
+  const g = runtime.lifeRuntime.gate(at(3), { cooldownMs: 0, userBusy: false, idleSeconds: 0, idleMode: false });
+  check("★ 凌晨也按间隔照常走，不再有免打扰拦着", g.allowed, g.reason);
   runtime.lifeRuntime.markDelivered("你吃饭了吗？", at(12));
   const snap = runtime.lifeRuntime.snapshot(at(12));
   check("★ 快照只有文字字段", Object.values(snap).every((v) => typeof v === "string"), JSON.stringify(snap));
@@ -314,15 +318,21 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   const happy = voice.voiceToneFor({ mood: 0.7, energy: 0.8, sleep: "awake" });
   const tired = voice.voiceToneFor({ mood: 0, energy: 0.15, sleep: "awake" });
   const neutral = voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "awake" });
-  check("★ 生气（默认阴阳型）：音高压低", angry.pitch < neutral.pitch, JSON.stringify(angry));
+  check("★ 生气（默认阴阳型）：整段发闷（tilt 上升）", angry.tilt > neutral.tilt, JSON.stringify(angry));
   const sarcastic = voice.voiceToneFor({ mood: -0.8, energy: 0.6, style: "sarcastic" });
   const terse = voice.voiceToneFor({ mood: -0.8, energy: 0.6, style: "terse" });
-  check("★ 阴阳怪气=冷怒：音压得最低", sarcastic.pitch <= terse.pitch, `${sarcastic.pitch} vs ${terse.pitch}`);
+  check("★ 阴阳怪气最闷（压着嗓子）", sarcastic.tilt >= terse.tilt, `${sarcastic.tilt} vs ${terse.tilt}`);
   check("★ 三种怒的听感不同", JSON.stringify(sarcastic) !== JSON.stringify(terse));
-  check("音调不超过 ±3（避免变成另一个人）", Math.abs(sarcastic.pitch) <= 3 && Math.abs(happy.pitch) <= 3);
-  check("★ 高兴：语速与音调都上扬", happy.rate > neutral.rate && happy.pitch > neutral.pitch, JSON.stringify(happy));
+  check("★ 不再向服务端要变调（接口里没有 pitch）", !("pitch" in sarcastic), JSON.stringify(sarcastic));
+  check("★ tilt 上限只有 0.25（只暗一点，不能闷）", sarcastic.tilt <= 0.25 && happy.tilt <= 0.25);
+  // 累 / 刚睡醒只用"慢+轻"，不许动频谱——这是"声音好闷"的直接原因
+  check("★ 累的时候不压低频（tilt 保持 0）", voice.voiceToneFor({ mood: 0, energy: 0.1, sleep: "awake" }).tilt === 0);
+  check("★ 刚睡醒也不压低频", voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "waking" }).tilt === 0);
+  check("★ 只有真生气才轻微发闷", voice.voiceToneFor({ mood: -0.8, energy: 0.6, style: "sarcastic" }).tilt > 0
+    && voice.voiceToneFor({ mood: 0, energy: 0.6 }).tilt === 0);
+  check("★ 高兴：语速上扬、不发闷", happy.rate > neutral.rate && happy.tilt <= neutral.tilt, JSON.stringify(happy));
   check("★ 累：语速变慢、音量变轻", tired.rate < neutral.rate && tired.volume < 1, JSON.stringify(tired));
-  check("幅度都很小（不像变声器）", Math.abs(angry.rate) <= 8 && Math.abs(happy.pitch) <= 2 && angry.volume >= 0.8);
+  check("幅度都很小（不像变声器）", Math.abs(angry.rate) <= 8 && angry.tilt <= 0.6 && angry.volume >= 0.8);
   check("刚睡醒会更慢", voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "waking" }).rate
     < voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "awake" }).rate);
   check("音量不会被压到听不见", voice.voiceToneFor({ mood: -1, energy: 0.05, sleep: "asleep" }).volume >= 0.8);

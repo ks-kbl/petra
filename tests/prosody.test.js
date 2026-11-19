@@ -297,5 +297,73 @@ const zeroCrossingsPerSecond = (buf, rate) => {
   check("短叹词仍然很短", shaped.length / sr < 0.3, (shaped.length / sr).toFixed(2));
 }
 
+// ---------- 塞擦音「切」不能被低通闷掉 ----------
+{
+  const qie = sp.interjectionFor("切，谁稀罕。");
+  check("★ 切仍然被识别", !!qie && qie.spec.kind === "scoff");
+  check("★ 切的低通几乎关掉（保住 q 的锐度）", (qie.spec.cutoff ?? 6000) >= 9000, String(qie.spec.cutoff));
+  check("★ 切的时长没被压过头", qie.spec.duration >= 0.24, String(qie.spec.duration));
+  const heng = sp.interjectionFor("哼！我才不要。");
+  check("鼻音「哼」仍可用较强低通", (heng.spec.cutoff ?? 6000) <= 6000, String(heng.spec.cutoff));
+
+  // 直接验证低通截止的作用：同样是 6kHz，3600 会砍掉，9000 基本保留
+  const len = Math.round(0.2 * sr);
+  const high = new Float32Array(len);
+  for (let i = 0; i < len; i++) high[i] = Math.sin((2 * Math.PI * 6000 * i) / sr) * 0.5;
+  const amp = (b) => Math.max(...b.subarray(Math.floor(b.length / 3)));
+  const cut36 = amp(sp.lowpass([high], sr, 3600)[0]);
+  const cut9k = amp(sp.lowpass([high], sr, 9000)[0]);
+  check("★ 9kHz 低通保留的高频远多于 3.6kHz", cut9k > cut36 * 2, `${cut36.toFixed(3)} vs ${cut9k.toFixed(3)}`);
+}
+
+// ---------- 全表体检：每种音都要选对低通、时长、起音 ----------
+{
+  const cases = [
+    // [文本, 期望最低低通, 期望最短时长, 说明]
+    ["哼！", 4000, 0.2, "鼻音：可以压"],
+    ["呵，是吗。", 7500, 0.22, "送气冷笑：要保住 h"],
+    ["切，谁稀罕。", 8500, 0.24, "塞擦音：要保住 q"],
+    ["嘁。", 8500, 0.24, "塞擦音"],
+    ["啧。", 8500, 0.22, "塞擦音"],
+    ["呸！", 9000, 0.2, "爆破音：要保住冲音"],
+    ["噗。", 9000, 0.2, "爆破音"],
+    ["嘶——", 10000, 0.24, "擦音：全靠高频"],
+    ["嘘——", 10000, 0.24, "擦音：全靠高频"],
+    ["诶？", 6000, 0.26, "元音起头，正常低通"],
+    ["咦？", 6500, 0.26, "元音起头"],
+    ["哦！", 5500, 0.26, "元音"],
+    ["啊？", 5500, 0.24, "元音"],
+    ["哈？", 7500, 0.24, "送气：要保住 h"],
+  ];
+  for (const [text, minCut, minDur, why] of cases) {
+    const hit = sp.interjectionFor(text);
+    const name = text.replace(/[，。！？—]/g, "");
+    check(`★ ${name} 能被识别（${why}）`, !!hit, text);
+    if (!hit) continue;
+    check(`★ ${name} 低通不低于 ${minCut}`, (hit.spec.cutoff ?? 6000) >= minCut, String(hit.spec.cutoff ?? "默认6000"));
+    check(`★ ${name} 时长不短于 ${minDur}s`, hit.spec.duration >= minDur, String(hit.spec.duration));
+  }
+  // 爆破音/擦音的起音必须很冲，否则冲音被包络抹平
+  for (const t of ["呸！", "噗。", "嘶——", "嘘——"]) {
+    check(`★ ${t[0]} 的起音够冲（≤2ms）`, (sp.interjectionFor(t)?.spec.attack ?? 1) <= 0.002, String(sp.interjectionFor(t)?.spec.attack));
+  }
+}
+
+// ---------- 低通的"柔和档"：单极只削毛边，不动中频 ----------
+{
+  const len = Math.round(0.2 * sr);
+  const mk = (hz) => {
+    const b = new Float32Array(len);
+    for (let i = 0; i < len; i++) b[i] = Math.sin((2 * Math.PI * hz * i) / sr) * 0.5;
+    return b;
+  };
+  const amp = (b) => Math.max(...b.subarray(Math.floor(b.length / 3)));
+  const mid = mk(1500);
+  const hard = sp.lowpass([mid], sr, 4300, 2)[0];
+  const soft = sp.lowpass([mid], sr, 8000, 1)[0];
+  check("★ 柔和档（单极 8kHz）基本不动中频", amp(soft) > amp(mid) * 0.85, amp(soft).toFixed(2));
+  check("重度档（双极 4.3kHz）会明显削中频", amp(hard) < amp(mid) * 0.8, amp(hard).toFixed(2));
+}
+
 console.log(`prosody: fail=${fail}`);
 process.exit(fail ? 1 : 0);
