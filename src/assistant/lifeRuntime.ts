@@ -271,15 +271,12 @@ export function markDelivered(text: string, now = Date.now()): void {
 /** 主动消息的闸门：把运行时状态塞进纯函数 */
 export function gate(
   now: number,
-  cfg: { dailyLimit: number; cooldownMs: number; userBusy: boolean; idleSeconds: number; idleMode: boolean },
+  cfg: { cooldownMs: number; userBusy: boolean; idleSeconds: number; idleMode: boolean },
 ): GateResult {
   const d = load(now);
   return evaluateGate({
     now,
     lastDeliveryAt: d.deliveries.lastAt,
-    deliveredToday: d.deliveries.day === dayKey(now) ? d.deliveries.count : 0,
-    recentDeliveries: d.deliveries.recent ?? [],
-    dailyLimit: cfg.dailyLimit,
     cooldownMs: cfg.cooldownMs,
     userBusy: cfg.userBusy,
     idleSeconds: cfg.idleSeconds,

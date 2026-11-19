@@ -1415,7 +1415,6 @@ function retryGreetingLater(dueAt: number, ms = 60 * 1000): void {
  */
 function greetingGate(now: number, idleSec: number): { allowed: boolean; retryInMs?: number; reason?: string } {
   return lifeRuntime.gate(now, {
-    dailyLimit: 24,
     cooldownMs: greetIntervalMs(settings.assistant.greetInterval),
     userBusy: false,
     idleSeconds: idleSec,

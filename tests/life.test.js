@@ -87,17 +87,20 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("★ 只预告一周内的", ann.upcomingAnniversaries(first, at(5, 0, 5), 3).every((a) => a.daysUntil <= 3));
 }
 
-// ---------- 主动消息闸门 ----------
+// ---------- 主动消息闸门：只管"别打断"，不管频率 ----------
 {
-  const ok = gateMod.evaluateGate({ now: at(15), lastDeliveryAt: 0, deliveredToday: 0, dailyLimit: 5, cooldownMs: 60000, userBusy: false, idleSeconds: 10, idleMode: false });
-  check("白天的正常状态放行", ok.allowed);
-  const night = gateMod.evaluateGate({ now: at(2), lastDeliveryAt: 0, deliveredToday: 0, dailyLimit: 5, cooldownMs: 60000, userBusy: false, idleSeconds: 10, idleMode: false });
-  check("★ 深夜免打扰", !night.allowed && /免打扰/.test(night.reason), night.reason);
-  check("免打扰会给一个「之后再说」的时间", !!night.retryInMs && night.retryInMs > 60000);
-  check("额度用完不再发", !gateMod.evaluateGate({ now: at(15), lastDeliveryAt: 0, deliveredToday: 5, dailyLimit: 5, cooldownMs: 0, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
-  check("冷却期内不发", !gateMod.evaluateGate({ now: at(15), lastDeliveryAt: at(15) - 30000, deliveredToday: 1, dailyLimit: 5, cooldownMs: 60000, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
-  check("用户正在聊天不发", !gateMod.evaluateGate({ now: at(15), lastDeliveryAt: 0, deliveredToday: 0, dailyLimit: 5, cooldownMs: 0, userBusy: true, idleSeconds: 0, idleMode: false }).allowed);
-  check("用户离开不发", !gateMod.evaluateGate({ now: at(15), lastDeliveryAt: 0, deliveredToday: 0, dailyLimit: 5, cooldownMs: 0, userBusy: false, idleSeconds: 900, idleMode: false }).allowed);
+  const at15 = at(15);
+  const ok = gateMod.evaluateGate({ now: at15, lastDeliveryAt: 0, cooldownMs: 20 * 60000, userBusy: false, idleSeconds: 10, idleMode: false });
+  check("正常状态放行", ok.allowed);
+  check("★ 没有「每天几次」的限制（凌晨也放行）",
+    gateMod.evaluateGate({ now: at(2), lastDeliveryAt: 0, cooldownMs: 0, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
+  check("★ 间隔就是冷却：没到点不发",
+    !gateMod.evaluateGate({ now: at15, lastDeliveryAt: at15 - 10 * 60000, cooldownMs: 20 * 60000, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
+  check("★ 到点就发（哪怕今天已经说过很多次）",
+    gateMod.evaluateGate({ now: at15, lastDeliveryAt: at15 - 25 * 60000, cooldownMs: 20 * 60000, userBusy: false, idleSeconds: 10, idleMode: false }).allowed);
+  check("用户正在聊天不发", !gateMod.evaluateGate({ now: at15, lastDeliveryAt: 0, cooldownMs: 0, userBusy: true, idleSeconds: 0, idleMode: false }).allowed);
+  check("用户离开不发", !gateMod.evaluateGate({ now: at15, lastDeliveryAt: 0, cooldownMs: 0, userBusy: false, idleSeconds: 900, idleMode: false }).allowed);
+  check("待机模式不发", !gateMod.evaluateGate({ now: at15, lastDeliveryAt: 0, cooldownMs: 0, userBusy: false, idleSeconds: 0, idleMode: true }).allowed);
 }
 
 // ---------- 话头复核 ----------
@@ -137,8 +140,9 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   // 时间点（08:30）是节目单的锚点，允许出现；但「状态」那一段不能有数值
   const statePart = block.split("【你今天在做的事】")[0];
   check("★ 状态描述不含数字（不能把精力当百分比念）", !/[0-9０-９]/.test(statePart), statePart);
-  const g = runtime.lifeRuntime.gate(at(3), { dailyLimit: 8, cooldownMs: 0, userBusy: false, idleSeconds: 0, idleMode: false });
-  check("★ 运行时闸门同样拦深夜", !g.allowed, g.reason);
+  // 现在没有"免打扰时段"了：节奏完全按用户设的间隔走（用户明确要求）
+  const g = runtime.lifeRuntime.gate(at(3), { cooldownMs: 0, userBusy: false, idleSeconds: 0, idleMode: false });
+  check("★ 凌晨也按间隔照常走，不再有免打扰拦着", g.allowed, g.reason);
   runtime.lifeRuntime.markDelivered("你吃饭了吗？", at(12));
   const snap = runtime.lifeRuntime.snapshot(at(12));
   check("★ 快照只有文字字段", Object.values(snap).every((v) => typeof v === "string"), JSON.stringify(snap));
@@ -332,31 +336,6 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("刚睡醒会更慢", voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "waking" }).rate
     < voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "awake" }).rate);
   check("音量不会被压到听不见", voice.voiceToneFor({ mood: -1, energy: 0.05, sleep: "asleep" }).volume >= 0.8);
-}
-
-// ---------- 滑动窗口：上午别刷屏、下午不要哑火 ----------
-{
-  const now = Date.parse("2026-11-19T14:00:00");
-  const mk = (backMin) => ({ ...({}), now: now - backMin * 60000 });
-  const base = {
-    lastDeliveryAt: 0, deliveredToday: 2, dailyLimit: 24, cooldownMs: 20 * 60000,
-    userBusy: false, idleSeconds: 10, idleMode: false, now,
-  };
-  // 90 分钟内说过一次 → 先别说
-  const short = gateMod.evaluateGate({ ...base, recentDeliveries: [now - 40 * 60000] });
-  check("★ 90 分钟内已经说过就不再开口", !short.allowed && /90 分钟/.test(short.reason), short.reason);
-  // 6 小时内已经 4 次 → 先别说
-  const long = gateMod.evaluateGate({
-    ...base, lastDeliveryAt: now - 100 * 60000,
-    recentDeliveries: [100, 180, 260, 340].map((m) => now - m * 60000),
-  });
-  check("★ 6 小时内 4 次就压住", !long.allowed && /有点多/.test(long.reason), long.reason);
-  // 上一个窗口都过期了 → 应该放行（不能像日额度那样"用完就整天哑火"）
-  const ok = gateMod.evaluateGate({
-    ...base, lastDeliveryAt: now - 200 * 60000,
-    recentDeliveries: [200, 260].map((m) => now - m * 60000),
-  });
-  check("★ 窗口过期后恢复正常（不会一下午哑火）", ok.allowed, JSON.stringify(ok));
 }
 
 console.log(`life: fail=${fail}`);

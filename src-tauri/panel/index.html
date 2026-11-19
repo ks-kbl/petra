@@ -1909,7 +1909,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   function greetStatNode() {
     const card = el("div", "card");
     card.appendChild(el("h2", null, "主动问候调度"));
-    card.appendChild(el("p", "cd", "只读：下一次什么时候问候。节奏由滑动窗口控制（90 分钟内最多 1 次、6 小时内最多 4 次、23:00~07:30 免打扰）；排查「一直不来」先看这里。"));
+    card.appendChild(el("p", "cd", "只读：下一次什么时候问候。**节奏完全按你设的间隔**，没有每日次数限制；只在待机、你正在聊天、人不在电脑前时跳过。排查「一直不来」先看这里。"));
     const wrap = el("div", "row");
     const t = el("div", "rtext");
     t.appendChild(el("div", "rlabel", "下次问候"));
@@ -1928,7 +1928,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       if (g.idleMode) parts.push("待机模式中（不打扰）");
       parts.push(`间隔 ${g.intervalMinutes} 分钟`);
       if (g.lastAt) parts.push(`上次 ${fmt(g.lastAt)}`);
-      // 今天说了几次：配合滑动窗口（90 分钟内最多 1 次、6 小时内最多 4 次）看节奏
+      // 今天说了几次：只是参考数字，不是上限
       if (typeof g.todayCount === "number") parts.push(`今天已说 ${g.todayCount} 次`);
       parts.push(`定时器${g.timerArmed ? "已装" : "未装"}`);
       desc = `${fmt(g.nextAt)}（还有 ${mins} 分 ${secs} 秒） · ${parts.join(" · ")}`;
