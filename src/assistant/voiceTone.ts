@@ -49,25 +49,27 @@ export function voiceToneFor(i: VoiceToneInput): VoiceTone {
     //   阴阳怪气 = 冷怒：音高压低、语速反而放慢（拖腔、带刺）
     //   话变少   = 闷怒：更短更轻，不给气口
     //   嘴硬装没事 = 憋着：几乎不变调，只把音高压一点
-    if (i.style === "terse") { rate += 1; tilt += 0.35; volume -= 0.05; }
-    else if (i.style === "pretend") { rate -= 1; tilt += 0.2; }
-    else { rate -= 1; tilt += 0.5; } // sarcastic：慢半拍 + 明显发闷，最像"阴着说话"
+    if (i.style === "terse") { rate += 1; tilt += 0.15; volume -= 0.05; }
+    else if (i.style === "pretend") { rate -= 1; tilt += 0.1; }
+    else { rate -= 1; tilt += 0.22; } // sarcastic：慢半拍 + 轻微发闷，别闷成听不清
   } else if (i.mood < -0.2) {
-    if (i.style === "sarcastic") { rate += 1; tilt += 0.25; }
-    else { rate += 2; tilt += 0.1; }
+    if (i.style === "sarcastic") { rate += 1; tilt += 0.12; }
+    else { rate += 2; tilt += 0.06; }
   } else if (i.mood >= 0.5) {
     // 心情好：轻快、稍微上扬
     rate += 2;
   }
 
-  if (i.sleep === "waking") { rate -= 3; volume -= 0.05; tilt += 0.1; }
-  if (i.sleep === "asleep") { rate -= 5; volume -= 0.1; tilt += 0.15; }
-  if (i.energy < 0.3) { rate -= 4; volume -= 0.05; tilt += 0.15; }
+  // 累/刚睡醒只用"慢 + 轻"表达，**不动频谱**：
+  // 之前这里也加了 tilt，结果日常对话一直在发闷——用户直接说"声音好闷，不亮"。
+  if (i.sleep === "waking") { rate -= 3; volume -= 0.05; }
+  if (i.sleep === "asleep") { rate -= 5; volume -= 0.1; }
+  if (i.energy < 0.3) { rate -= 4; volume -= 0.05; }
   else if (i.energy > 0.8 && i.mood >= 0) { rate += 1; }
 
   return {
     rate: clamp(Math.round(rate), -8, 8),
-    tilt: Math.max(0, Math.min(0.6, Number(tilt.toFixed(2)))),
+    tilt: Math.max(0, Math.min(0.25, Number(tilt.toFixed(2)))),
     volume: clamp(Number(volume.toFixed(2)), 0.8, 1),
   };
 }

@@ -320,7 +320,12 @@ const at = (h, m = 0, day = 18) => new Date(2026, 10, day, h, m, 0, 0).getTime()
   check("★ 阴阳怪气最闷（压着嗓子）", sarcastic.tilt >= terse.tilt, `${sarcastic.tilt} vs ${terse.tilt}`);
   check("★ 三种怒的听感不同", JSON.stringify(sarcastic) !== JSON.stringify(terse));
   check("★ 不再向服务端要变调（接口里没有 pitch）", !("pitch" in sarcastic), JSON.stringify(sarcastic));
-  check("tilt 有上限，不会闷成听不清", sarcastic.tilt <= 0.6 && happy.tilt <= 0.6);
+  check("★ tilt 上限只有 0.25（只暗一点，不能闷）", sarcastic.tilt <= 0.25 && happy.tilt <= 0.25);
+  // 累 / 刚睡醒只用"慢+轻"，不许动频谱——这是"声音好闷"的直接原因
+  check("★ 累的时候不压低频（tilt 保持 0）", voice.voiceToneFor({ mood: 0, energy: 0.1, sleep: "awake" }).tilt === 0);
+  check("★ 刚睡醒也不压低频", voice.voiceToneFor({ mood: 0, energy: 0.6, sleep: "waking" }).tilt === 0);
+  check("★ 只有真生气才轻微发闷", voice.voiceToneFor({ mood: -0.8, energy: 0.6, style: "sarcastic" }).tilt > 0
+    && voice.voiceToneFor({ mood: 0, energy: 0.6 }).tilt === 0);
   check("★ 高兴：语速上扬、不发闷", happy.rate > neutral.rate && happy.tilt <= neutral.tilt, JSON.stringify(happy));
   check("★ 累：语速变慢、音量变轻", tired.rate < neutral.rate && tired.volume < 1, JSON.stringify(tired));
   check("幅度都很小（不像变声器）", Math.abs(angry.rate) <= 8 && angry.tilt <= 0.6 && angry.volume >= 0.8);

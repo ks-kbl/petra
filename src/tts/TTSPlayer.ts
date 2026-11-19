@@ -719,8 +719,10 @@ class TTSPlayer {
       const sr = d.buffer.sampleRate;
       const chans: Float32Array[] = [];
       for (let c = 0; c < d.buffer.numberOfChannels; c++) chans.push(d.buffer.getChannelData(c));
-      const cutoff = 6000 - 3400 * Math.min(1, tilt); // 0.5 → ≈4300Hz
-      const out = lowpass(chans, sr, cutoff);
+      // 单极低通（6dB/oct）+ 起手 9kHz：只削掉"亮"的那层毛边，
+      // 不是把中高频整体压掉。tilt 0.22 → ≈8.2kHz，人耳听感是"暗一点"而不是"闷"。
+      const cutoff = 9000 - 4000 * Math.min(1, tilt);
+      const out = lowpass(chans, sr, cutoff, 1);
       const buf = ctx.createBuffer(out.length, out[0].length, sr);
       out.forEach((ch, i) => buf.getChannelData(i).set(ch));
       item.decoded = { buffer: buf, offset: d.offset, duration: d.duration };

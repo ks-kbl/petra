@@ -417,13 +417,13 @@ export function pitchDown(channels: Float32Array[], ratio: number): Float32Array
  * "电音"听感里有一半来自这些能量不高但很扎耳的高频碎屑：基频还在，
  * 但一个周期内的波形被接缝搞出了锯齿。低通把它们按掉，音色立刻"肉"回来。
  */
-export function lowpass(channels: Float32Array[], sampleRate: number, cutoff = 3600): Float32Array[] {
+export function lowpass(channels: Float32Array[], sampleRate: number, cutoff = 3600, passes = 2): Float32Array[] {
   const rc = 1 / (2 * Math.PI * cutoff);
   const dt = 1 / sampleRate;
   const alpha = dt / (rc + dt);
   return channels.map((src) => {
     let dst = new Float32Array(src.length);
-    for (let pass = 0; pass < 2; pass++) {
+    for (let pass = 0; pass < Math.max(1, passes); pass++) {
       const from = pass === 0 ? src : dst;
       const to = new Float32Array(src.length);
       let y = from[0] ?? 0;

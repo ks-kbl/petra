@@ -349,5 +349,21 @@ const zeroCrossingsPerSecond = (buf, rate) => {
   }
 }
 
+// ---------- 低通的"柔和档"：单极只削毛边，不动中频 ----------
+{
+  const len = Math.round(0.2 * sr);
+  const mk = (hz) => {
+    const b = new Float32Array(len);
+    for (let i = 0; i < len; i++) b[i] = Math.sin((2 * Math.PI * hz * i) / sr) * 0.5;
+    return b;
+  };
+  const amp = (b) => Math.max(...b.subarray(Math.floor(b.length / 3)));
+  const mid = mk(1500);
+  const hard = sp.lowpass([mid], sr, 4300, 2)[0];
+  const soft = sp.lowpass([mid], sr, 8000, 1)[0];
+  check("★ 柔和档（单极 8kHz）基本不动中频", amp(soft) > amp(mid) * 0.85, amp(soft).toFixed(2));
+  check("重度档（双极 4.3kHz）会明显削中频", amp(hard) < amp(mid) * 0.8, amp(hard).toFixed(2));
+}
+
 console.log(`prosody: fail=${fail}`);
 process.exit(fail ? 1 : 0);
