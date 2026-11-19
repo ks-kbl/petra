@@ -451,6 +451,14 @@ export interface InterjectionSpec {
   contour: { u: number; pitch: number }[];
   /** 起音时间（秒）：越短越"冲" */
   attack: number;
+  /**
+   * 处理后的低通截止频率（Hz）。默认 6000。
+   *
+   * 鼻音（哼/嗯）高频本来就少，压低一点只会更圆润；
+   * 但**塞擦音**（切 q/嘁/啧 z）的辨识度全在那段高频气流上，
+   * 用 3600 去压会直接变成一团闷响——「听不清」就是这么来的。
+   */
+  cutoff?: number;
   /** 这是什么情绪的声音，日志和测试用 */
   kind: "angry" | "scoff" | "sneer" | "curious" | "surprised" | "realize";
 }
@@ -476,21 +484,24 @@ function punctAfter(rest: string): Punct {
 const RECIPES: Record<string, Partial<Record<Punct, InterjectionSpec>>> = {
   // 生气、不服气：从上往下砸
   "哼": {
-    plain: { duration: 0.24, contour: [{ u: 0, pitch: 1.18 }, { u: 1, pitch: 0.82 }], attack: 0.004, kind: "angry" },
+    plain: { duration: 0.24, contour: [{ u: 0, pitch: 1.18 }, { u: 1, pitch: 0.82 }], attack: 0.004, kind: "angry", cutoff: 5000 },
   },
   // 冷笑
   "呵": {
     plain: { duration: 0.18, contour: [{ u: 0, pitch: 1.08 }, { u: 1, pitch: 0.9 }], attack: 0.006, kind: "sneer" },
   },
   // 咂嘴式不屑
+  // 切 / 嘁 / 啧 是**塞擦音**：辨识度靠那口高频气流，所以
+  // ① 时长别压太狠（0.15 → 0.26，压过头就只剩一下闷响）
+  // ② 低通几乎关掉（9000Hz），保住 "q/z" 的锐度
   "切": {
-    plain: { duration: 0.15, contour: [{ u: 0, pitch: 1.12 }, { u: 1, pitch: 0.92 }], attack: 0.005, kind: "scoff" },
+    plain: { duration: 0.26, contour: [{ u: 0, pitch: 1.08 }, { u: 1, pitch: 0.94 }], attack: 0.004, kind: "scoff", cutoff: 9000 },
   },
   "嘁": {
-    plain: { duration: 0.15, contour: [{ u: 0, pitch: 1.1 }, { u: 1, pitch: 0.9 }], attack: 0.005, kind: "scoff" },
+    plain: { duration: 0.26, contour: [{ u: 0, pitch: 1.06 }, { u: 1, pitch: 0.92 }], attack: 0.004, kind: "scoff", cutoff: 9000 },
   },
   "啧": {
-    plain: { duration: 0.14, contour: [{ u: 0, pitch: 1.14 }, { u: 1, pitch: 0.94 }], attack: 0.004, kind: "scoff" },
+    plain: { duration: 0.24, contour: [{ u: 0, pitch: 1.1 }, { u: 1, pitch: 0.95 }], attack: 0.003, kind: "scoff", cutoff: 9000 },
   },
   // 诶：好奇往上挑 / 想起什么慢慢拖 / 惊讶先升后降
   "诶": {
@@ -592,8 +603,10 @@ export function shapeInterjection(
     }
     return dst;
   });
-  // 最后过一道低通：弯音留下的高频毛刺就是"电音"的另一半来源
-  return lowpass(shaped, sampleRate);
+  // 最后过一道低通：弯音留下的高频毛刺就是"电音"的另一半来源。
+  // 截止频率按音素类型给——鼻音可以压狠一点，塞擦音必须放过高频。
+  const cutoff = spec.cutoff ?? 6000;
+  return cutoff >= 12000 ? shaped : lowpass(shaped, sampleRate, cutoff);
 }
 
 /**

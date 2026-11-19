@@ -12,7 +12,7 @@ let mod;
 try {
   Module._load = function (request, parent, ...rest) {
     if (request === "@tauri-apps/api/core") {
-      return { invoke: async (_cmd, args) => { sent.push(args); return ""; } };
+      return { invoke: async (cmd, args) => { if (cmd === "tts_synthesize") sent.push(args); return ""; } };
     }
     return originalLoad.call(this, request, parent, ...rest);
   };

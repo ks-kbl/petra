@@ -297,5 +297,24 @@ const zeroCrossingsPerSecond = (buf, rate) => {
   check("短叹词仍然很短", shaped.length / sr < 0.3, (shaped.length / sr).toFixed(2));
 }
 
+// ---------- 塞擦音「切」不能被低通闷掉 ----------
+{
+  const qie = sp.interjectionFor("切，谁稀罕。");
+  check("★ 切仍然被识别", !!qie && qie.spec.kind === "scoff");
+  check("★ 切的低通几乎关掉（保住 q 的锐度）", (qie.spec.cutoff ?? 6000) >= 9000, String(qie.spec.cutoff));
+  check("★ 切的时长没被压过头", qie.spec.duration >= 0.24, String(qie.spec.duration));
+  const heng = sp.interjectionFor("哼！我才不要。");
+  check("鼻音「哼」仍可用较强低通", (heng.spec.cutoff ?? 6000) <= 6000, String(heng.spec.cutoff));
+
+  // 直接验证低通截止的作用：同样是 6kHz，3600 会砍掉，9000 基本保留
+  const len = Math.round(0.2 * sr);
+  const high = new Float32Array(len);
+  for (let i = 0; i < len; i++) high[i] = Math.sin((2 * Math.PI * 6000 * i) / sr) * 0.5;
+  const amp = (b) => Math.max(...b.subarray(Math.floor(b.length / 3)));
+  const cut36 = amp(sp.lowpass([high], sr, 3600)[0]);
+  const cut9k = amp(sp.lowpass([high], sr, 9000)[0]);
+  check("★ 9kHz 低通保留的高频远多于 3.6kHz", cut9k > cut36 * 2, `${cut36.toFixed(3)} vs ${cut9k.toFixed(3)}`);
+}
+
 console.log(`prosody: fail=${fail}`);
 process.exit(fail ? 1 : 0);
