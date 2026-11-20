@@ -13,6 +13,7 @@ import {
 import { buildDayPlan, dayKey, planForPrompt, type PlanItem } from "./dayPlan";
 import { upcomingAnniversaries } from "./anniversary";
 import { habitsLine, learnHabits } from "./speechHabits";
+import { keepTurnLocal, type TurnContext, type TurnIntent } from "./conversationTurn";
 import { addLoop, loopLine, markAnswered, type PendingLoop } from "./openLoopReview";
 import { evaluateGate, type GateResult } from "./proactiveGate";
 import {
@@ -146,7 +147,7 @@ export function tick(now = Date.now()): void {
 }
 
 /** 用户说了一句话：涨心情、掉精力、记原话、复核话头 */
-export function noteUserMessage(text: string, now = Date.now()): void {
+export function noteUserMessage(text: string, now = Date.now(), turn?: TurnContext): void {
   const d = load(now);
   d.state = noteInteraction(d.state, now);
   const t = (text || "").trim();
@@ -157,14 +158,17 @@ export function noteUserMessage(text: string, now = Date.now()): void {
   }
   d.loops = markAnswered(d.loops, now);
   // 道歉/哄人：负面情绪的半衰期打折（心软），好感小涨
-  if (looksLikeApology(t)) {
+  if (turn?.repairReason) {
+    // 只撤回被明确澄清的最近误会；不清掉其它负面情绪，也不凭空加好感。
+    d.affect = d.affect.filter(e => e.intensity >= 0 || e.reason !== turn.repairReason || now - e.startedAt > 20 * 60_000);
+  } else if (looksLikeApology(t)) {
     d.affect = soften(d.affect, 0.5);
     d.favor = applyAffect(d.favor, 0.3, now);
   }
   // 可能伤人的话：先按启发式记一条，强度低的会在下一轮被自己冲淡；
   // **半衰期由人设定**（懒散/爱吃的人设心软得快，其它人设记久一点）
   const hurt = insultStrength(t);
-  if (hurt > 0) {
+  if (hurt > 0 && turn?.intent !== "repair") {
     const soft = d.traits.includes("lazy") || d.traits.includes("food");
     d.affect = addEvent(d.affect, {
       id: `${now}:${t.slice(0, 10)}`,
@@ -295,10 +299,11 @@ export function plan(now = Date.now()): PlanItem[] {
  * 给模型看的「生活上下文」：状态 + 在做什么 + 纪念日 + 话头 + 口头禅。
  * 全部为空时返回空串（调用方据此不加任何东西）。
  */
-export function promptBlock(now = Date.now(), userText = ""): string {
+export function promptBlock(now = Date.now(), userText = "", intent?: TurnIntent): string {
+  if (intent === "progress") return ""; // 不让生活状态抢走用户刚报告的进度
   const d = load(now);
   const parts: string[] = [];
-  const life = lifeLine({ ...d.state, sleep: stageFor(now) }, now);
+  const life = intent === "close" ? "" : lifeLine({ ...d.state, sleep: stageFor(now) }, now);
   if (life) parts.push(`【你现在的状态】${life}`);
   const mood = moodLine(d.affect, now);
   if (mood) parts.push(`【你的情绪】${mood}`);
@@ -310,10 +315,11 @@ export function promptBlock(now = Date.now(), userText = ""): string {
   if (tone) parts.push(`【语气】${tone}`);
   const fav = favorLine(d.favor);
   if (fav) parts.push(`【关系】${fav}`);
-  // 深度：按"这一轮该说多透"给，生气时一律短而准
-  parts.push(`【说话的深浅】${depthLine(depthFor({ text: userText, mood: moodValue }))}`);
-  const sharp = sharpnessLine(moodValue);
+  // 手动聊天的任务深度不被心情截断；问候保留原来的深浅策略。
+  parts.push(`【说话的深浅】${depthLine(depthFor({ text: userText, mood: intent ? 0 : moodValue }))}`);
+  const sharp = intent === "close" || intent === "repair" ? "" : sharpnessLine(moodValue);
   if (sharp) parts.push(`【锋锐度】${sharp}`);
+  if (intent && keepTurnLocal(intent)) return parts.join("\n\n");
   const p = planForPrompt(plan(now), now);
   if (p) parts.push(`【你今天在做的事】\n${p}`);
   const ann = upcomingAnniversaries(d.firstMetAt, now, 7);

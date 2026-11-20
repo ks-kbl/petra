@@ -145,6 +145,8 @@ html[data-theme="dark"] .navbar{
 .section-head h1{margin:0 0 4px; font-size:20px; letter-spacing:.2px}
 .section-head p{margin:0; color:var(--txt2); font-size:13px}
 .grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(min(340px,100%), 1fr)); gap:16px}
+.tts-probe-list{display:flex; flex-direction:column; align-items:flex-start; gap:6px; padding-block:10px 4px}
+.tts-probe-list .btn{text-align:left; width:min(100%, 190px)}
 .card{
   border:1px solid var(--line); border-radius:var(--radius); background:var(--card);
   backdrop-filter:blur(14px); box-shadow:var(--shadow); padding:16px 18px; min-width:0;
@@ -688,7 +690,6 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
         },
         { title: "生图模型接入", desc: "", type: "imageaccess" },
         { title: "不会接 API？", desc: "", type: "promo" },
-        { title: "语音自检", desc: "", type: "ttsprobe" },
         { title: "最近生成的图", desc: "", type: "genimages" },
         { title: "预设", desc: "", type: "presets" },
         { title: "主动问候调度", desc: "", type: "greetstat" },
@@ -767,6 +768,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
             { type: "actions", items: [{ id: "tts-test", label: "试听一句" }] },
           ],
         },
+        { title: "语音自检", desc: "", type: "ttsprobe" },
         {
           title: "语音识别", desc: "语音输入。Windows 默认用系统识别（更准、不花识别费）；Mac/Linux 没有系统识别，自动走云端模型",
           fields: [
@@ -1781,6 +1783,9 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
       status.textContent = `状态：可用（${info ? info.label : provider}${curImg.model ? " · " + curImg.model : ""}）`;
     }
     card.appendChild(status);
+    const same = provider === meta.provider && (curImg.model || "") === (meta.model || "") && (curImg.customBaseUrl || "") === (meta.customBaseUrl || "");
+    card.appendChild(el("div", "rdesc", `文生图：${same && meta.generateStatus === "ok" ? "已成功生成" : "未验证"} · 图像编辑：${same && meta.editStatus === "ok" ? "已成功编辑" : same && meta.editStatus === "unsupported" ? "上次请求未找到可用接口" : "未验证"}`));
+    card.appendChild(el("div", "rdesc", "聊天里可贴图修改，或选「用这张图继续改 / 局部涂抹」。改图需要所选模型的 /images/edits 接口；多参考图与选区还取决于模型能力。"));
 
     // 生图总开关：关掉后即使配置齐全也不会画（和"没配置"是两回事，提示语不一样）
     card.appendChild(fieldNode({
@@ -2300,34 +2305,75 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
    * 为什么要对照组：用户听到"电音"时，最需要区分的是"我们的处理带来的"
    * 还是"端点给的音频本身就脏"。点一下关掉处理再听，答案立刻就有了。
    */
+  let ttsProbeUI = { id: "", message: "", error: false };
+  function renderTtsProbeStatus() {
+    const node = $("#tts-probe-status");
+    if (!node) return;
+    node.textContent = ttsProbeUI.message;
+    node.style.color = ttsProbeUI.error ? "var(--danger, #b7374d)" : "";
+  }
+
+  async function runTtsProbe(text, prosody) {
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const report = (message, error = false) => {
+      ttsProbeUI = { id, message, error };
+      renderTtsProbeStatus();
+    };
+    report("正在联系桌宠…");
+    try {
+      await api("/api/action", { method: "POST", body: JSON.stringify({
+        id: "__data:tts-probe", payload: { text, prosody, requestId: id },
+      }) });
+      const deadline = Date.now() + 45_000;
+      while (ttsProbeUI.id === id && Date.now() < deadline) {
+        const data = await api("/api/state");
+        if (ttsProbeUI.id !== id) return;
+        const probe = data.meta?.ttsProbe;
+        if (probe?.id === id) {
+          report(probe.message, probe.status === "error");
+          if (probe.status !== "playing") return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      if (ttsProbeUI.id === id) report("没有收到试听结果，请确认桌宠在线后重试。", true);
+    } catch (_) {
+      if (ttsProbeUI.id === id) report("无法联系桌宠，请确认桌宠在线后重试。", true);
+    }
+  }
+
   function ttsProbeCard() {
-    const card = el("div", "card wide");
+    const card = el("div", "card");
     card.appendChild(el("h2", null, "语音自检"));
-    card.appendChild(el("p", "cd", "点按钮直接用当前音色念一句（不经过模型、不花对话 token）。听到怪声时，最后那个「关掉语气处理」是关键对照。"));
+    card.appendChild(el("p", "cd", "用当前音色试听，不调用对话模型；声音从桌宠播放。"));
 
     const cases = [
       { label: "正常说一句", text: "今天天气不错，我们出去走走吧。", prosody: true },
       { label: "拖音（嗯……）", text: "嗯……这个我得先想想。", prosody: true },
       { label: "生气（哼）", text: "哼，我才不信呢。", prosody: true },
       { label: "好奇（诶？）", text: "诶？你刚才说什么？", prosody: true },
+      { label: "不屑（切）", text: "切，彩虹卡就把本鱼藏的红烧肉编进文案了？", prosody: true },
+      { label: "咂嘴（啧）", text: "啧，这次差一点就成了。", prosody: true },
+      { label: "轻声（嘘）", text: "嘘，别把它吵醒了。", prosody: true },
+      { label: "短笑（哈）", text: "哈，你还真信了。", prosody: true },
     ];
-    const row = el("div", "btn-row");
+    const row = el("div", "tts-probe-list");
     cases.forEach((c) => {
       const b = el("button", "btn btn-sm", c.label);
-      b.onclick = () => runAction("__data:tts-probe", "语音试听", { text: c.text, prosody: c.prosody });
+      b.onclick = () => void runTtsProbe(c.text, c.prosody);
       row.appendChild(b);
     });
     card.appendChild(row);
 
     const row2 = el("div", "btn-row");
-    const plain = el("button", "btn btn-sm", "关掉语气处理，再念第一句（对照）");
-    plain.onclick = () => runAction("__data:tts-probe", "语音对照试听", {
-      text: "嗯……这个我得先想想。",
-      prosody: false,
-    });
-    row2.appendChild(plain);
+    const plain = el("button", "btn btn-sm", "嗯……（关闭本地处理对照）");
+    plain.onclick = () => void runTtsProbe(cases[1].text, false);
+    const status = el("span", "rdesc", ttsProbeUI.message);
+    status.id = "tts-probe-status";
+    status.setAttribute("role", "status");
+    if (ttsProbeUI.error) status.style.color = "var(--danger, #b7374d)";
+    row2.append(plain, status);
     card.appendChild(row2);
-    card.appendChild(el("div", "rdesc", "同一句「嗯……」带处理和不带处理各听一遍：如果只有带处理的那遍怪，是拉伸算法的问题；两遍都怪，就是音色/端点给的音频本身的问题。"));
+    card.appendChild(el("div", "rdesc", "同一句「嗯……」可以分别试听有无本地处理；关闭对照不会改变平时的语气设置。"));
     return card;
   }
 

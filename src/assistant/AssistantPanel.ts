@@ -1,6 +1,8 @@
 import { lifeRuntime } from "./lifeRuntime";
 import { filterMentionable } from "./mentionScore";
 import { voiceCapabilityLine } from "./voiceTone";
+import { readTurn, keepTurnLocal, turnReplyGuide } from "./conversationTurn";
+import { builtinConversationExamples } from "./builtinPersonas";
 import { recentDiaryBrief, weeklyDiaryMood } from "../features/diary/DiaryManager";
 import { extractDiaryFacts, memoryLineFor } from "./diaryMemory";
 import { textSimilarity } from "./memoryOps";
@@ -50,6 +52,8 @@ import {
 } from "./moodTrend";
 import { detectCorrection } from "./correction";
 import { generateImage, listImageModelsSafe } from "./AssistantClient";
+import { asksImageEdit, isExplicitImageOperation, allowsMultiImageEdit, imageCapabilityKey, recordImageCapability, selectImageSources, requestImageEdit, type ImageRef } from "./imageEditing";
+import { drawImageMask } from "./imageMask";
 import { resolveImageBase, imageKeyScope, imagePresetKeyScope, currentImageKeyScope, defaultImageModels, isImageConfigured } from "./imageProviders";
 import { hasSendableContent, composeUserMessage } from "./sendCompose";
 import {
@@ -238,7 +242,48 @@ function takeDraft(): string {
 }
 
 /** 本轮要发给模型的图片（dataURL）。只在这一次请求里编码，不写进历史 */
-let pendingImages: { name: string; dataUrl: string }[] = [];
+let pendingImages: ImageRef[] = [];
+let activeImageRefs: ImageRef[] = [];
+let activeImageAt = 0;
+
+async function pickImageMask(ref: ImageRef) {
+  try {
+    const mask = await drawImageMask(ref);
+    if (!mask) return;
+    await openAssistant();
+    pendingImages = [{ ...ref, name: `${ref.name} · 局部选区`, mask, selected: true }];
+    if (attachBar) renderAttachBar(attachBar);
+    input?.focus();
+    resetTimer();
+  } catch { toast("无法打开图片选区", "warn"); }
+}
+
+function addEditImageButton(host: HTMLElement, ref: ImageRef) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "as-btn";
+  button.textContent = "用这张图继续改";
+  button.onclick = async (e) => {
+    e.stopPropagation();
+    await openAssistant();
+    const existing = pendingImages.findIndex(img => img.dataUrl === ref.dataUrl);
+    if (existing >= 0) pendingImages[existing] = { ...pendingImages[existing], selected: true };
+    else {
+      if (pendingImages.length >= ATTACH_IMAGE_LIMIT) { toast("请先移除不需要的参考图", "info"); return; }
+      pendingImages.push({ ...ref, selected: true });
+    }
+    if (attachBar) renderAttachBar(attachBar);
+    input?.focus();
+    resetTimer();
+  };
+  host.appendChild(button);
+  const mask = document.createElement("button");
+  mask.type = "button";
+  mask.className = "as-btn";
+  mask.textContent = "局部涂抹";
+  mask.onclick = (e) => { e.stopPropagation(); void pickImageMask(ref); };
+  host.appendChild(mask);
+}
 /** 本轮附加的文本文件（读完直接并进消息正文，随历史保存） */
 let pendingTextFiles: { name: string; text: string }[] = [];
 /** 输入框上方的附件条 */
@@ -818,12 +863,16 @@ function takeTurnNudge(userText = ""): string {
     if (!shouldNudge(nudgeState)) return "";
     // 先看"这次的对话留下的线头"，再退回"很久没提的旧事实"
     const loop = pickOpenLoop(nudgeState, chatSummary.openLoops);
-    if (loop) {
+    // 旧话头必须和本轮有实质命中；单靠以前重要或很久没提过，不足以插话。
+    const relatedLoop = loop && rankMemories([{
+      id: "open-loop", content: loop, category: "event", importance: 2, lastUsedAt: Date.now(), createdAt: Date.now(),
+    }], { userText }, { requireMatch: true }).length > 0;
+    if (loop && relatedLoop) {
       nudgeState = markNudged(nudgeState, Date.now(), loop);
       saveNudgeState();
       return nudgeBlock({ content: loop });
     }
-    const cand = pickNudgeCandidate(memory);
+    const cand = pickNudgeCandidate(recallRelevantMemories({ userText }, true));
     if (!cand) return "";
     nudgeState = markNudged(nudgeState);
     saveNudgeState();
@@ -1692,7 +1741,7 @@ function bubbleBody(b: HTMLElement): HTMLElement {
  * 生成图片后，在对话里直接显示缩略图（点一下用系统看图打开）。
  * 以前只把路径写在文字里，用户既看不到图、点 `[查看图片]` 也没反应。
  */
-async function addImageBubble(path: string) {
+async function addImageBubble(path: string, root?: ImageRef[]) {
   try {
     const dataUrl = await invoke<string>("read_image_data_url", { path });
     ensureBubbles();
@@ -1707,6 +1756,10 @@ async function addImageBubble(path: string) {
       void invoke("open_path", { path }).catch(() => toast(`图片在：${path}`, "info"));
     });
     b.appendChild(img);
+    const ref: ImageRef = { name: path.split(/[\\/]/).pop() || "生成图片", dataUrl, root };
+    activeImageRefs = [ref];
+    activeImageAt = Date.now();
+    addEditImageButton(b, ref);
     attachBubbleClose(b);
     bubbles?.appendChild(b);
     setTimeout(() => b.scrollIntoView({ block: "nearest", behavior: "smooth" }), 50);
@@ -1717,14 +1770,14 @@ async function addImageBubble(path: string) {
  * 生图期间把等待气泡换成"进度 + 取消"。
  * 生图要 25 秒生成 + 30 秒下载，只写"正在画"用户会以为卡死。
  */
-function startGenProgress(bubble: HTMLElement, onCancel: () => void): () => void {
+function startGenProgress(bubble: HTMLElement, onCancel: () => void, action = "画图"): () => void {
   const body = bubbleBody(bubble);
   const started = Date.now();
   const render = () => {
     const sec = Math.round((Date.now() - started) / 1000);
     body.innerHTML = "";
     const span = document.createElement("span");
-    span.textContent = `正在画图…已 ${sec} 秒（通常 1 分钟左右）`;
+    span.textContent = `正在${action}…已 ${sec} 秒（通常 1 分钟左右）`;
     const btn = document.createElement("button");
     btn.className = "as-cancel-btn";
     btn.textContent = "取消";
@@ -1780,7 +1833,7 @@ function attachBubbleClose(b: HTMLElement): void {
  * 用户会怀疑「到底发出去了吗」。这里把缩略图留在用户气泡里，下一轮 AI 气泡进来时
  * 再由 trimBubbles 按「保留最近一条 user」的规则收掉。
  */
-function addUserAttachmentBubble(text: string, images: string[]) {
+function addUserAttachmentBubble(text: string, images: ImageRef[]) {
   if (!images.length) return;
   ensureBubbles();
   const b = document.createElement("div");
@@ -1794,12 +1847,15 @@ function addUserAttachmentBubble(text: string, images: string[]) {
   }
   const grid = document.createElement("div");
   grid.className = "as-user-imgs";
-  images.forEach((src, i) => {
+  images.forEach((ref, i) => {
     const img = document.createElement("img");
     img.className = "as-user-img";
-    img.src = src;
+    img.src = ref.dataUrl;
     img.alt = images.length > 1 ? `发送的图片 ${i + 1}` : "发送的图片";
-    grid.appendChild(img);
+    const item = document.createElement("div");
+    item.appendChild(img);
+    addEditImageButton(item, ref);
+    grid.appendChild(item);
   });
   body.appendChild(grid);
   b.appendChild(body);
@@ -2055,6 +2111,8 @@ export function repositionAssistantBubbles(): void {
 
 /** 清空对话历史（保留长期记忆 memory） */
 export function clearHistory() {
+  activeImageRefs = [];
+  activeImageAt = 0;
   history = [];
   resetChatSummary();
   lastExtractedAt = 0;
@@ -2151,9 +2209,9 @@ function buildChatContext(nickname: string, outputLang: string): string {
   // 只允许用设置里那一个称呼，不许随语境换着叫。
   if (nickname) {
     if (outputLang && outputLang !== "zh-cn") {
-      parts.push(`用户昵称：${nickname}（用${langNameOf(outputLang)}称呼，不要翻译成中文，也不要换成别的叫法）`);
+      parts.push(`用户昵称：${nickname}（用${langNameOf(outputLang)}称呼，不要翻译成中文，也不要换成别的叫法；不需要每轮都称呼）`);
     } else {
-      parts.push(`对用户的称呼固定是「${nickname}」，这轮也只这么叫，不要换别的称呼`);
+      parts.push(`对用户的称呼固定是「${nickname}」，用到时只这么叫，也可以不称呼`);
     }
   } else {
     parts.push("对用户的称呼没有指定：直接用「你」，不要自创昵称");
@@ -2170,33 +2228,31 @@ async function send(text: string) {
   if (recognizer?.isRecording()) recognizer.cancel();
   if (busy) return;
   markConversationActivity();
-  // 生活状态：用户开口就算一次互动（涨心情、掉精力、顺手复核话头、学口头禅）
-  lifeRuntime.noteUserMessage(text, Date.now());
   const s = loadSettings();
   const ttsKey = await invoke<string>("get_tts_key").catch(() => "");
   ttsPlayer.setConfig(s.tts.enabled, ttsKey, s.tts.speakerId, s.assistant.outputLanguage ?? "");
   // 新消息开始就掐掉上一段语音：否则旧回复还在朗读，新回复的语音排在旧队列后面，
   // 用户听到的内容和屏幕上的新回复完全对不上。
   if (s.tts.enabled) ttsPlayer.stop();
-  const apiKey = await ensureApiKey();
   if (!s.assistant.enabled) {
     const b = addBubble("sys", "小助手模式没开，右键 →「小助手模式」打开");
     scheduleFade(b, 4000);
     return;
   }
   // 本地 Ollama / 本机自定义端点不需要 Key，这里不能再按"Key 为空"拦下
-  if (!isProviderReady(s.assistant, apiKey)) {
+  const directEdit = !!text.trim() && (pendingImages.some(ref => ref.selected) || isExplicitImageOperation(text) || asksImageEdit(text, pendingImages.length > 0 || (activeImageRefs.length > 0 && Date.now() - activeImageAt < 2 * 3600_000), !pendingImages.length));
+  const apiKey = directEdit ? "" : await ensureApiKey();
+  if (!directEdit && !isProviderReady(s.assistant, apiKey)) {
     const b = addBubble("sys", "还没配 API Key，请到「小助手设置」填写（本地 Ollama 可留空）");
     scheduleFade(b, 4000);
     return;
   }
-  if (!s.assistant.persona.trim()) {
+  if (!directEdit && !s.assistant.persona.trim()) {
     const b = addBubble("sys", "请先在「小助手设置」填人格设定（必填）");
     scheduleFade(b, 5000);
     return;
   }
-  // 本轮要不要顺口提起一件旧事（有频率上限，提过就冷却）
-  const turnNudge = takeTurnNudge(text);
+
   const outLang = s.assistant.outputLanguage;
   // 换语言时清空对话历史。
   // 以前用内存变量 lastChatLang 作基准，重启后初值为空 → 第一次发送就误清历史；
@@ -2215,6 +2271,11 @@ async function send(text: string) {
     s.assistant.historyLang = outLang;
     saveSettings(s);
   }
+  const now = Date.now();
+  const turn = readTurn(text, history, pendingImages.length + pendingTextFiles.length > 0, now);
+  const localTurn = keepTurnLocal(turn.intent);
+  const turnNudge = turn.intent === "open" && text.trim() ? takeTurnNudge(text) : "";
+  lifeRuntime.noteUserMessage(text, now, turn);
   // 附件：文本文件直接并进正文（模型立刻看得到）；图片只在本轮请求里编码成多模态，
   // 历史里只留一句占位，避免 base64 把 chat-history 和请求体一起撑爆。
   const attachText = pendingTextFiles
@@ -2225,11 +2286,22 @@ async function send(text: string) {
   const imagesForTurn = pendingImages.map((i) => i.dataUrl);
   const sentImages = pendingImages.slice();
   const composed = composeUserMessage(text, attachText, pendingImages);
+  if (sentImages.some(ref => ref.selected) && !text.trim()) {
+    toast("请先说一句要怎么改，选图已保留", "info");
+    return;
+  }
   clearAttachments();
   // 带图片就回显一条「你发的」气泡：附件条清空后，用户看不到自己到底发了哪张图。
-  if (sentImages.length) addUserAttachmentBubble(text.trim(), sentImages.map((i) => i.dataUrl));
+  if (sentImages.length) addUserAttachmentBubble(text.trim(), sentImages);
+  const currentRefs = Date.now() - activeImageAt < 2 * 3600_000 ? activeImageRefs : [];
+  const editSources = selectImageSources(text, sentImages, currentRefs);
+  const explicitEdit = !!text.trim() && (sentImages.some(ref => ref.selected) || isExplicitImageOperation(text) || asksImageEdit(text, editSources.length > 0, !sentImages.length));
+  if (sentImages.length && (!sentImages.some(ref => ref.selected) || text.trim())) {
+    activeImageRefs = sentImages.map(({ mask: _mask, selected: _selected, ...ref }) => ref);
+    activeImageAt = Date.now();
+  }
   // 用户提到"之前/上次/让你/计时"等旧事：先自动检索一次完整历史（模型也保留工具备查）
-  const historyRecall = await autoRecallHistory(composed);
+  const historyRecall = localTurn || explicitEdit ? "" : await autoRecallHistory(text || composed);
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑。
   // 但它**不进历史**——交给 chatStream 的 tailInstruction 在发送时贴到最后一行，
   // 否则之后每一条历史 user 消息都会带着同一句提醒，纯烧 token。
@@ -2249,11 +2321,11 @@ async function send(text: string) {
   lastSentText = text.trim();
   lastSentAt = Date.now();
   // 情感反馈：先分析用户消息（零 token），立即驱动角色表情/动作 + 心情
-  const userEmo = classifyEmotion(text);
+  const userEmo = turn.intent === "repair" ? "neutral" : classifyEmotion(text);
   // 生气了可以"不干活"：只拒社交类请求，第二次必做、每天最多 2 次、
   // 说「认真的」立刻照做（边界见 refusal.ts）。拒绝也要说清楚为什么。
   {
-    const refuseLine = lifeRuntime.maybeRefuse(text, Date.now());
+    const refuseLine = explicitEdit || turn.intent === "repair" || turn.intent === "close" || turn.intent === "progress" ? "" : lifeRuntime.maybeRefuse(text, Date.now());
     if (refuseLine) {
       const b = addBubble("ai", refuseLine);
       scheduleFade(b, 9000);
@@ -2269,7 +2341,7 @@ async function send(text: string) {
   // 只在本轮生效、不进历史 —— 图片 base64 很大，进历史会把存储撑爆。
   const screenshot: { image: string | undefined } = { image: undefined };
   let autoScreenAttached = false;
-  if (s.assistant.autoScreen !== false && !imagesForTurn.length && looksLikeScreenReference(text)) {
+  if (!explicitEdit && s.assistant.autoScreen !== false && !imagesForTurn.length && looksLikeScreenReference(text)) {
     try {
       screenshot.image = await invoke<string>("capture_screen");
       autoScreenAttached = Boolean(screenshot.image);
@@ -2286,7 +2358,16 @@ async function send(text: string) {
     const budget = new ToolLoopBudget({ maxRounds: Infinity, maxCalls: Infinity });
     // 人设锚点：整轮只算一次（设置改了才会变），贴在请求末尾防"越聊越像客服"
     const personaAnchor = composePersonaAnchor(s.assistant);
+    const chatPersona = [s.assistant.persona, builtinConversationExamples(s.assistant.personaFields, s.assistant.personaFree)].filter(Boolean).join("\n\n");
     // 生图是否就绪（独立接入 + Key）只在这一轮开始时查一次，别每轮重复打 IPC
+    if (explicitEdit) {
+      const result = await runImageEdit(text, editSources, loading);
+      setBubbleText(loading, result);
+      pushHistory({ role: "assistant", content: result });
+      saveHistory();
+      scheduleFade(loading, readingHoldMs(result, 8000));
+      return;
+    }
     const imgState = await imageReadyState();
     let finished = false;
     let streamEmo: EmotionTag = "neutral";
@@ -2300,17 +2381,16 @@ async function send(text: string) {
         enabled: Boolean(s.tts.enabled),
         hasVoice: Boolean(s.tts.speakerId),
       });
-      const diaryBrief = recentDiaryBrief(3);
-      const moodWeek = weeklyDiaryMood();
+      const diaryBrief = localTurn ? "" : recentDiaryBrief(3);
+      const moodWeek = localTurn ? "" : weeklyDiaryMood();
       const lifeCtx = [
-        lifeRuntime.promptBlock(Date.now(), text),
+        lifeRuntime.promptBlock(Date.now(), text, turn.intent),
         voiceCtx,
         diaryBrief ? `【你最近写过的日记（只有主题，要全文就用 view_diary）】\n${diaryBrief}` : "",
         moodWeek ? `【这几天的情绪】${moodWeek}` : "",
       ].filter(Boolean).join("\n\n");
-      const ctxMemories = recallRelevantMemories({ timeOfDay: timeOfDayKey(), userText: text });
+      const ctxMemories = localTurn || !text.trim() ? [] : recallRelevantMemories({ userText: text }, true);
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
-      const personaWithLang = s.assistant.persona;
       // 生图能力要和模型说清楚：没配生图接入就**当场如实说明**，别硬调工具再报"接口没连上"。
       // 生图现在是独立接入（自己的供应商/端点/Key），不再看对话端点"像不像能画图"。
       const imageCtx = imgState.ready
@@ -2325,16 +2405,17 @@ async function send(text: string) {
         buildChatContext(s.assistant.nickname, s.assistant.outputLanguage ?? "") +
         (lifeCtx ? "\n\n" + lifeCtx : "") +
         "\n\n" + imageCtx + "\n\n" + recentImageBlock() +
+        (editSources.length ? `\n【当前图片】有 ${editSources.length} 张用户附件或对话图片。明确要求修改时用 edit_image，写清改动和保留项；不要用 generate_image 替代。指代不清先问。` : "") +
         (autoScreenAttached ? "\n\n" + AUTO_SCREEN_NOTE : "") +
         (expiredNote ? "\n\n" + expiredNote : "") +
-        "\n\n" + langInstruction;
+        "\n\n" + turnReplyGuide(turn.intent, turn.replyToGreeting) + "\n\n" + langInstruction;
 
       const res = await chatStream(
         s.assistant.provider,
         apiKey,
         s.assistant.model,
         history,
-        personaWithLang,
+        chatPersona,
         ctxMemories,
         s.assistant.customBaseUrl,
         (delta) => {
@@ -2353,13 +2434,13 @@ async function send(text: string) {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
           ...(imagesForTurn.length ? { userImages: imagesForTurn } : {}),
           // 没接入生图（或没填 Key）时干脆不暴露这个工具，模型就不会"先调一下试试"再报错
-          ...(imgState.ready ? {} : { disabledTools: ["generate_image"] }),
+          disabledTools: imgState.ready ? (editSources.length ? [] : ["edit_image"]) : ["generate_image", "edit_image"],
           extraTools: pluginRuntime.getOpenAITools(),
-          // 画像 + 最近情绪只走 system prompt：模型知道"这是什么样的人、最近过得怎样"，
+          // 画像 + 最近情绪只进本轮附加上下文：模型知道"这是什么样的人、最近过得怎样"，
           // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
-          profileText: [personaContextBlock(), turnNudge, historyRecall].filter(Boolean).join("\n\n"),
+          profileText: [localTurn ? "" : personaContextBlock(), turnNudge, historyRecall].filter(Boolean).join("\n\n"),
           // 长聊之后补上被窗口切掉的旧对话，避免"聊到一半突然不认识你"
-          historySummary: summaryBlock(chatSummary),
+          historySummary: localTurn ? "" : summaryBlock(chatSummary),
           // 语言提醒只贴在本轮请求最后一行，不写进历史
           ...(langReminder ? { tailInstruction: langReminder } : {}),
           // 人设锚点：人设完整文本在 system 最前面，太远了，这里再补一句短提醒
@@ -2371,7 +2452,7 @@ async function send(text: string) {
       if (res.toolCalls.length) {
         // 工具调用：执行后进入下一轮
         if (budget.rounds === 1 && !streamed) setBubbleText(loading, "");
-        await handleToolCalls(res.toolCalls, loading, budget, screenshot);
+        await handleToolCalls(res.toolCalls, loading, budget, screenshot, editSources);
         continue;
       }
 
@@ -2543,13 +2624,47 @@ async function send(text: string) {
   }
 }
 
+async function runImageEdit(prompt: string, sources: ImageRef[], loading: HTMLElement): Promise<string> {
+  const st = loadSettings();
+  const hint = "请检查「控制面板 → 小助手 → 生图模型接入」。";
+  const cfg = st.assistant.image;
+  if (st.assistant.imageEnabled === false) return "生图与改图已关闭。" + hint;
+  if (!sources.length) return "请先上传或选中要修改的原图。";
+  if (sources.length > 1 && !allowsMultiImageEdit(prompt)) return "有多张候选图片。请点「用这张图继续改」选一张，或说明要把多张图一起用。";
+  if (!cfg || !isImageConfigured(cfg)) return "还没有接入生图模型。" + hint;
+  const base = resolveImageBase(cfg.provider, cfg.customBaseUrl);
+  const model = (cfg.model || defaultImageModels(cfg.provider)[0] || "").trim();
+  const capKey = imageCapabilityKey(cfg.provider, cfg.customBaseUrl || "", model, cfg.activePresetId);
+  const ctrl = new AbortController();
+  const stop = startGenProgress(loading, () => ctrl.abort(), "改图");
+  try {
+    const key = await getApiKey(currentImageKeyScope(cfg)).catch(() => "");
+    const lookLocal = cfg.provider === "custom" && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:\/]|$)/i.test(base);
+    if (!key && !lookLocal) return "还没配置生图 Key。" + hint;
+    const img = await requestImageEdit({ base, apiKey: key, model, prompt, images: sources, mask: sources.find(ref => ref.mask)?.mask, signal: ctrl.signal });
+    if (ctrl.signal.aborted) return "已取消改图，原图未改动。";
+    const path = img.base64
+      ? await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 })
+      : await invoke<string>("save_image_from_url", { url: img.url ?? "", nameHint: "" });
+    rememberGenImage({ path, prompt, model, ts: Date.now() });
+    recordImageCapability(capKey, "edit", "ok");
+    await addImageBubble(path, sources.flatMap(ref => ref.root ?? [ref]).map(({ mask: _mask, selected: _selected, ...ref }) => ref));
+    return `改好了，已另存到桌面，原图未覆盖：${path}`;
+  } catch (e) {
+    if (ctrl.signal.aborted) return "已取消改图，原图未改动。";
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.startsWith("此接入未提供")) recordImageCapability(capKey, "edit", "unsupported");
+    return `改图失败，原图未改动：${msg}`;
+  } finally { stop(); }
+}
+
 /** 把提示合并到工具结果前面（一个 tool_call 只能对应一条 tool 消息，不能多发一条） */
 function withHint(text: string, hint: string): string {
   return hint ? `${hint}\n${text}` : text;
 }
 
 /** 处理工具调用：先 push assistant tool_calls 消息，再逐个执行并 push tool 消息 */
-async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: ToolLoopBudget, screenshot: { image: string | undefined }) {
+async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: ToolLoopBudget, screenshot: { image: string | undefined }, editSources: ImageRef[] = []) {
   // assistant 消息带 tool_calls（content 为 null 规范格式；DeepSeek 要求 tool 消息紧跟它）
   pushHistory({
     role: "assistant",
@@ -2858,6 +2973,16 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
     }
     // ---------- 生图 ----------
     // 模型名：用户填过就用用户的；没填就从 /models 里自动识别（并存下来，下次直接用）
+    if (tc.name === "edit_image") {
+      const latest = [...history].reverse().find(m => m.role === "user")?.content ?? "";
+      if (!asksImageEdit(latest, editSources.length > 0, true) && !editSources.some(ref => ref.selected)) {
+        pushHistory({ role: "tool", tool_call_id: tc.id, content: "没有收到明确的改图授权。请用户说明改图并选原图，不要另画。" });
+        continue;
+      }
+      const result = await runImageEdit(String(tc.args.prompt || ""), editSources, loading);
+      pushHistory({ role: "tool", tool_call_id: tc.id, content: result });
+      continue;
+    }
     if (tc.name === "generate_image") {
       const st = loadSettings();
       const cfg = st.assistant.image;
@@ -2920,9 +3045,10 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
           ? await invoke<string>("save_desktop_image", { nameHint: "", base64: img.base64 })
           : await invoke<string>("save_image_from_url", { url: img.url ?? "", nameHint: "" });
         rememberGenImage({ path, prompt: String(tc.args.prompt || ""), model: img.model, ts: Date.now() });
+        recordImageCapability(imageCapabilityKey(imgCfg.provider, imgCfg.customBaseUrl || "", img.model, imgCfg.activePresetId), "generate", "ok");
         pushHistory({ role: "tool", tool_call_id: tc.id, content: `已用 ${img.model} 生成图片并保存到桌面：${path}` });
         toast(`画好了（${img.model}），已存到桌面：${path}`, "info");
-        void addImageBubble(path);
+        await addImageBubble(path);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         if (/abort/i.test(msg)) {
@@ -3196,9 +3322,9 @@ function recallRelevantMemories(context: {
   currentTitle?: string;
   idleMinutes?: number;
   userText?: string;
-}): MemoryEntry[] {
+}, requireMatch = false): MemoryEntry[] {
   if (memory.length === 0) return [];
-  return rankMemories(memory, context, { limit: 4, minScore: 5 }).map((r) => r.entry);
+  return rankMemories(memory, context, { limit: 4, minScore: 5, requireMatch }).map((r) => r.entry);
 }
 
 /**

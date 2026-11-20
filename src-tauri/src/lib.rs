@@ -1023,29 +1023,16 @@ fn should_accept_input(
         // 一次取不到就整窗穿透，会让菜单和按钮「点了没反应」
         return fallback;
     };
-    if point_in_interactive_regions(x, y, &snapshot.regions) {
-        return true;
-    }
-    // 坐标系不匹配的兜底：前端上报的是「CSS px × devicePixelRatio」，而 Win32 的
-    // ScreenToClient 在高 DPI / WebView 缩放下可能给出另一套刻度（实测 200% 缩放下
-    // 差将近 2 倍）。用「前端视口 / 客户端实际尺寸」求出换算比再试一次，
-    // 否则表现就是「明明指着宠物却整窗穿透，点不动也拖不动」。
-    if let Some((vw, vh)) = snapshot.viewport_px {
-        if vw > 1.0 && vh > 1.0 {
-            if let Some((cw, ch)) = client_size {
-                if cw > 1 && ch > 1 {
-                    let kx = vw / cw as f32;
-                    let ky = vh / ch as f32;
-                    let sx = (x as f32 * kx).round() as i32;
-                    let sy = (y as f32 * ky).round() as i32;
-                    if point_in_interactive_regions(sx, sy, &snapshot.regions) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
+    // 区域是 CSS 像素，光标是原生客户端坐标。能换算时只判 CSS 点一次；
+    // 先判原始坐标再补判 CSS 会让高 DPI 下透明处出现一块错位的重复拦截区。
+    let (x, y) = match (snapshot.viewport_px, client_size) {
+        (Some((vw, vh)), Some((cw, ch))) if vw > 1.0 && vh > 1.0 && cw > 1 && ch > 1 => (
+            (x as f64 * vw as f64 / cw as f64).floor() as i32,
+            (y as f64 * vh as f64 / ch as f64).floor() as i32,
+        ),
+        _ => (x, y),
+    };
+    point_in_interactive_regions(x, y, &snapshot.regions)
 }
 
 #[tauri::command]
@@ -5817,7 +5804,7 @@ fn get_window_scale_factor(app: &AppHandle) -> f64 {
         .unwrap_or(1.0)
 }
 
-/// 唯一的光标穿透决策线程。region 与光标均使用物理客户端坐标。
+/// 唯一的光标穿透决策线程。原生光标坐标在命中判定时统一换算到前端视口。
 fn spawn_clickthrough_watcher(app: AppHandle) {
     std::thread::spawn(move || {
         let mut menu_outside_notified = false;
@@ -6032,6 +6019,17 @@ mod interaction_tests {
             now - INTERACTION_STATE_STALE_AFTER - std::time::Duration::from_millis(1),
         );
         assert!(!should_accept_input(&snapshot, false, false, Some((0, 0)), now, false, None));
+    }
+
+    #[test]
+    fn dpi_conversion_does_not_accept_unscaled_ghost_region() {
+        let now = std::time::Instant::now();
+        let mut snapshot = fresh_snapshot(vec![region("pet", 100, 100, 100, 100)], now);
+        snapshot.viewport_px = Some((700.0, 700.0));
+        let client = Some((1400, 1400));
+        for (point, accepted) in [((150, 150), false), ((199, 300), false), ((200, 200), true), ((399, 399), true), ((400, 300), false)] {
+            assert_eq!(should_accept_input(&snapshot, false, false, Some(point), now, false, client), accepted);
+        }
     }
 
     #[test]
