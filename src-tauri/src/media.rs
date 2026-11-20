@@ -192,6 +192,7 @@ pub fn start_media_poller(app: AppHandle) {
                     let picked = pick_best_session(&manager);
                     match picked {
                         Some((rank, np)) if rank > 0 => {
+                            crate::update_media_snapshot(&np);
                             let identity = format!("{}|{}|{}", np.title, np.artist, np.app_id);
                             if identity != last_identity {
                                 last_identity = identity;
@@ -218,6 +219,7 @@ pub fn start_media_poller(app: AppHandle) {
                         }
                         // 只有视频会话（rank=0）或根本没有会话：当作"没在放音乐"，不弹歌词。
                         _ => {
+                            crate::update_media_snapshot(&NowPlaying::default());
                             if last_key != "__none__" {
                                 last_key = String::from("__none__");
                                 last_identity = String::new();
@@ -227,6 +229,7 @@ pub fn start_media_poller(app: AppHandle) {
                     }
                 }
                 Err(e) => {
+                    crate::update_media_snapshot(&NowPlaying::default());
                     fail_streak += 1;
                     if fail_streak == 1 || fail_streak % 30 == 0 {
                         crate::log_warn(&format!("[media] SMTC 不可用：{e}"));

@@ -144,6 +144,7 @@ pub fn start_media_poller(app: AppHandle) {
         let mut had_session = false;
         loop {
             let np = sample_now_playing();
+            crate::update_media_snapshot(&np);
             let interval = if np.has_session {
                 if np.playing {
                     POLL_PLAYING_MS

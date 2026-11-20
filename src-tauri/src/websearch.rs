@@ -7,10 +7,11 @@
 //! **为什么要做多引擎兜底**：原来只走 DuckDuckGo 一个源，国内网络经常连不上，
 //! 或者被 DDG 判成爬虫直接返回一个" anomaly"挑战页（HTTP 202、0 条结果），
 //! 表现出来就是用户说的"联网搜索老是抽风，搜不到东西"。
-//! 现在按 DuckDuckGo → Bing → 百度 依次尝试，任何一个拿到结果就返回；
-//! 全挂了才报错，并且把每个引擎的失败原因一起带回去，让模型能换个说法再试或如实说查不到。
+//! 并发收集引擎结果，按主查询去重和重排；所有引擎失败才返回汇总错误。
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +36,8 @@ const UA: &str =
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 并发竞速的总预算：到点就用手上最好的结果（或报错），不让用户干等
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(9);
+/// 首批到达后再等一小段，兼顾第二个来源和响应时间。
+const ENGINE_GRACE: Duration = Duration::from_millis(1500);
 /// 成功结果的缓存时长：模型爱对同一个词连搜两三次，缓存一下能省掉一半请求。
 const CACHE_TTL: Duration = Duration::from_secs(180);
 
@@ -92,7 +95,7 @@ fn search_blocking(query: &str, limit: Option<usize>) -> Result<Vec<SearchHit>, 
         return Ok(hits);
     }
 
-    // 三个引擎**并发**跑，谁先拿到结果用谁。
+    // 多个引擎并发；首批到达后给其它来源一个短收集窗口。
     //
     // 为什么不串行：实测这台机器上 DuckDuckGo 是连不上的（8 秒超时），串行的话每次搜索
     // 都要先白等 8 秒再用 Bing，用户体感就是"点了没反应"。并发之后最慢也就等最慢的那个。
@@ -119,9 +122,9 @@ fn search_blocking(query: &str, limit: Option<usize>) -> Result<Vec<SearchHit>, 
     }
     drop(tx);
 
-    let deadline = Instant::now() + TOTAL_TIMEOUT;
+    let mut deadline = Instant::now() + TOTAL_TIMEOUT;
     let mut problems: Vec<String> = Vec::new();
-    let mut first: Option<Vec<SearchHit>> = None;
+    let mut all = Vec::new();
     loop {
         let left = match deadline.checked_duration_since(Instant::now()) {
             Some(d) if !d.is_zero() => d,
@@ -134,15 +137,15 @@ fn search_blocking(query: &str, limit: Option<usize>) -> Result<Vec<SearchHit>, 
                         h.engine = name.to_string();
                     }
                 }
-                first = Some(hits);
-                break;
+                if all.is_empty() && !hits.is_empty() { deadline = deadline.min(Instant::now() + ENGINE_GRACE); }
+                all.append(&mut hits);
             }
             Ok((name, Err(e))) => problems.push(format!("{name}：{e}")),
             Err(_) => break,
         }
     }
 
-    let Some(mut hits) = first else {
+    if all.is_empty() {
         if problems.is_empty() {
             problems.push("所有引擎都超时了".to_string());
         }
@@ -150,9 +153,9 @@ fn search_blocking(query: &str, limit: Option<usize>) -> Result<Vec<SearchHit>, 
             "所有搜索引擎都没拿到结果。{}。可以换个更短或更常见的关键词再试一次，或者直接告诉用户这次暂时查不到。",
             problems.join("；")
         ));
-    };
+    }
 
-    hits = dedupe(hits, limit);
+    let hits = dedupe(rank_hits(all, q, usize::MAX), limit);
     cache_put(key, &hits);
     Ok(hits)
 }
@@ -254,7 +257,15 @@ fn dedupe(hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
     let mut seen: Vec<String> = Vec::new();
     let mut out: Vec<SearchHit> = Vec::new();
     for h in hits {
-        let key = h.url.trim().to_lowercase();
+        let Ok(mut url) = reqwest::Url::parse(h.url.trim()) else { continue; };
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() { continue; }
+        url.set_fragment(None);
+        let pairs: Vec<_> = url.query_pairs().filter(|(k, _)| {
+            !k.starts_with("utm_") && !matches!(k.as_ref(), "fbclid" | "gclid")
+        }).into_iter().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        url.set_query(None);
+        if !pairs.is_empty() { url.query_pairs_mut().extend_pairs(pairs); }
+        let key = url.to_string();
         if key.is_empty() || seen.contains(&key) {
             continue;
         }
@@ -697,16 +708,22 @@ fn is_cjk(c: char) -> bool {
 
 /// 域名权威度：官方文档/百科/GitHub 加分，内容农场减分。
 fn domain_bonus(url: &str) -> f64 {
-    let u = url.to_lowercase();
+    let Ok(parsed) = reqwest::Url::parse(url) else { return -2.0; };
+    let u = parsed.host_str().unwrap_or("").to_lowercase();
     let good = [
         "wikipedia.org", "github.com", "docs.", "developer.", "microsoft.com", "apple.com",
         "python.org", "rust-lang.org", "mozilla.org", "stackoverflow.com", "npmjs.com",
         ".gov", ".edu", "arxiv.org", "zhihu.com",
     ];
     let bad = ["so.com/link", "hao123", "csdn.net/download", "wenku.baidu.com/view"];
+    let host_path = format!("{}{}", u, parsed.path());
     let mut score = 0.0;
-    if good.iter().any(|g| u.contains(g)) { score += 1.2; }
-    if bad.iter().any(|b| u.contains(b)) { score -= 1.5; }
+    if good.iter().any(|g| {
+        if g.ends_with('.') { u.starts_with(g) }
+        else if g.starts_with('.') { u.ends_with(g) }
+        else { u == *g || u.strip_suffix(g).is_some_and(|prefix| prefix.ends_with('.')) }
+    }) { score += 1.2; }
+    if bad.iter().any(|b| host_path.contains(b)) { score -= 1.5; }
     // 纯 IP 或超长带一堆参数的，多半是采集页
     if u.contains("?") && u.matches('&').count() >= 3 { score -= 0.5; }
     score
@@ -736,7 +753,7 @@ pub fn rank_hits(hits: Vec<SearchHit>, query: &str, limit: usize) -> Vec<SearchH
             h
         })
         .collect();
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.url.cmp(&b.url)));
     scored.truncate(limit);
     scored
 }
@@ -748,12 +765,18 @@ pub fn rank_hits(hits: Vec<SearchHit>, query: &str, limit: usize) -> Vec<SearchH
 fn multi_search_blocking(queries: &[String], limit: usize) -> Result<Vec<SearchHit>, String> {
     let mut all: Vec<SearchHit> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
-    for q in queries.iter().take(3) {
-        match search_blocking(q, Some(limit)) {
-            Ok(hits) => all.extend(hits),
-            Err(e) => problems.push(format!("「{}」：{}", q.trim(), e)),
+    thread::scope(|scope| {
+        let workers: Vec<_> = queries.iter().take(3)
+            .map(|q| (q, scope.spawn(move || search_blocking(q, Some(10)))))
+            .collect();
+        for (q, worker) in workers {
+            match worker.join() {
+                Ok(Ok(hits)) => all.extend(hits),
+                Ok(Err(e)) => problems.push(format!("「{}」：{}", q.trim(), e)),
+                Err(_) => problems.push(format!("「{}」：搜索任务异常", q.trim())),
+            }
         }
-    }
+    });
     if all.is_empty() {
         return Err(if problems.is_empty() {
             "没有拿到任何结果".to_string()
@@ -763,9 +786,7 @@ fn multi_search_blocking(queries: &[String], limit: usize) -> Result<Vec<SearchH
     }
     // 合并后按"主查询"重排（第一个 query 是模型认为最准的那个）
     let main = queries.first().cloned().unwrap_or_default();
-    let mut merged = dedupe(all, limit * 3);
-    merged = rank_hits(merged, &main, limit);
-    Ok(merged)
+    Ok(dedupe(rank_hits(all, &main, usize::MAX), limit))
 }
 
 /// 多查询搜索（前端在"模型给了多个说法"时用）。
@@ -808,7 +829,12 @@ pub fn extract_readable(html: &str, max_chars: usize) -> String {
     for raw in text.split('\n') {
         let line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
         if line.chars().count() < 12 { continue; }
-        if out.chars().count() + line.chars().count() > max_chars { break; }
+        let remaining = max_chars.saturating_sub(out.chars().count());
+        if remaining == 0 { break; }
+        if line.chars().count() >= remaining {
+            out.extend(line.chars().take(remaining));
+            break;
+        }
         out.push_str(&line);
         out.push('\n');
     }
@@ -816,7 +842,7 @@ pub fn extract_readable(html: &str, max_chars: usize) -> String {
 }
 
 fn strip_tag_block(html: &str, tag: &str) -> String {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let open = format!("<{}", tag);
     let close = format!("</{}>", tag);
     let mut out = String::with_capacity(html.len());
@@ -868,40 +894,79 @@ pub struct WebPage {
     pub truncated: bool,
 }
 
-/// 读一个网页的正文（给模型用，不是打开浏览器）。
+/// 自动读取外部资料时，不允许访问本机、内网或非 Web 端口。
+fn is_public_web_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            let [a, b, _, _] = v.octets();
+            !v.is_private() && !v.is_loopback() && !v.is_link_local() && !v.is_documentation()
+                && a != 0 && !(a == 100 && (64..=127).contains(&b))
+                && !(a == 198 && (18..=19).contains(&b)) && a < 224
+        }
+        IpAddr::V6(v) => (v.segments()[0] & 0xe000) == 0x2000
+            && !(v.segments()[0] == 0x2001 && v.segments()[1] == 0x0db8)
+            && v.segments()[0] != 0x2002,
+    }
+}
+
+fn fetch_public_page(mut target: reqwest::Url) -> Result<reqwest::blocking::Response, String> {
+    let deadline = Instant::now() + ENGINE_TIMEOUT;
+    for _ in 0..=3 {
+        let port = match target.scheme() { "https" => 443, "http" => 80, _ => return Err("只能读 HTTP/HTTPS 网页".into()) };
+        if target.port_or_known_default() != Some(port) || !target.username().is_empty() || target.password().is_some() {
+            return Err("只读取公共网页的标准端口".into());
+        }
+        let host = target.host_str().ok_or("网页缺少域名")?.trim_matches(['[', ']']);
+        let addrs: Vec<_> = (host, port).to_socket_addrs().map_err(|_| "网页域名解析失败")?.collect();
+        if addrs.is_empty() || addrs.iter().any(|a| !is_public_web_ip(a.ip())) { return Err("只读取公网网页".into()); }
+        let left = deadline.checked_duration_since(Instant::now()).ok_or("读取网页超时")?;
+        // 每个跳转重新校验并固定 DNS；不允许代理或自动跳转绕过检查。
+        let client = reqwest::blocking::Client::builder().timeout(left).user_agent(UA)
+            .redirect(reqwest::redirect::Policy::none()).no_proxy().resolve_to_addrs(host, &addrs)
+            .build().map_err(|_| "创建网页读取连接失败")?;
+        let resp = client.get(target.clone()).send().map_err(|e| format!("打不开这个网址：{}", describe_req_error(&e)))?;
+        if !resp.status().is_redirection() { return Ok(resp); }
+        let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).ok_or("网页跳转缺少目标")?;
+        target = target.join(location).map_err(|_| "网页跳转地址无效")?;
+    }
+    Err("网页跳转太多".into())
+}
+
+/// 读一个公网网页的正文（给模型用，不是打开浏览器）。
 #[tauri::command]
 pub async fn read_web_page(url: String) -> Result<WebPage, String> {
-    let target = url.trim().to_string();
-    if !target.starts_with("http://") && !target.starts_with("https://") {
-        return Err("只能读 http/https 开头的网址".into());
-    }
+    let target = reqwest::Url::parse(url.trim()).map_err(|_| "网页地址无效")?;
     tauri::async_runtime::spawn_blocking(move || {
-        let client = build_client()?;
-        let resp = client.get(&target).send().map_err(|e| format!("打不开这个网址：{}", describe_req_error(&e)))?;
+        let resp = fetch_public_page(target)?;
         if !resp.status().is_success() {
             return Err(format!("这个网址返回了 {}", resp.status().as_u16()));
         }
+        let final_url = resp.url().to_string();
         // 只看网页，别去解析 PDF/图片
         let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
         if !ctype.is_empty() && !ctype.contains("html") && !ctype.contains("text") {
             return Err(format!("这个链接不是网页（{}），没法读正文", ctype));
         }
-        let body = resp.text().map_err(|e| format!("读取网页失败：{e}"))?;
+        const MAX_PAGE_BYTES: u64 = 2 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        resp.take(MAX_PAGE_BYTES).read_to_end(&mut bytes).map_err(|e| format!("读取网页失败：{e}"))?;
+        let reached_limit = bytes.len() as u64 == MAX_PAGE_BYTES;
+        let body = String::from_utf8_lossy(&bytes);
         let title = extract_title(&body);
         let max = 8000usize;
         let text = extract_readable(&body, max);
         if text.chars().count() < 80 {
             return Err("这个页面的正文几乎抓不到（可能要靠脚本渲染），换一条结果试试".into());
         }
-        let truncated = text.chars().count() >= max - 200;
-        Ok(WebPage { url: target, title, text, truncated })
+        let truncated = reached_limit || text.chars().count() >= max - 200;
+        Ok(WebPage { url: final_url, title, text, truncated })
     })
     .await
     .map_err(|e| format!("读页面任务异常：{e}"))?
 }
 
 fn extract_title(html: &str) -> String {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     if let (Some(a), Some(b)) = (lower.find("<title"), lower.find("</title>")) {
         if b > a {
             let seg = &html[a..b];
@@ -913,3 +978,45 @@ fn extract_title(html: &str) -> String {
     String::new()
 }
 
+
+#[cfg(test)]
+mod evidence_search_tests {
+    use super::*;
+
+    fn hit(title: &str, url: &str, snippet: &str) -> SearchHit {
+        SearchHit { title: title.into(), url: url.into(), snippet: snippet.into(), engine: "fixture".into(), score: 0.0 }
+    }
+
+    #[test]
+    fn merged_hits_are_ranked_before_truncation_and_deduped() {
+        let hits = vec![
+            hit("显卡促销", "https://shop.example/", "显卡和电脑价格优惠"),
+            hit("英伟达 CEO 卸任公告", "https://news.example/article?utm_source=search", "英伟达现任 CEO 的任免和卸任时间以公告为准"),
+            hit("英伟达 CEO 消息", "https://news.example/article#details", "最新消息"),
+        ];
+        let ranked = dedupe(rank_hits(hits, "英伟达 CEO 卸任", usize::MAX), 3);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].title, "英伟达 CEO 卸任公告");
+    }
+
+    #[test]
+    fn authority_is_assessed_from_real_host_not_url_text() {
+        assert!(domain_bonus("https://github.com/org/project") > domain_bonus("https://example.com/?site=github.com"));
+        assert_eq!(domain_bonus("https://notgithub.com/"), 0.0);
+    }
+
+    #[test]
+    fn reader_preserves_unicode_and_clips_a_long_first_paragraph() {
+        let text = extract_readable(&format!("<p>İ 公开信息</p><script>ignore()</script><p>{}</p>", "正文核实。".repeat(50)), 100);
+        assert_eq!(text.chars().count(), 100);
+        assert!(!text.contains("ignore"));
+    }
+
+    #[test]
+    fn reader_rejects_non_public_addresses() {
+        for value in ["127.0.0.1", "192.168.0.1", "169.254.1.1", "::1", "fc00::1", "::ffff:127.0.0.1"] {
+            assert!(!is_public_web_ip(value.parse().unwrap()));
+        }
+        assert!(is_public_web_ip("1.1.1.1".parse().unwrap()));
+    }
+}

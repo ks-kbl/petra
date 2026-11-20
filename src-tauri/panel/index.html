@@ -691,7 +691,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
         { title: "生图模型接入", desc: "", type: "imageaccess" },
         { title: "不会接 API？", desc: "", type: "promo" },
         { title: "最近生成的图", desc: "", type: "genimages" },
-        { title: "预设", desc: "", type: "presets" },
+        { title: "API 与生图预设", desc: "", type: "presets" },
         { title: "主动问候调度", desc: "", type: "greetstat" },
         { title: "对话记录", desc: "", type: "chat" },
         {
@@ -717,7 +717,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     },
     {
       id: "persona", label: "人设", title: "人设 · 它是谁",
-      desc: "决定它的说话发生，填得越具体人设越稳定。改动后立刻生效，右侧为最终提示词预览",
+      desc: "决定它的说话方式，填得越具体人设越稳定。改动后立刻生效，右侧为最终提示词预览",
       cards: [
         { title: "内置人设", desc: "", type: "personas" },
         {
@@ -740,8 +740,8 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
           ],
         },
         {
-          title: "人设预设", desc: "把当前人设（含API）保存为预设",
-          type: "presets",
+          title: "人设预设", desc: "保存和切换自定义人设",
+          type: "personapresets",
         },
         {
           title: "自由补充", desc: "如果不想被分栏限制可以在这里填写，会拼最终提示词之后",
@@ -1386,9 +1386,40 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
   }
 
   /** 预设：一套 API 配置（供应商 + 端点 + 模型 + 自己的 Key） */
+  function personaPresetsCard() {
+    const card = el("div", "card");
+    card.appendChild(el("h2", null, "人设预设"));
+    card.appendChild(el("p", "cd", "保存角色设定、自由补充和称呼。切换时不改模型、API Key 或生图配置。"));
+    const list = state.settings.assistant?.personaPresets || [];
+    if (!list.length) card.appendChild(el("div", "empty", "还没有自定义人设预设"));
+    list.forEach(p => {
+      const row = el("div", "row");
+      row.appendChild(el("div", "rlabel", p.name));
+      const controls = el("div", "rctl");
+      const apply = el("button", "btn btn-sm", "套用");
+      apply.onclick = () => runAction(`__personapreset:apply:${p.id}`, "套用人设");
+      const remove = el("button", "btn btn-sm btn-danger", "删除");
+      remove.onclick = () => {
+        if (confirm(`删除人设预设「${p.name}」？当前人设不会改变。`)) runAction(`__personapreset:delete:${p.id}`, "删除人设预设");
+      };
+      controls.append(apply, remove);
+      row.appendChild(controls);
+      card.appendChild(row);
+    });
+    const save = el("button", "btn btn-primary btn-sm", "＋ 保存当前人设");
+    save.onclick = () => {
+      const name = prompt("给这套人设起个名字", state.settings.assistant?.personaFields?.name?.trim().slice(0, 24) || "");
+      if (name?.trim()) runAction("__personapreset:save", { name }, "保存人设预设");
+    };
+    const actions = el("div", "btn-row");
+    actions.appendChild(save);
+    card.appendChild(actions);
+    return card;
+  }
+
   function presetsCard() {
     const card = el("div", "card");
-    card.appendChild(el("h2", null, "预设"));
+    card.appendChild(el("h2", null, "API 与生图预设"));
     card.appendChild(el("p", "cd", "一套 API 配置存为一个预设，一键切换。Key 各自独立存在预设槽位中，不会互相覆盖。"));
     const d = state.meta.data || {};
     const list = (state.meta.presets || {}).list || (d.presets && d.presets.list) || [];
@@ -2714,6 +2745,7 @@ code{font-family:ui-monospace,Consolas,monospace; font-size:12px; background:var
     sec.cards.forEach((cardSpec) => {
       if (cardSpec.type === "status") return grid.appendChild(statusCard());
       if (cardSpec.type === "model") return grid.appendChild(modelCard());
+      if (cardSpec.type === "personapresets") return grid.appendChild(personaPresetsCard());
       if (cardSpec.type === "presets") return grid.appendChild(presetsCard());
       if (cardSpec.type === "chat") return grid.appendChild(chatCard());
       if (cardSpec.type === "chatlog") return grid.appendChild(chatLogCard());

@@ -121,7 +121,7 @@ import { copyText } from "./ui/clipboard";
 import { setVisibleRect, clampIntoRect, fitSizeInRect } from "./ui/visible";
 import { infoPanelPlacement } from "./ui/infoPanelPlacement";
 import { clamp } from "./utils/math";
-import { loadSettings, saveSettings as saveSettingsRaw, composePersona, type Settings, type AssistantProvider } from "./utils/settings";
+import { loadSettings, saveSettings as saveSettingsRaw, composePersona, snapshotPersonaPreset, applyPersonaPreset, type Settings, type AssistantProvider } from "./utils/settings";
 import { OUTPUT_LANGUAGE_OPTIONS } from "./utils/outputLanguage";
 import { ACTIVITY_LABEL, nextActivity, type ActivityLevel } from "./utils/settings";
 import { astrobotOn } from "./bridges/astrobot";
@@ -4877,6 +4877,31 @@ function runPanelAction(id: string, payload?: unknown): void {
   }
   if (id.startsWith("__data:")) {
     void handlePanelDataAction(id.slice(7), payload);
+    return;
+  }
+  if (id.startsWith("__personapreset:")) {
+    const [, action, presetId] = id.split(":");
+    const data = (payload ?? {}) as { name?: unknown };
+    const name = typeof data.name === "string" ? data.name.trim() : "";
+    settings = loadSettings();
+    const assistant = settings.assistant;
+    const list = assistant.personaPresets;
+    const index = list.findIndex(p => p.id === presetId);
+    if (action === "save" && name) {
+      list.push(snapshotPersonaPreset(assistant, crypto.randomUUID(), name));
+      toast(`已保存人设预设：${name}`);
+    } else if (index >= 0 && action === "apply") {
+      applyPersonaPreset(assistant, list[index]);
+      lifeRuntime.setPersona(assistant.persona);
+      toast(`已套用人设：${list[index].name}`);
+    } else if (index >= 0 && action === "delete") {
+      list.splice(index, 1);
+      toast("已删除人设预设，当前人设不变");
+    } else {
+      toast("没有可操作的人设预设，或名称为空", "warn");
+      return;
+    }
+    saveSettings(settings);
     return;
   }
   // 一键套用内置人设：直接覆盖 personaFields / personaFree，再用 composePersona 重新拼

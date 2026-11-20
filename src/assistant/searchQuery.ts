@@ -83,3 +83,79 @@ export function hitRelevance(hits: { title?: string; snippet?: string }[], query
 
 /** 结果够不够好：低于 0.25 就值得换词重搜一次 */
 export const RELEVANCE_FLOOR = 0.25;
+
+/** 主查询始终保留；词条释义或全名扩展可以补充，不能替换主查询。 */
+export function searchPlan(query: string, alternatives: string[], userText = ""): string[] {
+  const main = query.trim();
+  if (!main) return [];
+  const user = userText.trim();
+  const concise = buildQueryVariants(user)[1] ?? user;
+  // 只补简短的公开事实问句；附件、长文本、链接或凭据样式不可自动拼进外部搜索。
+  const publicQuestion = user.length >= 6 && user.length <= 100 && !/[\r\n]|https?:|(?:api.?key|token|密码|密钥|sk-[\w-]+|[\w.+-]+@[\w.-]+\.[a-z]{2,})/i.test(user);
+  const drift = publicQuestion && needsWebEvidence(user) && hitRelevance([{ title: main }], concise) < 0.35;
+  const extra = alternatives.map(s => s.trim()).filter(s => s && hitRelevance([{ title: s }], main) >= 0.3);
+  // 明显换了问题时让用户原问题排第一，模型写法只补召回，不再决定最终排序。
+  const facet = /下岗|卸任|辞职|离职|上任|人事|辞任|CEO|resign/i;
+  const issueDrift = drift && facet.test(concise) && !facet.test(main);
+  return [...new Set([...(issueDrift ? [concise, main] : [main, ...(drift ? [concise] : [])]), ...extra, ...buildQueryVariants(main)])].slice(0, 3);
+}
+
+export function needsWebEvidence(text: string): boolean {
+  return /最新|最近|目前|现任|刚刚|今天|本周|今年|消息|新闻|传闻|真假|属实|卸任|上任|离职|下岗|辞职|任免|版本|发布|发售|价格|多少钱|股价|价格表|比分|结果|政策|法规|公告|何时生效|latest|today|current|price|release|resign|version|policy/i.test(text);
+}
+
+export interface WebHit { title: string; url: string; snippet: string; engine?: string; score?: number }
+export interface WebEvidencePage { title: string; url: string; text: string; truncated: boolean }
+const clean = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+function sourceHost(url: string): string {
+  try {
+    const u = new URL(url);
+    if (!["http:", "https:"].includes(u.protocol) || u.username || u.password) return "";
+    return u.hostname.toLowerCase().replace(/^www\./, "");
+  } catch { return ""; }
+}
+
+export async function collectWebEvidence(hits: WebHit[], query: string, read: (url: string) => Promise<WebEvidencePage>): Promise<WebEvidencePage[]> {
+  const candidates: WebHit[] = [];
+  const hosts = new Set<string>();
+  for (const hit of hits) {
+    const host = sourceHost(hit.url);
+    if (!host || hosts.has(host) || hitRelevance([hit], query) < RELEVANCE_FLOOR) continue;
+    const snippet = clean(hit.snippet);
+    if (snippet.length >= 24 && candidates.some(h => clean(h.snippet) === snippet)) continue;
+    hosts.add(host);
+    candidates.push(hit);
+    if (candidates.length === 4) break;
+  }
+  const pages: WebEvidencePage[] = [];
+  for (let i = 0; i < candidates.length && pages.length < 2; i += 2) {
+    const results = await Promise.allSettled(candidates.slice(i, i + 2).map(hit => read(hit.url)));
+    for (const res of results) {
+      if (res.status !== "fulfilled") continue;
+      const page = res.value;
+      const host = sourceHost(page.url);
+      const bodyKey = clean(page.text).slice(0, 350);
+      if (!host || bodyKey.length < 35 || hitRelevance([{ snippet: page.text }], query) < RELEVANCE_FLOOR) continue;
+      if (pages.some(p => sourceHost(p.url) === host || clean(p.text).slice(0, 350) === bodyKey)) continue;
+      pages.push(page);
+      if (pages.length === 2) break;
+    }
+  }
+  return pages;
+}
+
+/** 保留正文中命中查询的部分，不把 8 千字页头和导航直接塞进聊天。 */
+export function evidenceExcerpt(text: string, query: string, limit = 1100): string {
+  if (text.length <= limit) return text;
+  const words = tokens(query);
+  const step = Math.floor(limit / 2);
+  if (step < 1) return text.slice(0, limit);
+  let bestStart = 0;
+  let bestScore = 0;
+  for (let i = 0; i < text.length; i += step) {
+    const block = text.slice(i, i + limit).toLowerCase();
+    const score = words.filter(t => block.includes(t)).length;
+    if (score > bestScore) { bestStart = i; bestScore = score; }
+  }
+  return `${bestStart ? "…" : ""}${text.slice(bestStart, bestStart + limit)}…`;
+}
