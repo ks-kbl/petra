@@ -451,7 +451,7 @@ export function composePersona(a: AssistantSettings): string {
   const nick = (a.nickname ?? "").trim();
   lines.push(
     nick
-      ? `对用户的称呼固定是「${nick}」：全程只用这一个称呼，不要换成别的叫法，也不要自创昵称。`
+      ? `对用户的称呼固定是「${nick}」：需要称呼时只用这个，不要换成别的叫法或自创昵称；自然省略也可以。`
       : `对用户的称呼没有指定：一律直接用「你」，不要自创昵称（主人/宝贝/亲爱的/小朋友之类都不要用）。`,
   );
   return lines.join("\n");
@@ -478,7 +478,7 @@ export function composePersonaAnchor(a: AssistantSettings, maxChars = 110): stri
   if (!first && !traits && !speech) return "";
   const parts: string[] = [];
   if (first) parts.push(`你就是「${first}」，不是助手也不是客服`);
-  if (nick) parts.push(`叫用户「${nick}」`);
+  if (nick) parts.push(`可叫「${nick}」`);
   if (traits) parts.push(`性格：${traits}`);
   if (speech) parts.push(`说话：${speech}`);
   let out = `【人设提醒·你正在扮演】${parts.join("；")}。`;

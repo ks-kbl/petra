@@ -20,7 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { loadSettings } from "../utils/settings";
 import { holdWake, releaseWake } from "../audio/wakeGate";
 import { takeSpeechSegment, flushSpeechSegment, speechLimits, type SpeechBoundary } from "./sentenceSplit";
-import { stretchFillerInChannels, fillerStretchFor, isBareFiller, lowpass } from "./prosody";
+import { stretchFillerInChannels, fillerStretchFor, isBareFiller, interjectionFor, lowpass } from "./prosody";
 
 interface QueueItem {
   text: string;
@@ -307,6 +307,7 @@ class TTSPlayer {
    * 立刻判断电音是处理带来的还是端点给的音频本身就脏。正式流程永远开着。
    */
   private prosodyEnabled = true;
+  private testPlayback?: { prosody: boolean; error?: string; finish?: (error?: string) => void };
   /** 多轮上下文 id：同一段回复共用，让几句之间的语气连贯 */
   private sectionId = "";
   /** 这条回复已经送出去几段：决定下一段攒多长（见 speechLimits） */
@@ -472,6 +473,9 @@ class TTSPlayer {
 
   stop() {
     this.generation++;
+    const interruptedTest = this.testPlayback;
+    this.testPlayback = undefined;
+    interruptedTest?.finish?.("试听已被新的语音打断");
     // 新一段回复 = 新的语气上下文，section_id 重新生成
     this.sectionId = "";
     this.emotionTag = "neutral";
@@ -613,7 +617,7 @@ class TTSPlayer {
         apiKey: this.apiKey,
         speaker: this.speakerId,
         text: speakText,
-        language: this.language || undefined,
+        language: this.testPlayback ? "zh-cn" : this.language || undefined,
         tone,
       });
       // 这期间用户已经发了新消息/关了语音：这段音频已经没人要了，别往新一轮的队列里塞
@@ -636,8 +640,12 @@ class TTSPlayer {
           const bounds = findSpeechBounds(channels, buffer.sampleRate);
           item.decoded = { buffer, offset: bounds.offset, duration: bounds.duration };
           // 段首是「嗯……/哦，」这种语气词时，把那一小段音频拉长（不改音高）
-          this.applyMoodTilt(item);
-          this.applyFillerStretch(item);
+          if (interjectionFor(item.text)?.spec.preserveOriginal) {
+            this.prosodyLog(`skip(preserve-original) text=${item.text.slice(0, 12)}`);
+          } else {
+            this.applyMoodTilt(item);
+            this.applyFillerStretch(item);
+          }
         } catch (e) {
           if (gen !== this.generation) return;
           // 不懂这个格式/解码失败：这个端点后续都走兜底，别再每句都白试一次
@@ -658,6 +666,7 @@ class TTSPlayer {
     } catch (e) {
       if (gen !== this.generation) return;
       console.warn("[TTS] failed:", e);
+      if (this.testPlayback) this.testPlayback.error = "语音合成失败，请检查语音 Key、音色 ID 和网络";
       // 失败也要标记 ready 并推进队列：以前只置 ready 不 pump()，若失败的是**队首**
       // 那一句（长句最容易超时），整条队列会停在"ready 但 audio=null"的队首不动，
       // 后面已经合成好的句子永远不播，整段回复静音。
@@ -690,10 +699,16 @@ class TTSPlayer {
    * 不经过模型，直接把这句话走完整条链路（合成 → 解码 → 语气处理 → 播放），
    * 用来把"模型没说语气词"和"处理没生效"这两种情况区分开。
    */
-  speakTest(text: string) {
+  speakTest(text: string, options?: { prosody: boolean; error?: string; finish?: (error?: string) => void }) {
     this.stop();
+    if (options) this.testPlayback = options;
     this.pushDelta(text);
     this.flush();
+    if (options) this.onIdle(() => {
+      if (this.testPlayback !== options) return;
+      this.testPlayback = undefined;
+      options.finish?.(options.error);
+    });
   }
 
   /**
@@ -734,7 +749,7 @@ class TTSPlayer {
     const d = item.decoded;
     const ctx = this.ctx;
     const head = item.text.slice(0, 12);
-    if (!this.prosodyEnabled) { this.prosodyLog(`skip(disabled) text=${head}`); return; }
+    if (!(this.testPlayback?.prosody ?? this.prosodyEnabled)) { this.prosodyLog(`skip(disabled) text=${head}`); return; }
     if (!d || !ctx) { this.prosodyLog(`skip(no-audio) text=${head}`); return; }
     const sr = d.buffer.sampleRate;
     const chans: Float32Array[] = [];
@@ -858,9 +873,14 @@ class TTSPlayer {
       this.speaking = false;
       this.pump();
     };
+    const failed = () => {
+      if (gen !== this.generation || this.current !== audio) return;
+      if (this.testPlayback) this.testPlayback.error = "音频已合成，但桌宠未能播放";
+      done();
+    };
     audio.onended = done;
-    audio.onerror = done;
-    audio.play().catch(done);
+    audio.onerror = failed;
+    audio.play().catch(failed);
   }
 
   /** 队列空了才通知：气泡淡出、唤醒恢复都挂在这里 */

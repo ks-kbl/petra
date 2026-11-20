@@ -173,11 +173,7 @@ const zeroCrossingsPerSecond = (buf, rate) => {
   check("哦？是追问", sp.interjectionFor("哦？真的假的。")?.spec.kind === "curious");
   check("啊？没听清", sp.interjectionFor("啊？你再说一遍。")?.spec.kind === "curious");
   check("哈？反问", sp.interjectionFor("哈？这也行？")?.spec.kind === "curious");
-  check("哈！是笑一声（往下走）", (() => {
-    const h = sp.interjectionFor("哈！真有意思。");
-    const c = h && h.spec.contour;
-    return !!c && c[0].pitch > c[c.length - 1].pitch;
-  })());
+  check("哈！保留合成的笑声，不重制送气", sp.interjectionFor("哈！真有意思。")?.spec.preserveOriginal === true);
   check("嗯？是追问（上挑）", sp.interjectionFor("嗯？你刚说什么。")?.spec.kind === "curious");
 
   // 表里没有的组合要放行给拖音那条线，别抢
@@ -301,8 +297,13 @@ const zeroCrossingsPerSecond = (buf, rate) => {
 {
   const qie = sp.interjectionFor("切，谁稀罕。");
   check("★ 切仍然被识别", !!qie && qie.spec.kind === "scoff");
-  check("★ 切的低通几乎关掉（保住 q 的锐度）", (qie.spec.cutoff ?? 6000) >= 9000, String(qie.spec.cutoff));
-  check("★ 切的时长没被压过头", qie.spec.duration >= 0.24, String(qie.spec.duration));
+  check("★ 切优先保留原始音频", qie?.spec.preserveOriginal === true);
+  check("★ 切换不是短叹词", sp.interjectionFor("切换模型") === null);
+  const source = new Float32Array([0, 0.15, -0.2, 0.25, -0.1, 0, 0.75]);
+  const result = sp.stretchFillerInChannels([source], sr, "切，彩虹卡就把本鱼藏的红烧肉编进文案了？");
+  check("★ 切和后续整句保持同一份 PCM，无增益/衰减/变调", !result.stretched && result.channels[0] === source);
+  const direct = sp.shapeInterjection([source], sr, { start: 1, end: 5 }, qie.spec)[0];
+  check("★ 直接调用整形也不会修改切的采样", direct.every((sample, i) => sample === source[i + 1]) && direct.length === 4);
   const heng = sp.interjectionFor("哼！我才不要。");
   check("鼻音「哼」仍可用较强低通", (heng.spec.cutoff ?? 6000) <= 6000, String(heng.spec.cutoff));
 
@@ -347,6 +348,37 @@ const zeroCrossingsPerSecond = (buf, rate) => {
   for (const t of ["呸！", "噗。", "嘶——", "嘘——"]) {
     check(`★ ${t[0]} 的起音够冲（≤2ms）`, (sp.interjectionFor(t)?.spec.attack ?? 1) <= 0.002, String(sp.interjectionFor(t)?.spec.attack));
   }
+}
+
+// ---------- 按真实行为回归：高风险音全部保留原采样；不连带改后文 ----------
+{
+  const source = new Float32Array([0, 0.15, -0.2, 0.25, -0.1, 0, 0.75]);
+  for (const token of ["切", "嘁", "啧", "呸", "啐", "噗", "嘶", "嘘", "呵", "哈"]) {
+    const text = `${token}，你听见了吗？`;
+    const spec = sp.interjectionFor(text)?.spec;
+    const result = sp.stretchFillerInChannels([source], sr, text);
+    check(`★ ${token} 独立叹词原声通过`, spec?.preserveOriginal && !result.stretched && result.channels[0] === source);
+  }
+  for (const literal of ["哼唱", "呵护", "切换", "噗通", "嘶哑", "哈哈", "哈欠", "切 片"]) {
+    check(`★ ${literal} 不误判为独立叹词`, sp.interjectionFor(literal) === null);
+  }
+  const connected = Float32Array.from({ length: Math.round(sr * 0.35) }, (_, i) => Math.sin(2 * Math.PI * 200 * i / sr) * 0.4);
+  for (const head of ["嗯……", "哼！", "诶？"]) {
+    const result = sp.stretchFillerInChannels([connected], sr, `${head}后文实际连读`);
+    check(`★ ${head} 未检测到停顿时保留原声`, !result.stretched && result.channels[0] === connected);
+  }
+  let random = 747;
+  const noise = Float32Array.from({ length: Math.round(sr * 0.2) }, () => {
+    random = (Math.imul(1664525, random) + 1013904223) >>> 0;
+    return (random / 0x100000000 - 0.5) * 0.6;
+  });
+  const noisy = sp.stretchFillerInChannels([noise], sr, "嗯……");
+  check("★ 无稳定周期的音频不走强行拼接", !noisy.stretched && noisy.channels[0] === noise);
+  const suffix = Float32Array.from({ length: Math.round(sr * 0.05) }, () => 0.5);
+  const input = new Float32Array(2 * suffix.length);
+  input.set(suffix, suffix.length);
+  const joined = sp.spliceStretched([input], { start: 0, end: suffix.length }, [new Float32Array(suffix.length * 2)], sr)[0];
+  check("★ 下一段原声起音没有被拼接淡化", joined.subarray(-suffix.length).every((v, i) => v === suffix[i]));
 }
 
 // ---------- 低通的"柔和档"：单极只削毛边，不动中频 ----------

@@ -312,6 +312,7 @@ const BASE_PROMPT =
   "【联网】只在这几种情况下搜：新闻时事、版本号、价格行情、赛事比分、人物近况、政策法规、你不确定的具体事实。搜之前先想清楚**用户在问的那个具体东西**是什么，查询词要「主体＋具体点」（例：问「黄老板是不是下岗了」就搜「黄仁勋 卸任 英伟达 CEO」，不要搜「英伟达 显卡 价格」）。一次没搜到就换一个更短更准的说法再试，最多两次，还不行就如实说没查到，不要硬编、也不要换着花样反复搜。搜到结果用自己的话转述，别念整段摘要。纯闲聊、情绪、算数、常识、写代码这类不需要搜，直接答。\n" +
   "【日记】你每天会写一篇只有自己看的日记（主人可以在「日记」里看到）。写的时候分两段：先是那天真实发生的事，再是你自己的想法和感受；没发生的事一个字都不许编，素材少就写短。主人问起你写过什么、或者让你念某天的日记，用 view_diary 查，别凭印象编。\n" +
   "【记忆】用户透露偏好/习惯/情绪就调用 remember；同一件事有新进展就用同主题再记一次（会覆盖旧的），用户纠正你时一定要记对的那条。记住是为了把话接得更准，不要拿出来炫耀「我记得」。\n" +
+  "【实际进度】对方在说自己做的事，就回应对方的实际进展，不把动作认到自己身上。人设只改说法；没有真实动作或工具结果，不能编造自己执行了工作，也不能借人设替对方承诺或改期。\n" +
   "【旧任务】对话历史里几天前的计时、提醒、待办、约定默认已经结束或过期；除非用户明确问起，否则不要把它们当成当前正在做的事，也不要主动复述。\n" +
   "【别敷衍】一，不要用「确实」「挺好的」「可以的」这类空话当整句回复；二，每条回复至少有一个具体的点——他刚说的话、时间、文件名、你查到的东西、或者你的判断；三，能给判断就给判断，别把选项列一遍让他自己挑；四，不确定就说不确定，别硬凑一段像样的废话。\n" +
   "【别说这些】不拿「你又/总是/老是」指责对方的习惯（除非用户原话里确实说过）；不复述饥饿、精力、心情这类状态数值，也不把它们当流水账汇报；不编造对方没做过的事来当话题由头。\n" +
@@ -539,6 +540,18 @@ const TOOLS = [
           prompt: { type: "string", description: "画面描述，越具体越好" },
           size: { type: "string", description: "可选尺寸，如 1024x1024；不确定别传" },
         },
+        required: ["prompt"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_image",
+      description: "基于用户选中的图片或本对话当前图片修改。只在用户明确要求改图时使用，不能用文生图替代，也不能把自动截屏作为原图。",
+      parameters: {
+        type: "object",
+        properties: { prompt: { type: "string", description: "修改内容和必须保留的内容" } },
         required: ["prompt"],
       },
     },
@@ -1876,7 +1889,10 @@ async function requestImageOnce(
   if (size) body.size = size;
 
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 120000); // 生图慢，给 2 分钟
+  const abort = () => ctrl.abort();
+  if (signal?.aborted) throw new Error("已取消生图");
+  signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(abort, 120000); // 生图慢，给 2 分钟
   try {
     const res = await fetch(`${base}/images/generations`, {
       method: "POST",
@@ -1912,10 +1928,12 @@ async function requestImageOnce(
     }
     throw new Error(`生图返回里既没有 b64_json 也没有 url：${text.slice(0, 160)}`);
   } catch (e: unknown) {
+    if (signal?.aborted) throw new Error("已取消生图 (aborted)");
     if (e instanceof DOMException && e.name === "AbortError") throw new Error("生图超时（2 分钟），换个小一点的尺寸或稍后再试");
     throw e;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
   }
 }
 

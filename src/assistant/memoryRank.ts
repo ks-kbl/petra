@@ -119,7 +119,7 @@ export function bm25(
 export function rankMemories<T extends RankableMemory>(
   memories: T[],
   ctx: RecallContext = {},
-  opts: { limit?: number; minScore?: number } = {},
+  opts: { limit?: number; minScore?: number; requireMatch?: boolean } = {},
 ): Ranked<T>[] {
   const limit = opts.limit ?? 4;
   const minScore = opts.minScore ?? 5;
@@ -200,7 +200,7 @@ export function rankMemories<T extends RankableMemory>(
 
   scored.sort((a, b) => b.score - a.score);
   return scored
-    .filter((s) => s.score >= minScore && (s.signal || s.entry.importance === 1 || !userText))
+    .filter((s) => s.score >= minScore && (s.signal || (!opts.requireMatch && (s.entry.importance === 1 || !userText))))
     .slice(0, limit)
     .map(({ entry, score }) => ({ entry, score }));
 }

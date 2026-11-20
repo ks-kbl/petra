@@ -1,3 +1,4 @@
+import { imageCapability, imageCapabilityKey } from "./assistant/imageEditing";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow, LogicalPosition, PhysicalPosition, availableMonitors, primaryMonitor } from "@tauri-apps/api/window";
@@ -500,25 +501,17 @@ function updateModelBounds(bounds?: { left: number; top: number; right: number; 
   engine.lastBoundsOnScreen = { left: l, top: t, right: l + w, bottom: t + h };
 }
 
-/** 模型可点范围比绿框四周多出的像素：边缘留一点余量，移动中的宠物更容易抓到 */
-const PET_HIT_PADDING = 18;
-
-/** 检查鼠标事件是否在模型可点区域内（绿框 + 18px 余量），不是则忽略 */
-function isInsideModel(e: { clientX: number; clientY: number }): boolean {
-  const r = getModelRect();
-  const pad = PET_HIT_PADDING;
-  // 和 Rust 侧同一套圆角判定：四角是透明的就不该响应点击
-  return pointInRoundedRect(
-    e.clientX,
-    e.clientY,
-    {
-      x: r.left - pad,
-      y: r.top - pad,
-      width: r.right - r.left + pad * 2,
-      height: r.bottom - r.top + pad * 2,
-    },
-    currentBoundsCorner() + pad,
+/** 框外空白交给底层窗口；DOM 命中与原生上报共用同一个模型区域。 */
+function modelInteractionRegion(): PhysicalInteractiveRegion | null {
+  if (!view.getCharacterBounds?.()) return null;
+  return logicalRectToPhysicalRegion(
+    "pet", getModelRect(), 1, window.innerWidth, window.innerHeight, 0, currentBoundsCorner(),
   );
+}
+
+function isInsideModel(e: { clientX: number; clientY: number }): boolean {
+  const region = modelInteractionRegion();
+  return !!region && pointInRoundedRect(e.clientX, e.clientY, region, region.cornerRadius ?? 0);
 }
 
 /** 获取模型在窗口中的矩形（不依赖 DOM，始终可用） */
@@ -2601,38 +2594,7 @@ function collectInteractionRegions(): PhysicalInteractiveRegion[] {
   const clientPhysicalHeight = Math.round(window.innerHeight * scale);
   const regions: PhysicalInteractiveRegion[] = [];
 
-  const pet = getModelRect();
-  // 点击区域保底：边界松紧（-120~120）可以把包围盒压成一条几十像素的细缝，
-  // 结果"明明指着宠物却点不动、拖动直接穿透"（实测出现过 33px 宽的区域）。
-  // 这里只放宽**交互区域**，不动绿框/面板定位用的原始 getModelRect()。
-  // 保底别太狠：以前是 120×160，小体型模型会凭空长出几十像素的**看不见但吃点击**的环，
-  // 表现就是"桌宠旁边明明没东西，却点不到下面的窗口"。降到 48×64 仍能点中小模型，
-  // 又不会把透明区域撑成一块挡板。
-  const MIN_W = 48;
-  const MIN_H = 64;
-  const petHit = { ...pet };
-  if (petHit.right - petHit.left < MIN_W) {
-    const cx = (petHit.left + petHit.right) / 2;
-    petHit.left = cx - MIN_W / 2;
-    petHit.right = cx + MIN_W / 2;
-    petHit.width = MIN_W;
-  }
-  if (petHit.bottom - petHit.top < MIN_H) {
-    const cy = (petHit.top + petHit.bottom) / 2;
-    petHit.top = cy - MIN_H / 2;
-    petHit.bottom = cy + MIN_H / 2;
-    petHit.height = MIN_H;
-  }
-  const petRegion = logicalRectToPhysicalRegion(
-    "pet",
-    petHit,
-    scale,
-    clientPhysicalWidth,
-    clientPhysicalHeight,
-    PET_HIT_PADDING,
-    // 圆角要加回 padding：区域整体比绿框大一圈，圆角也跟着外扩才贴合
-    currentBoundsCorner() + PET_HIT_PADDING,
-  );
+  const petRegion = modelInteractionRegion();
   if (petRegion) regions.push(petRegion);
 
   const seen = new Set<Element>();
@@ -2651,8 +2613,7 @@ function collectInteractionRegions(): PhysicalInteractiveRegion[] {
         scale,
         clientPhysicalWidth,
         clientPhysicalHeight,
-        // 留 4px 余量：鼠标压在按钮边缘 1~2px 外时也不该漏到下层窗口
-        4,
+        0,
       );
       if (region) regions.push(region);
     });
@@ -3892,6 +3853,7 @@ let panelEverOpened = false;
 let panelSyncTimer: number | null = null;
 /** 版本号（面板顶栏显示），boot 时填 */
 let appVersion = "";
+let panelTtsProbe: { id: string; status: "playing" | "done" | "error"; message: string } | null = null;
 
 /** 把设置与元数据推给控制面板：面板每次 GET /api/state 读的就是这份 */
 async function pushPanelState(): Promise<void> {
@@ -3927,6 +3889,7 @@ function schedulePanelSync(): void {
 function buildPanelMeta() {
   return {
     version: appVersion,
+    ttsProbe: panelTtsProbe,
     // 问候调度只读快照：控制面板用它显示"下一次什么时候问候"，
     // 排查"设了 N 分钟却一直不来"时不用再等或翻 localStorage
     greeting: {
@@ -3960,6 +3923,13 @@ function buildPanelMeta() {
       presets: settings.assistant.image?.presets ?? [],
       hasKey: !!panelKeys.image,
       models: panelImageModels,
+      ...(() => {
+        const cfg = settings.assistant.image;
+        if (!cfg) return {};
+        const model = cfg.model || IMAGE_PROVIDERS[cfg.provider]?.defaultModels[0] || "";
+        const key = imageCapabilityKey(cfg.provider, cfg.customBaseUrl || "", model, cfg.activePresetId);
+        return { generateStatus: imageCapability(key, "generate"), editStatus: imageCapability(key, "edit") };
+      })(),
     },
     // 内置人设清单（只给面板渲染卡片用；正文留在 WebView 侧，点"套用"才写进设置）
     personas: BUILTIN_PERSONAS.map((p) => ({ id: p.id, name: p.name, tagline: p.tagline })),
@@ -4507,22 +4477,27 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
         break;
       }
       case "tts-probe": {
-        // 语气自检：把某一句按"带处理/不带处理"念一遍，用来判断电音是不是处理带来的
+        const id = String(p.requestId ?? "");
+        const report = (status: "playing" | "done" | "error", message: string) => {
+          panelTtsProbe = { id, status, message };
+          void pushPanelState();
+        };
         const text = String(p.text ?? "").trim();
-        const prosody = p.prosody !== false;
-        if (!text) break;
-        if (!settings.tts.enabled) { toast("先开启语音输出再试听", "info"); break; }
+        if (!text) { report("error", "没有收到试听文案"); return; }
+        if (!settings.tts.enabled) { report("error", "请先开启朗读"); return; }
+        if (ttsPlayer.muted) { report("error", "桌宠朗读已静音，请先取消静音"); return; }
+        const speaker = String(settings.tts.speakerId ?? "").trim();
+        if (!speaker) { report("error", "请先填写音色 ID"); return; }
+        report("playing", "正在合成并播放试听…");
         const key = await invoke<string>("get_tts_key").catch(() => "");
-        if (!String(settings.tts.speakerId ?? "").trim()) {
-          toast("还没填「音色 ID」：控制面板 → 语音 → 音色 ID", "warn");
-          break;
-        }
-        ttsPlayer.setConfig(true, key, settings.tts.speakerId, settings.assistant.outputLanguage ?? "");
-        ttsPlayer.setProsodyEnabled(prosody);
+        if (panelTtsProbe?.id !== id) return;
+        if (!key) { report("error", "未找到语音朗读 Key，请先填写"); return; }
+        ttsPlayer.setConfig(true, key, speaker, settings.assistant.outputLanguage ?? "");
         ttsPlayer.setMoodTone({ rate: 0, tilt: 0, volume: 1 });
-        ttsPlayer.speakTest(text);
-        toast(prosody ? "正在试听（带语气处理）" : "正在试听（已关掉语气处理，用作对照）", "info");
-        break;
+        ttsPlayer.speakTest(text, { prosody: p.prosody !== false, finish: error => {
+          if (panelTtsProbe?.id === id) report(error ? "error" : "done", error ?? "试听播放结束");
+        } });
+        return;
       }
       case "check-update":
         void checkUpdate(true);

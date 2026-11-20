@@ -35,6 +35,35 @@ function load(file, dependencies, globals = {}) {
 
   // Exercise the real panel patch handler against persisted state and model bounds.
   const mainSource = ts.createSourceFile('main.ts', fs.readFileSync('src/main.ts', 'utf8'), ts.ScriptTarget.Latest, true);
+  const html = fs.readFileSync('src-tauri/panel/index.html', 'utf8');
+  const voice = html.indexOf('id: "voice", label: "语音"');
+  const fun = html.indexOf('id: "fun", label: "娱乐"');
+  assert.match(html.slice(voice, fun), /type: "ttsprobe"/, '语音自检归语音页');
+  assert.equal((html.match(/type: "ttsprobe"/g) || []).length, 1);
+  const posted = [];
+  let probeState;
+  const probeCtx = vm.createContext({
+    renderTtsProbeStatus() {}, ttsProbeUI: { id: '', message: '', error: false },
+    api: async (url, opts) => {
+      if (url === '/api/action') {
+        const action = JSON.parse(opts.body);
+        posted.push(action);
+        probeState = { id: action.payload?.requestId, status: 'error', message: '请先填写音色 ID' };
+        return {};
+      }
+      assert.equal(url, '/api/state');
+      return { meta: { ttsProbe: probeState } };
+    },
+  });
+  const probeStart = html.indexOf('  async function runTtsProbe(');
+  vm.runInContext(html.slice(probeStart, html.indexOf('  function ttsProbeCard(', probeStart)), probeCtx);
+  await probeCtx.runTtsProbe('切，你听见了吧？', false);
+  assert.equal(posted[0].id, '__data:tts-probe');
+  assert.equal(posted[0].payload.text, '切，你听见了吧？');
+  assert.equal(posted[0].payload.prosody, false);
+  assert.equal(probeCtx.ttsProbeUI.message, '请先填写音色 ID');
+  assert.equal(probeCtx.ttsProbeUI.error, true);
+
   const selected = new Set(['deepAssign', 'applyPanelPatch']);
   const functions = mainSource.statements.filter(n => ts.isFunctionDeclaration(n) && selected.has(n.name?.text)).map(n => n.getText(mainSource)).join('\n');
   let stored = { assistant: { provider: 'deepseek', customBaseUrl: '', model: 'old-model', activePresetId: 'saved', presets: [] }, boundsPaddings: { A: { left: 10, right: 20, top: 0, bottom: 0 }, B: { left: 30, right: 40, top: 0, bottom: 0 } }, fileDenyPaths: ['/keep'] };

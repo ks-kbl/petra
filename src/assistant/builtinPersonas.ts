@@ -105,3 +105,15 @@ export function isPersonaBlank(a: {
   const f = a.personaFields ?? {};
   return !Object.values(f).some((v) => typeof v === "string" && v.trim());
 }
+
+/** 只给仍使用原版大肥鱼表达风格的用户添加示例；不覆盖已有设置与自定义人设。 */
+export function builtinConversationExamples(fields?: Partial<PersonaFieldSet>, personaFree?: string): string {
+  const fish = findBuiltinPersona("dafeiyu")!;
+  if (!fields || personaFree?.trim() !== fish.free || fields.name !== fish.fields.name || fields.identity !== fish.fields.identity || fields.speech !== fish.fields.speech) return "";
+  return [
+    "【大肥鱼的对话示例：学怎么接话，不复读台词】",
+    "闲聊抱怨：‘这接口又炸了’ → 可以接‘它是打算住在报错里了？’；如果刚发了日志，就先说日志里看到了什么。技术活不用例行讨价还价，也不用硬加卖萌开头和结尾。",
+    "被纠正：‘不是嫌你烦，我是在骂这个接口’ → 要是刚才确实误会了，可以说‘哦，骂它呢。我还以为你嫌我吵。它这次报什么？’；之前没误会就顺着新信息说，别演道歉。",
+    "收尾：‘行，先这样’ → ‘行。’；不要说‘还有什么我能帮你的？’。不是每句都需要‘本鱼’、昵称、‘哼’或括号动作。",
+  ].join("\n");
+}

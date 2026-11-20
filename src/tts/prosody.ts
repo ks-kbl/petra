@@ -14,6 +14,9 @@
 /** 会被拖长的语气词（都念单个音节，鼻音/元音为主，拉伸伪影最小） */
 const FILLERS = ["嗯", "哦", "啊", "唉", "诶", "哎", "唔", "噢", "呀"];
 
+const INTERJECTION_BOUNDARY = /^[，,、。.!！?？…—－；;：:\n\r]/;
+const hasFollowingSpeech = (text: string) => /[^\s，,、。.!！?？…—－；;：:]/.test(text.trimStart().slice(1));
+
 export interface FillerStretch {
   /** 命中的语气词 */
   token: string;
@@ -57,6 +60,7 @@ export function findFirstVoicedRun(
   sampleRate: number,
   fromSample = 0,
   maxSamples?: number,
+  requirePause = false,
 ): { start: number; end: number } | null {
   const total = channels[0]?.length ?? 0;
   if (!total || !sampleRate) return null;
@@ -94,6 +98,8 @@ export function findFirstVoicedRun(
     if (rmsAt(s) >= threshold) { quiet = 0; end = s + frame; }
     else if (++quiet >= gapFrames) break;
   }
+  // 有后文但在扫描窗口内没找到清楚的停顿：可能是连读，不能把后续文字卷进去。
+  if (requirePause && quiet < gapFrames) return null;
   return { start, end: Math.min(limit, end + frame) };
 }
 
@@ -182,6 +188,7 @@ export function spliceStretched(
   span: { start: number; end: number },
   stretched: Float32Array[],
   sampleRate: number,
+  tailEnvelope = true,
 ): Float32Array[] {
   const total = channels[0].length;
   const insert = stretched[0]?.length ?? 0;
@@ -189,7 +196,7 @@ export function spliceStretched(
   const out: Float32Array[] = [];
   // 只有真·拖音（>0.3s）才需要尾巴衰减；短叹词「哼」本身已经带包络，
   // 再压一层会把它压成一声气音。
-  const tail = insert > sampleRate * 0.3 ? Math.max(1, Math.round(sampleRate * 0.18)) : 0;
+  const tail = tailEnvelope && insert > sampleRate * 0.3 ? Math.max(1, Math.round(sampleRate * 0.18)) : 0;
   for (let c = 0; c < channels.length; c++) {
     const src = channels[c];
     const dst = new Float32Array(outLen);
@@ -202,7 +209,7 @@ export function spliceStretched(
       dst[span.start + i] = st[i] * gain;
     }
     dst.set(src.subarray(span.end), span.start + insert);
-    // 接缝交叉淡化：拼接点两侧各 6ms，否则波形不连续会"咔"一声——
+    // 只淡化重制片段的头尾（各约 6ms），不削弱后一句原声的起音——
     // 那声咔哒叠在鼻音上，听起来就是典型的"电音"。
     const xf = Math.min(
       Math.round(sampleRate * 0.006),
@@ -213,7 +220,6 @@ export function spliceStretched(
       for (let i = 0; i < xf; i++) {
         const g = i / xf;
         dst[span.start + i] *= g;                                   // 进入拉伸段：淡入
-        dst[span.start + insert + i] *= g;                           // 回到原音：淡入
         dst[span.start + insert - 1 - i] *= g;                       // 拉伸段收尾：淡出
       }
     }
@@ -226,7 +232,7 @@ export function spliceStretched(
  * 估基音周期（采样点数），失败返回 null。
  *
  * 归一化自相关：只取 60~500Hz 的范围，峰值不够高（清音/气声）就返回 null，
- * 交给 WSOLA 那条兜底——绝不能拿一个瞎猜的周期去拼接，那才是电音的来源。
+ * 播放链路保留原声，不拿猜测的周期拼接，避免电音。
  */
 export function estimatePeriod(samples: Float32Array, sampleRate: number): number | null {
   const len = samples.length;
@@ -295,14 +301,15 @@ export function stretchVoiced(
     // 相位对齐：把输入起点吸附到最近的周期整数倍上
     const snapped = Math.round(Math.round(nominal) / P) * P;
     const srcBase = start + Math.max(0, Math.min(len - grain, snapped));
+    const grainLen = Math.min(grain, len);
     for (let c = 0; c < channels.length; c++) {
       const src = channels[c];
       const dst = result[c];
-      for (let i = 0; i < grain && outPos + i < outLen; i++) {
+      for (let i = 0; i < grainLen && outPos + i < outLen; i++) {
         dst[outPos + i] += src[srcBase + i] * win[i];
       }
     }
-    for (let i = 0; i < grain && outPos + i < outLen; i++) norm[outPos + i] += win[i];
+    for (let i = 0; i < grainLen && outPos + i < outLen; i++) norm[outPos + i] += win[i];
     outPos += hopOut;
     nominal += hopIn;
   }
@@ -326,6 +333,12 @@ export interface ProsodyResult {
   mode: "none" | "psola" | "wsola" | "interjection";
 }
 
+/** 估不到可靠基音时，宁可用原声，不在短促气流上反复拼接。 */
+function periodForSpan(channels: Float32Array[], sampleRate: number, span: { start: number; end: number }): number | null {
+  const probe = channels[0].subarray(span.start, Math.min(span.end, span.start + Math.round(sampleRate * 0.04)));
+  return estimatePeriod(probe, sampleRate);
+}
+
 export function stretchFillerInChannels(
   channels: Float32Array[],
   sampleRate: number,
@@ -333,29 +346,28 @@ export function stretchFillerInChannels(
   fromSample = 0,
 ): ProsodyResult {
   if (!channels.length) return { channels, stretched: false, factor: 1, mode: "none" };
-  // 短叹词优先：哼 / 切 / 啧 要的是"往下砸 + 收得快"，不是拉长
+  // 短叹词优先按配方分流：清辅音原样播放，确定能定位的浊音才整形。
   const inter = interjectionFor(text);
+  if (inter?.spec.preserveOriginal) return { channels, stretched: false, factor: 1, mode: "none" };
   if (inter) {
-    const spanI = findFirstVoicedRun(channels, sampleRate, fromSample, Math.round(sampleRate * 0.9));
-    if (spanI && spanI.end - spanI.start <= sampleRate * 0.9) {
+    const spanI = findFirstVoicedRun(channels, sampleRate, fromSample, Math.round(sampleRate * 0.9), hasFollowingSpeech(text));
+    if (spanI && spanI.end - spanI.start <= sampleRate * 0.65 && periodForSpan(channels, sampleRate, spanI)) {
       const shaped = shapeInterjection(channels, sampleRate, spanI, inter.spec);
-      return { channels: spliceStretched(channels, spanI, shaped, sampleRate), stretched: true, factor: 1, mode: "interjection" };
+      return { channels: spliceStretched(channels, spanI, shaped, sampleRate, false), stretched: true, factor: 1, mode: "interjection" };
     }
   }
   const mark = fillerStretchFor(text);
   if (!mark || mark.factor <= 1.05) {
     return { channels, stretched: false, factor: 1, mode: "none" };
   }
-  const span = findFirstVoicedRun(channels, sampleRate, fromSample, Math.round(sampleRate * 0.9));
+  const span = findFirstVoicedRun(channels, sampleRate, fromSample, Math.round(sampleRate * 0.9), hasFollowingSpeech(text));
   if (!span) return { channels, stretched: false, factor: 1, mode: "none" };
   // 框出来太长说明开头压根没有语气词停顿（可能整句连读），宁可不拉
   if (span.end - span.start > sampleRate * 0.7) return { channels, stretched: false, factor: 1, mode: "none" };
-  // 优先按基音周期拼接（鼻音最干净）；估不出周期才退回 WSOLA
-  const probe = channels[0].subarray(span.start, Math.min(span.end, span.start + Math.round(sampleRate * 0.04)));
-  const period = estimatePeriod(probe, sampleRate);
-  let stretched = period
-    ? stretchVoiced(channels, sampleRate, span.start, span.end, mark.factor, period)
-    : wsola(channels, sampleRate, span.start, span.end, mark.factor);
+  // 有稳定基音才周期拼接；估不出来就保留原音。
+  const period = periodForSpan(channels, sampleRate, span);
+  if (!period) return { channels, stretched: false, factor: 1, mode: "none" };
+  let stretched = stretchVoiced(channels, sampleRate, span.start, span.end, mark.factor, period);
   // 长拖音才压音高：随口应的那声「嗯，」压了反而怪
   if (mark.kind === "think") stretched = pitchDown(stretched, 0.97);
   // 拖音同样要过低通。之前只有短叹词过、拖音没过，所以"某些字还有电音"——
@@ -367,7 +379,7 @@ export function stretchFillerInChannels(
     channels: spliceStretched(channels, span, stretched, sampleRate),
     stretched: true,
     factor: mark.factor,
-    mode: period ? "psola" : "wsola",
+    mode: "psola",
   };
 }
 
@@ -461,6 +473,8 @@ export interface InterjectionSpec {
    * 用 3600 去压会直接变成一团闷响——「听不清」就是这么来的。
    */
   cutoff?: number;
+  /** 保留原始发音，不压时长、不变调、不做包络衰减或整段情绪低通。 */
+  preserveOriginal?: boolean;
   /** 这是什么情绪的声音，日志和测试用 */
   kind: "angry" | "scoff" | "sneer" | "curious" | "surprised" | "realize";
 }
@@ -483,46 +497,19 @@ function punctAfter(rest: string): Punct {
  * 「诶……」是想起来了慢慢拖，「诶！」是被吓到先升后降。人在说话时，
  * 语气词的意思几乎全靠这条音高曲线承载，字面本身是不变的。
  */
+function originalInterjections(kinds: Record<string, InterjectionSpec["kind"]>): Record<string, { plain: InterjectionSpec }> {
+  return Object.fromEntries(Object.entries(kinds).map(([token, kind]) => [token, {
+    plain: { duration: 0.26, contour: [{ u: 0, pitch: 1 }, { u: 1, pitch: 1 }], attack: 0, kind, cutoff: 12000, preserveOriginal: true },
+  }]));
+}
+
 const RECIPES: Record<string, Partial<Record<Punct, InterjectionSpec>>> = {
   // 生气、不服气：从上往下砸
   "哼": {
     plain: { duration: 0.24, contour: [{ u: 0, pitch: 1.18 }, { u: 1, pitch: 0.82 }], attack: 0.004, kind: "angry", cutoff: 5000 },
   },
-  // 冷笑
-  // 呵是**送气**的（h 开头），高频气流决定它听起来是"呵"还是"呃"
-  "呵": {
-    plain: { duration: 0.26, contour: [{ u: 0, pitch: 1.06 }, { u: 1, pitch: 0.92 }], attack: 0.004, kind: "sneer", cutoff: 8000 },
-  },
-  // 咂嘴式不屑
-  // 切 / 嘁 / 啧 是**塞擦音**：辨识度靠那口高频气流，所以
-  // ① 时长别压太狠（0.15 → 0.26，压过头就只剩一下闷响）
-  // ② 低通几乎关掉（9000Hz），保住 "q/z" 的锐度
-  "切": {
-    plain: { duration: 0.26, contour: [{ u: 0, pitch: 1.08 }, { u: 1, pitch: 0.94 }], attack: 0.004, kind: "scoff", cutoff: 9000 },
-  },
-  "嘁": {
-    plain: { duration: 0.26, contour: [{ u: 0, pitch: 1.06 }, { u: 1, pitch: 0.92 }], attack: 0.004, kind: "scoff", cutoff: 9000 },
-  },
-  // 爆破音 / 嘘声：辨识度全在起音那几十毫秒的冲音上，
-  // 所以 ①起音压到 1~2ms（4ms 就够把它抹平）②低通接近关掉 ③时长不能压太短
-  "呸": {
-    plain: { duration: 0.24, contour: [{ u: 0, pitch: 1.12 }, { u: 1, pitch: 0.9 }], attack: 0.001, kind: "scoff", cutoff: 9500 },
-  },
-  "啐": {
-    plain: { duration: 0.22, contour: [{ u: 0, pitch: 1.1 }, { u: 1, pitch: 0.92 }], attack: 0.001, kind: "scoff", cutoff: 9500 },
-  },
-  "噗": {
-    plain: { duration: 0.22, contour: [{ u: 0, pitch: 1.05 }, { u: 1, pitch: 0.92 }], attack: 0.001, kind: "scoff", cutoff: 9500 },
-  },
-  "嘶": {
-    plain: { duration: 0.28, contour: [{ u: 0, pitch: 1.06 }, { u: 1, pitch: 0.96 }], attack: 0.002, kind: "scoff", cutoff: 11000 },
-  },
-  "嘘": {
-    plain: { duration: 0.3, contour: [{ u: 0, pitch: 1.04 }, { u: 1, pitch: 0.98 }], attack: 0.002, kind: "scoff", cutoff: 11000 },
-  },
-  "啧": {
-    plain: { duration: 0.24, contour: [{ u: 0, pitch: 1.1 }, { u: 1, pitch: 0.95 }], attack: 0.003, kind: "scoff", cutoff: 9000 },
-  },
+  // 送气、塞擦、爆破和擦音：保留合成原声，避免起音被重采样和衰减。
+  ...originalInterjections({ 切: "scoff", 嘁: "scoff", 啧: "scoff", 呸: "scoff", 啐: "scoff", 噗: "scoff", 嘶: "scoff", 嘘: "scoff", 呵: "sneer" }),
   // 诶：好奇往上挑 / 想起什么慢慢拖 / 惊讶先升后降
   "诶": {
     question: { duration: 0.3, contour: [{ u: 0, pitch: 0.96 }, { u: 1, pitch: 1.24 }], attack: 0.008, kind: "curious" },
@@ -550,11 +537,8 @@ const RECIPES: Record<string, Partial<Record<Punct, InterjectionSpec>>> = {
     question: { duration: 0.28, contour: [{ u: 0, pitch: 0.94 }, { u: 1, pitch: 1.2 }], attack: 0.008, kind: "curious" },
     exclaim: { duration: 0.3, contour: [{ u: 0, pitch: 0.98 }, { u: 0.5, pitch: 1.22 }, { u: 1, pitch: 1.05 }], attack: 0.005, kind: "surprised" },
   },
-  // 哈：反问是上挑，笑一声是往下走
-  "哈": {
-    question: { duration: 0.3, contour: [{ u: 0, pitch: 0.98 }, { u: 1, pitch: 1.18 }], attack: 0.005, kind: "curious", cutoff: 8000 },
-    exclaim: { duration: 0.26, contour: [{ u: 0, pitch: 1.1 }, { u: 1, pitch: 0.9 }], attack: 0.004, kind: "scoff", cutoff: 8000 },
-  },
+  // 哈：不要重制 h 的起音，问号和感叹号的语气都交给合成器。
+  ...originalInterjections({ 哈: "curious" }),
   // 嗯：追问「嗯？」要上挑；其余标点交给拖音那条线（不在这里抢）
   "嗯": {
     question: { duration: 0.26, contour: [{ u: 0, pitch: 0.98 }, { u: 1, pitch: 1.18 }], attack: 0.008, kind: "curious" },
@@ -581,6 +565,8 @@ export function interjectionFor(text: string): { token: string; spec: Interjecti
   // 先按标点找，再退到 plain（"哼"这种不管什么标点都是那一声）
   const spec = table[punct] ?? table.plain ?? null;
   if (!spec) return null;
+  // 所有配方都只命中独立叹词，不能把「切换」「哼唱」「呵护」当作情绪。
+  if (rest.trim() && !INTERJECTION_BOUNDARY.test(rest.trimStart())) return null;
   return { token, spec };
 }
 
@@ -597,6 +583,7 @@ export function shapeInterjection(
   span: { start: number; end: number },
   spec: InterjectionSpec,
 ): Float32Array[] {
+  if (spec.preserveOriginal) return channels.map(c => c.slice(span.start, span.end));
   const spanLen = Math.max(1, span.end - span.start);
   const targetLen = Math.max(
     Math.round(sampleRate * 0.08),
