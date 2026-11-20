@@ -35,5 +35,15 @@ const long = st.composePersonaAnchor({
 });
 check("超长会被截断到上限", long.length <= 112, String(long.length));
 
+const personaSource = { ...base, personaFree: "原始补充", provider: "custom", model: "chat-model", customBaseUrl: "https://example.invalid", activePresetId: "api-slot", image: { model: "image-model" } };
+const preset = st.snapshotPersonaPreset(personaSource, "p1", "人设一");
+check("人设预设只存人设字段", Object.keys(preset).sort().join(",") === "fields,free,id,name,nickname");
+const target = { ...personaSource, model: "keep-chat", activePresetId: "keep-slot", personaFields: { name: "其他" }, nickname: "你" };
+st.applyPersonaPreset(target, preset);
+check("切换人设不改变模型、Key 槽或生图配置", target.model === "keep-chat" && target.activePresetId === "keep-slot" && target.image === personaSource.image && target.customBaseUrl === personaSource.customBaseUrl);
+check("切换人设恢复角色、自由补充和称呼", target.persona.includes("原始补充") && target.nickname === "老大" && target.personaInitialized);
+target.personaFields.name = "改过";
+check("编辑当前人设不会改写预设快照", preset.fields.name === base.personaFields.name);
+
 console.log("persona-anchor: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);
 process.exit(fail ? 1 : 0);

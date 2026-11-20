@@ -59,6 +59,7 @@ let lyricOffsetMs = 0;
 /** 微调步长：一次点按调整这么多（3 下≈1 秒，够快也够细） */
 export const LYRIC_OFFSET_STEP_MS = 300;
 let currentKey = "";
+let currentTrack: { title: string; artist: string } | null = null;
 /** 播放器是否在播放（用于"跟唱"状态） */
 let playing = false;
 /** 本首已确认没有歌词（纯音乐 / 库里没有）→ 静默不跟唱，也不再提示 */
@@ -80,6 +81,7 @@ function resetTrackState(): void {
   clock = null;
   lines = null;
   currentKey = "";
+  currentTrack = null;
   follower.reset();
   playing = false;
   noLyrics = false;
@@ -151,6 +153,7 @@ async function onMedia(p: MediaPayload): Promise<void> {
     return;
   }
 
+  currentTrack = { title, artist };
   const key = title + "|" + artist;
   if (key !== currentKey) {
     currentKey = key;
@@ -219,6 +222,16 @@ function tick(): void {
   const line = lines[show];
   const trans = translateOn && transLines ? lookupTranslation(transLines, line.timeMs) : null;
   showLyricLine(line.text, trans);
+}
+
+/** 仅供明确询问当前曲目时读取；时钟不可信时不猜当前歌词。 */
+export function currentMusicSnapshot(): { title: string; artist: string; lyric?: string } | null {
+  if (!running || !playing || !currentTrack) return null;
+  const snapshot = { ...currentTrack };
+  if (!clock?.trusted || clock.drift || !lines?.length) return snapshot;
+  const index = lineIndexAt(lines, lyricQueryPosition(clock.positionMs(), LYRIC_LEAD_MS, lyricOffsetMs));
+  const lyric = lines[index]?.text.trim().slice(0, 90);
+  return lyric ? { ...snapshot, lyric } : snapshot;
 }
 
 /** 启动：订阅媒体事件 + 定时推导当前行 */

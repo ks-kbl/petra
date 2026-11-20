@@ -36,6 +36,9 @@ function load(file, dependencies, globals = {}) {
   // Exercise the real panel patch handler against persisted state and model bounds.
   const mainSource = ts.createSourceFile('main.ts', fs.readFileSync('src/main.ts', 'utf8'), ts.ScriptTarget.Latest, true);
   const html = fs.readFileSync('src-tauri/panel/index.html', 'utf8');
+  const persona = html.slice(html.indexOf('id: "persona", label: "人设"'), html.indexOf('id: "voice", label: "语音"'));
+  assert.match(persona, /type: "personapresets"/);
+  assert.doesNotMatch(persona, /type: "presets"|含API/);
   const voice = html.indexOf('id: "voice", label: "语音"');
   const fun = html.indexOf('id: "fun", label: "娱乐"');
   assert.match(html.slice(voice, fun), /type: "ttsprobe"/, '语音自检归语音页');

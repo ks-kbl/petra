@@ -160,6 +160,7 @@ pub fn start_media_poller(app: AppHandle) {
                     "[media] 未找到 playerctl，读不到 MPRIS，已降级为「无媒体会话」（歌词气泡不显示）",
                 );
             }
+            crate::update_media_snapshot(&np);
             let interval = if np.has_session {
                 if np.playing {
                     POLL_PLAYING_MS

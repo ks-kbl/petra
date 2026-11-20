@@ -121,6 +121,14 @@ export interface AssistantPreset {
   personaFields?: PersonaFields;
 }
 
+export interface PersonaPreset {
+  id: string;
+  name: string;
+  fields: PersonaFields;
+  free: string;
+  nickname: string;
+}
+
 export interface AssistantSettings {
   enabled: boolean;
   provider: AssistantProvider;
@@ -136,6 +144,8 @@ export interface AssistantSettings {
   personaInitialized?: boolean;
   /** 结构化人设字段 */
   personaFields: PersonaFields;
+  /** 人设快照单独保存，不关联模型、接口和密钥。 */
+  personaPresets: PersonaPreset[];
   customBaseUrl: string;
   /** 保存的预设列表 */
   presets: AssistantPreset[];
@@ -369,6 +379,7 @@ const DEFAULTS: Settings = {
       emoji: "",
     },
     customBaseUrl: "",
+    personaPresets: [],
     presets: [],
     activePresetId: "",
     historyLang: "",
@@ -431,6 +442,18 @@ let currentLevel: ActivityLevel = DEFAULTS.activity;
  * 结构化人设 → 一段提示词。
  * 只拼非空项；自由人设放在最后，方便用户写「补充说明」。
  */
+export function snapshotPersonaPreset(a: AssistantSettings, id: string, name: string): PersonaPreset {
+  return { id, name, fields: { ...a.personaFields }, free: a.personaFree, nickname: a.nickname };
+}
+
+export function applyPersonaPreset(a: AssistantSettings, preset: PersonaPreset): void {
+  a.personaFields = { ...preset.fields };
+  a.personaFree = preset.free;
+  a.nickname = preset.nickname;
+  a.personaInitialized = true;
+  a.persona = composePersona(a);
+}
+
 export function composePersona(a: AssistantSettings): string {
   const f = a.personaFields ?? DEFAULTS.assistant.personaFields;
   const lines: string[] = [];
@@ -506,6 +529,7 @@ export function loadSettings(): Settings {
         personaFree:
           (parsed.assistant?.personaFree ?? parsed.assistant?.persona ?? "") as string,
         personaFields: { ...DEFAULTS.assistant.personaFields, ...(parsed.assistant?.personaFields ?? {}) },
+        personaPresets: Array.isArray(parsed.assistant?.personaPresets) ? parsed.assistant.personaPresets : [],
       },
       diary: { ...DEFAULTS.diary, ...(parsed.diary ?? {}) },
       dailyCard: { ...DEFAULTS.dailyCard, ...(parsed.dailyCard ?? {}) },

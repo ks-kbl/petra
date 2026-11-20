@@ -239,7 +239,7 @@ const json = (obj, status = 200) =>
     );
     check("★ 带图 400 后自动去图重试并成功", res.text.includes("看不到图"), res.text);
     check("★ 第一次请求带图、第二次不带", bodies.length === 2 && JSON.stringify(bodies[0]).includes("image_url") && !JSON.stringify(bodies[1]).includes("image_url"), `bodies=${bodies.length}`);
-    check("★ 去图时明确告诉模型看不到画面", JSON.stringify(bodies[1]).includes("不支持图片输入"), "");
+    check("★ 去图时明确告诉模型看不到画面", JSON.stringify(bodies[1]).includes("本轮图片未传给当前聊天模型") && JSON.stringify(bodies[1]).includes("无需让用户重复提供已知信息"), "");
   }
 
   console.log("assistant-compat: pass=" + (fail === 0 ? "all" : "has failures") + " fail=" + fail);

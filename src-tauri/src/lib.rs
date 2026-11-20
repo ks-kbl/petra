@@ -31,6 +31,24 @@ mod media;
 #[path = "media_linux.rs"]
 mod media;
 
+// 当前曲目和歌词浮层是两件事：聊天按需取样，不依赖网页是否订阅过媒体事件。
+static MEDIA_SNAPSHOT: std::sync::Mutex<Option<(std::time::Instant, media::NowPlaying)>> = std::sync::Mutex::new(None);
+
+fn update_media_snapshot(sample: &media::NowPlaying) {
+    if let Ok(mut latest) = MEDIA_SNAPSHOT.lock() {
+        *latest = if sample.has_session && sample.playing && !sample.title.trim().is_empty() {
+            Some((std::time::Instant::now(), sample.clone()))
+        } else { None };
+    }
+}
+
+#[tauri::command]
+fn current_music_metadata() -> Option<media::NowPlaying> {
+    let guard = MEDIA_SNAPSHOT.lock().ok()?;
+    let (at, snapshot) = guard.as_ref()?;
+    (at.elapsed() <= std::time::Duration::from_secs(6)).then(|| snapshot.clone())
+}
+
 #[cfg(windows)]
 mod proxy;
 #[cfg(target_os = "macos")]
@@ -5960,6 +5978,7 @@ mod interaction_tests {
             width,
             height,
             enabled: true,
+            corner_radius: 0.0,
         }
     }
 
@@ -6527,7 +6546,7 @@ pub fn run() {
             save_image_from_url, copy_to_desktop, read_image_data_url, http_post_json,
             read_file_text_plain,
             get_mic_permission, set_mic_permission, repair_mic_permission, sync_webview_mic_permission,
-            capture_screen,
+            capture_screen, current_music_metadata,
             plugins::plugin_dir, plugins::plugin_list, plugins::plugin_read_source,
             plugins::plugin_install_example, plugins::plugin_install_dsh_bridge, plugins::plugin_delete,
             plugins::plugin_sdk_install, plugins::plugin_sdk_dir, plugins::export_dsh_bridge,
