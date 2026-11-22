@@ -1683,9 +1683,12 @@ async function boot() {
             return;
           }
           const sent = await triggerProactive();
-          markGreeted(now);
-          if (sent) trackEvent({ type: "greeting", summary: "主动问候了用户" });
-          scheduleNextGreeting();
+          lastActiveAt = now;
+          if (sent) {
+            markGreeted(Date.now());
+            trackEvent({ type: "greeting", summary: "主动问候了用户" });
+            scheduleNextGreeting();
+          }
           return;
         }
       }
@@ -4521,7 +4524,7 @@ async function handlePanelDataAction(kind: string, payload: unknown): Promise<vo
         break;
       }
       case "chat-clear":
-        clearHistory();
+        await clearHistory();
         panelChat = [];
         toast("对话记录已清空");
         break;
@@ -6600,9 +6603,10 @@ async function toggleAssistantSettings() {
     const clearHistBtn = document.createElement("button");
     clearHistBtn.className = "as-btn";
     clearHistBtn.textContent = "清空对话历史";
-    clearHistBtn.addEventListener("click", () => {
-      clearHistory();
-      toast("对话历史已清空，长期记忆保留");
+    clearHistBtn.addEventListener("click", async () => {
+      if (!window.confirm("清空全部对话历史？长期记忆会保留。")) return;
+      try { await clearHistory(); toast("对话历史已清空，长期记忆保留"); }
+      catch (e) { toast(`清空失败：${String(e)}`, "warn"); }
     });
 
     sep(); // 分组：隐私
@@ -6893,12 +6897,12 @@ function showUpdateBubble(tag: string) {
   el.append(title, hint, bar, actions);
   document.body.appendChild(el);
 
-  // 下载失败时统一跳官网：GitHub 在国内经常下不动，官网有可直接下载的安装包
+  // 下载失败时由用户选择重试或打开官网。
   const openOfficialSite = () => {
     void invoke("open_url", { url: "http://petra.xin/" });
     el.remove();
   };
-  laterBtn.addEventListener("click", () => el.remove());
+  laterBtn.onclick = () => el.remove();
   updateBtn.addEventListener("click", async () => {
     hint.textContent = "正在下载…";
     bar.style.display = "block";
@@ -6911,15 +6915,13 @@ function showUpdateBubble(tag: string) {
     if (ok) {
       hint.textContent = "下载完成，即将安装";
     } else {
-      hint.textContent = "下载失败，正在打开官网，可在官网手动下载。";
+      hint.textContent = "下载失败。可以重试，或前往官网手动下载。";
       bar.style.display = "none";
       updateBtn.disabled = false;
       updateBtn.textContent = "重试";
       laterBtn.disabled = false;
       laterBtn.textContent = "前往官网";
       laterBtn.onclick = openOfficialSite;
-      // 留 600ms 让用户看清"下载失败"，再自动跳官网；气泡保留，方便回来点「重试」
-      window.setTimeout(() => void invoke("open_url", { url: "http://petra.xin/" }), 600);
     }
   });
 

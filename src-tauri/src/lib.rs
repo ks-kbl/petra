@@ -1361,14 +1361,53 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+static CHAT_HISTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn parse_chat_archive(raw: &str) -> Result<Vec<serde_json::Value>, String> {
+    let messages: Vec<serde_json::Value> = serde_json::from_str(raw)
+        .map_err(|e| format!("聊天历史格式无效，原文件未更改：{e}"))?;
+    if messages.iter().any(|m| !matches!(m.get("role").and_then(|r| r.as_str()), Some("user" | "assistant" | "system" | "tool"))) {
+        return Err("聊天历史包含无效消息，原文件未更改".into());
+    }
+    Ok(messages)
+}
+
+fn write_chat_shard(path: &std::path::Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let temp = path.with_extension("json.tmp");
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temp); }
+    result.map_err(|e| format!("保存聊天历史失败：{e}"))
+}
+
+#[cfg(test)]
+mod chat_archive_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_snapshots_are_not_empty_archives() {
+        for bad in ["", "{", "{}", "[null]", "[{\"role\":\"unknown\"}]"] {
+            assert!(parse_chat_archive(bad).is_err());
+        }
+        assert!(parse_chat_archive("[]").unwrap().is_empty());
+        assert_eq!(parse_chat_archive(r#"[{"role":"user","content":"你好"}]"#).unwrap().len(), 1);
+    }
+}
+
 /// 把旧版单文件历史迁移成按天分片（只在旧文件存在时做一次）
 fn migrate_legacy_chat_history(app: &AppHandle) -> Result<(), String> {
     let legacy = chat_history_path(app)?;
     if !legacy.exists() {
         return Ok(());
     }
-    let raw = std::fs::read_to_string(&legacy).unwrap_or_default();
-    let msgs: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let raw = std::fs::read_to_string(&legacy).map_err(|e| e.to_string())?;
+    let msgs = parse_chat_archive(&raw)?;
     let dir = chat_history_dir(app)?;
     let mut buckets: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
         std::collections::BTreeMap::new();
@@ -1379,16 +1418,13 @@ fn migrate_legacy_chat_history(app: &AppHandle) -> Result<(), String> {
         let path = dir.join(format!("{day}.json"));
         // 目标已存在就合并（极少数情况下迁移跑了两遍）
         let mut merged: Vec<serde_json::Value> = if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default()
+            parse_chat_archive(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)?
         } else {
             Vec::new()
         };
-        merged.extend(list);
+        for msg in list { if !merged.contains(&msg) { merged.push(msg); } }
         let text = serde_json::to_string(&merged).map_err(|e| e.to_string())?;
-        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        write_chat_shard(&path, &text)?;
     }
     // 迁移完改名留档，避免下次又迁一遍；出问题也能人工找回
     let backup = legacy.with_extension("json.bak");
@@ -1398,6 +1434,7 @@ fn migrate_legacy_chat_history(app: &AppHandle) -> Result<(), String> {
 
 /// 读取全部聊天历史（按日期升序拼接）。面板和前端都用它。
 pub(crate) fn read_chat_history_all(app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    let _guard = CHAT_HISTORY_LOCK.lock().map_err(|_| "聊天历史暂不可用")?;
     migrate_legacy_chat_history(app)?;
     let dir = chat_history_dir(app)?;
     let mut days: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
@@ -1420,31 +1457,39 @@ pub(crate) fn read_chat_history_all(app: &AppHandle) -> Result<Vec<serde_json::V
 /// 保存聊天历史（前端传入整份 JSON）：按 ts 拆成每天一个文件写回。
 #[tauri::command]
 fn save_chat_history(app: AppHandle, content: String) -> Result<(), String> {
+    let msgs = parse_chat_archive(&content)?;
+    // 空快照不是清空指令，也不触发迁移。
+    if msgs.is_empty() { return Ok(()); }
+    let _guard = CHAT_HISTORY_LOCK.lock().map_err(|_| "聊天历史暂不可用")?;
     migrate_legacy_chat_history(&app)?;
-    let msgs: Vec<serde_json::Value> = serde_json::from_str(&content).unwrap_or_default();
     let dir = chat_history_dir(&app)?;
-    let mut buckets: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
-        std::collections::BTreeMap::new();
-    for m in msgs {
-        buckets.entry(chat_day_key(&m)).or_default().push(m);
-    }
-    // 历史被清空：把旧分片都删掉（否则清空之后又会被读回来）
-    if buckets.is_empty() {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().map(|x| x == "json").unwrap_or(false) {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-        }
-        return Ok(());
-    }
-    // 逐个写；本次没涉及的老日子文件保持原样（它们不会再变）
-    for (day, list) in buckets {
+    let mut buckets = std::collections::BTreeMap::<String, Vec<serde_json::Value>>::new();
+    for m in msgs { buckets.entry(chat_day_key(&m)).or_default().push(m); }
+    // 先验证将要覆盖的文件，损坏的分片不能被新内容盖掉。
+    for day in buckets.keys() {
         let path = dir.join(format!("{day}.json"));
+        if path.exists() { parse_chat_archive(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)?; }
+    }
+    for (day, list) in buckets {
         let text = serde_json::to_string(&list).map_err(|e| e.to_string())?;
-        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        write_chat_shard(&dir.join(format!("{day}.json")), &text)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_chat_history(app: AppHandle) -> Result<(), String> {
+    let _guard = CHAT_HISTORY_LOCK.lock().map_err(|_| "聊天历史暂不可用")?;
+    let dir = chat_history_dir(&app)?;
+    let legacy = chat_history_path(&app)?;
+    for path in [legacy.with_extension("json.bak"), legacy] {
+        if path.exists() { std::fs::remove_file(path).map_err(|e| e.to_string())?; }
+    }
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.is_file() && (path.extension().is_some_and(|e| e == "json") || path.to_string_lossy().ends_with(".json.tmp")) {
+            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -6536,7 +6581,7 @@ pub fn run() {
             websearch::web_search,
             websearch::web_search_multi, websearch::read_web_page,
             list_installed_apps, open_path, lock_screen,
-            save_chat_history, load_chat_history, search_chat_history,
+            save_chat_history, clear_chat_history, load_chat_history, search_chat_history,
             schedule_shutdown, cancel_shutdown,
             register_assistant_shortcut, unregister_assistant_shortcut, capture_hotkey,
             tts_synthesize, set_tts_key, get_tts_key,
