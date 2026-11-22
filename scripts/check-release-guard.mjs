@@ -7,6 +7,7 @@
  * 这条守卫放在 release workflow 的构建之前，不满足就直接失败，避免发出坏包。
  */
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 /** 所有对外发布的包都必须内置这把公钥（换 key 时同步改这里） */
 const EXPECTED_KEY_ID = "7CB49615F65D3C41";
@@ -31,6 +32,17 @@ const ref = String(process.env.GITHUB_REF_NAME || "").trim();
 const tagVersion = ref.replace(/^v/, "");
 
 const errors = [];
+// Tauri 写入生成的 NSIS 语言文件时会处理编码；源文件不得再含 BOM。
+for (const [language, file] of Object.entries(conf.bundle?.windows?.nsis?.customLanguageFiles ?? {})) {
+  try {
+    const bytes = readFileSync(resolve("src-tauri", file));
+    if (bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))) {
+      errors.push(`NSIS 语言文件 ${language} (${file}) 必须保存为无 BOM 的 UTF-8`);
+    }
+  } catch (e) {
+    errors.push(`无法读取 NSIS 语言文件 ${language} (${file})：${e.message}`);
+  }
+}
 if (!keyId) {
   errors.push("tauri.conf.json 的 updater.pubkey 解不出 keyid（格式不对）");
 } else if (keyId !== EXPECTED_KEY_ID) {
