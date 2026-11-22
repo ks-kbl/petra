@@ -1,4 +1,4 @@
-﻿LangString addOrReinstall ${LANG_SIMPCHINESE} "重新安装 Petra"
+LangString addOrReinstall ${LANG_SIMPCHINESE} "重新安装 Petra"
 LangString alreadyInstalled ${LANG_SIMPCHINESE} "已安装 Petra"
 LangString alreadyInstalledLong ${LANG_SIMPCHINESE} "当前已安装 Petra ${VERSION}。请选择重新安装或卸载，然后点击「下一步」。"
 LangString appRunning ${LANG_SIMPCHINESE} "Petra 正在运行。请先退出再重试。"
