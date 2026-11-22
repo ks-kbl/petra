@@ -159,6 +159,18 @@ let timer: number | null = null;
 let busy = false;
 /** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant / triggerProactive） */
 let historyLoaded = false;
+let historyLoading: Promise<void> | undefined;
+let historyWrites = Promise.resolve();
+let clearingHistory = false;
+let sending = false;
+let proactivePending = false;
+let conversationEpoch = 0;
+
+async function ensureHistoryLoaded() {
+  if (historyLoaded) return;
+  historyLoading ??= loadHistory().then(() => { historyLoaded = true; }).finally(() => { historyLoading = undefined; });
+  await historyLoading;
+}
 /** 最近一次用户主动聊天/打开对话面板的时间：判断"问候到点时用户是不是正在聊" */
 let lastConversationActivityAt = 0;
 /** 本轮进程内还未到点的提醒；到点后自动完成 openLoop，不需要用户再确认 */
@@ -983,8 +995,10 @@ async function loadHistory() {
       const legacy = localStorage.getItem(HIST_KEY);
       if (legacy) {
         raw = legacy;
-        void invoke("save_chat_history", { content: legacy }).catch(() => {});
-        localStorage.removeItem(HIST_KEY);
+        try {
+          await invoke("save_chat_history", { content: legacy });
+          localStorage.removeItem(HIST_KEY);
+        } catch { /* 保存失败不移除迁移源 */ }
       }
     }
     const h = JSON.parse(raw || "[]");
@@ -1024,8 +1038,6 @@ async function loadHistory() {
   } catch {
     history = [];
   }
-  // 不再在这里重置"历史所属语言" —— 那会把「改语言就清历史」也一起关掉。
-  // 历史语言改为持久化在 settings.assistant.historyLang，见 send()。
 }
 /**
  * 统一的"写进历史"入口：补齐 ts 时间戳。
@@ -1037,13 +1049,17 @@ function pushHistory(msg: ChatMessage) {
 }
 
 function saveHistory() {
-  // 整体覆盖写到 app_data_dir/chat-history.json；fire-and-forget，失败不阻塞对话
-  void invoke("save_chat_history", { content: JSON.stringify(history) }).catch(() => {});
+  if (!historyLoaded || clearingHistory) return;
+  const content = JSON.stringify(history);
+  historyWrites = historyWrites.then(() => invoke<void>("save_chat_history", { content })).catch(e => {
+    void invoke("debug_mark", { msg: `[chat-history] 保存失败：${String(e)}` }).catch(() => {});
+  });
 }
 
 // ---------- 主动问候：对话活动判断 + 话题记录 ----------
 function markConversationActivity(): void {
   lastConversationActivityAt = Date.now();
+  conversationEpoch++;
 }
 
 function assistantPanelIsOpen(): boolean {
@@ -1055,7 +1071,7 @@ export function isAssistantConversationActive(): boolean {
   return busy || assistantPanelIsOpen() || Date.now() - lastConversationActivityAt < 2 * 60 * 1000;
 }
 
-/** 问候流程内部用：不含 busy（问候自身会把 busy 置真） */
+/** 手动聊天优先；问候使用独立状态，不占用 busy。 */
 function isUserConversationActive(): boolean {
   return assistantPanelIsOpen() || Date.now() - lastConversationActivityAt < 2 * 60 * 1000;
 }
@@ -1984,10 +2000,7 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   //    序列覆盖掉，配对丢失后每轮请求 400；
   //  · 后来改成 busy 时跳过 —— 又引入新问题：启动后第一次打开若正赶上主动问候/抽卡点评
   //    （busy=true），历史根本没加载过，之后第一条消息就把 chat-history.json 整份覆盖掉。
-  if (!historyLoaded) {
-    await loadHistory();
-    historyLoaded = true;
-  }
+  await ensureHistoryLoaded();
   inputBar!.classList.remove("hidden");
   // Esc 收起时留下的草稿：打开面板自动填回
   if (input && !input.value.trim()) {
@@ -2113,26 +2126,23 @@ export function repositionAssistantBubbles(): void {
 }
 
 /** 清空对话历史（保留长期记忆 memory） */
-export function clearHistory() {
-  activeImageRefs = [];
-  activeImageAt = 0;
-  history = [];
-  resetChatSummary();
-  lastExtractedAt = 0;
+export async function clearHistory(): Promise<void> {
+  if (busy || sending || clearingHistory) throw new Error("请等当前对话结束后再清空");
+  clearingHistory = true;
+  conversationEpoch++;
   try {
-    void invoke("save_chat_history", { content: "[]" }).catch(() => {});
-  } catch {
-    /* 忽略 */
-  }
-  clearBubbles();
-}
-
-export function resetHistory() {
-  history = [];
-  resetChatSummary();
-  lastExtractedAt = 0;
-  saveHistory();
-  if (bubbles) bubbles.innerHTML = "";
+    await historyLoading;
+    await historyWrites;
+    await invoke("clear_chat_history");
+    try { localStorage.removeItem(HIST_KEY); } catch { /* 磁盘清空已成功 */ }
+    activeImageRefs = [];
+    activeImageAt = 0;
+    history = [];
+    historyLoaded = true;
+    resetChatSummary();
+    lastExtractedAt = 0;
+    clearBubbles();
+  } finally { clearingHistory = false; }
 }
 
 function lastBubble(): HTMLElement | null {
@@ -2224,12 +2234,23 @@ function buildChatContext(nickname: string, outputLang: string): string {
 }
 
 async function send(text: string) {
+  if (busy || sending || clearingHistory) {
+    if (input && !input.value.trim() && text.trim()) setInputValue(text);
+    if (clearingHistory) toast("正在清空历史，请稍后再发送", "info");
+    return;
+  }
+  sending = true;
+  try { await sendTurn(text); }
+  finally { sending = false; }
+}
+
+async function sendTurn(text: string) {
   // 手动发送（回车 / 点「发送」）时如果麦克风还在听，直接取消这一轮：
   // 否则几秒后识别收尾 → onFinal → 把这句**再发一次**。
   // 实测：12:31 点发送把 interim 发了出去，2 秒后 final 回来又发了一遍，
   // 于是 AI 回了一句「刚关过了呀，那页已经没了」。
   if (recognizer?.isRecording()) recognizer.cancel();
-  if (busy) return;
+  if (busy || clearingHistory) return;
   markConversationActivity();
   const s = loadSettings();
   const ttsKey = await invoke<string>("get_tts_key").catch(() => "");
@@ -2257,23 +2278,8 @@ async function send(text: string) {
   }
 
   const outLang = s.assistant.outputLanguage;
-  // 换语言时清空对话历史。
-  // 以前用内存变量 lastChatLang 作基准，重启后初值为空 → 第一次发送就误清历史；
-  // 后来在 loadHistory 里初始化又导致"改语言永远不清"。现在把历史所属语言**持久化**：
-  //   - 有记录且与当前不同 => 用户真的换了语言 => 清历史
-  //   - 没有记录（老用户升级）=> 认作当前语言，不动历史
-  const historyLang = s.assistant.historyLang ?? "";
-  if (history.length > 0) {
-    if (historyLang && historyLang !== outLang) history = [];
-    else if (!historyLang) {
-      s.assistant.historyLang = outLang;
-      saveSettings(s);
-    }
-  }
-  if (s.assistant.historyLang !== outLang) {
-    s.assistant.historyLang = outLang;
-    saveSettings(s);
-  }
+  // 输出语言只影响本轮指令，不能替代清空历史。
+  await ensureHistoryLoaded();
   const now = Date.now();
   const turn = readTurn(text, history, pendingImages.length + pendingTextFiles.length > 0, now);
   const localTurn = keepTurnLocal(turn.intent);
@@ -3518,17 +3524,28 @@ function greetingLifeBlock(): string {
 
 export async function triggerProactive(): Promise<boolean> {
   // 已经在回复 / 用户正开着对话框聊天：取消本次问候（用户要求：正在聊天时不插话）
-  if (busy || isUserConversationActive()) return false;
+  if (busy || sending || clearingHistory || proactivePending || isUserConversationActive()) return false;
+  const epoch = conversationEpoch;
+  const cancelled = () => epoch !== conversationEpoch || busy || sending || clearingHistory || isUserConversationActive()
+    || !loadSettings().assistant.enabled || loadSettings().idleMode;
+  proactivePending = true;
+  try { return await generateProactive(cancelled); }
+  catch (e) {
+    void invoke("debug_mark", { msg: `[greeting] 主动问候失败：${String(e)}` }).catch(() => {});
+    return false;
+  }
+  finally { proactivePending = false; }
+}
+
+async function generateProactive(cancelled: () => boolean): Promise<boolean> {
 
   const s = loadSettings();
   const apiKey = await ensureApiKey();
   if (!s.assistant.enabled || !isProviderReady(s.assistant, apiKey)) return false;
 
   // 问候要进主对话历史，所以先把磁盘历史加载好，避免之后第一条消息把历史文件覆盖掉
-  if (!historyLoaded) {
-    await loadHistory();
-    historyLoaded = true;
-  }
+  await ensureHistoryLoaded();
+  if (cancelled()) return false;
 
   // 固定并发调用两个"问候工具"：截屏 + 前台窗口检查。
   // 用户要求 AI 通过两个来源自行总结，再生成相关问候。
@@ -3553,7 +3570,7 @@ export async function triggerProactive(): Promise<boolean> {
   }
 
   // 采集过程中用户可能已经打开对话框开始聊天：这时取消本次问候
-  if (isUserConversationActive()) return false;
+  if (cancelled()) return false;
 
   const now = new Date();
   const hour = now.getHours();
@@ -3606,11 +3623,7 @@ export async function triggerProactive(): Promise<boolean> {
     recentGreetingTopics: todayTopics,
   });
 
-  busy = true;
-  setSendBusy(true);
-  lifecycleOnOpen?.();
-  const bubble = addBubble("ai", "");
-  setBubbleText(bubble, "正在看看你在做什么…");
+
   let streamed = "";
   try {
     // 问候不暴露通用工具，避免模型乱开软件；截屏与窗口检查已经由前端并发执行。
@@ -3633,14 +3646,10 @@ export async function triggerProactive(): Promise<boolean> {
     if (!greeting) throw new Error("模型没有生成问候内容");
     const { main: mainText, trans: transText } = splitTranslation(greeting);
     if (!mainText.trim()) throw new Error("模型没有生成问候正文");
-    // 投递记账：额度、上次时间、以及"这句是问句"的话头登记
-    lifeRuntime.markDelivered(mainText, Date.now());
-
-    // 生成期间用户已经打开对话框开始聊天：本次问候作废，不要打断用户
-    if (isUserConversationActive()) {
-      bubble.remove();
-      return false;
-    }
+    if (cancelled()) return false;
+    const bubble = addBubble("ai", mainText);
+    const deliveredAt = Date.now();
+    lifeRuntime.markDelivered(mainText, deliveredAt);
 
     for (const m of relevantMemories) {
       const orig = memory.find(e => e.id === m.id);
@@ -3669,7 +3678,7 @@ export async function triggerProactive(): Promise<boolean> {
 
     // 关键：主动问候也是正常对话，必须写进主历史并标【问候】，
     // 这样用户下一句回复时，模型知道"自己刚刚主动说过什么"。
-    pushHistory({ role: "assistant", content: markGreetingForHistory(greeting), ts: Date.now() });
+    pushHistory({ role: "assistant", content: markGreetingForHistory(greeting), ts: deliveredAt });
     saveHistory();
     recordGreeting(parsed.summary || mainText.slice(0, 80), mainText);
 
@@ -3682,12 +3691,7 @@ export async function triggerProactive(): Promise<boolean> {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     void invoke("debug_mark", { msg: `[greeting] 主动问候失败：${msg}` }).catch(() => {});
-    bubble.remove();
     return false;
-  } finally {
-    busy = false;
-    setSendBusy(false);
-    lifecycleOnClose?.();
   }
 }
 
