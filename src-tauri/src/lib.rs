@@ -10,6 +10,7 @@ mod audio;
 #[path = "audio_linux.rs"]
 mod audio;
 
+mod assistant_memory;
 mod plugins;
 mod websearch;
 
@@ -1480,6 +1481,7 @@ fn save_chat_history(app: AppHandle, content: String) -> Result<(), String> {
 #[tauri::command]
 fn clear_chat_history(app: AppHandle) -> Result<(), String> {
     let _guard = CHAT_HISTORY_LOCK.lock().map_err(|_| "聊天历史暂不可用")?;
+    assistant_memory::clear_inbox(&app)?;
     let dir = chat_history_dir(&app)?;
     let legacy = chat_history_path(&app)?;
     for path in [legacy.with_extension("json.bak"), legacy] {
@@ -6582,6 +6584,8 @@ pub fn run() {
             websearch::web_search_multi, websearch::read_web_page,
             list_installed_apps, open_path, lock_screen,
             save_chat_history, clear_chat_history, load_chat_history, search_chat_history,
+            assistant_memory::memory_load, assistant_memory::memory_enqueue,
+            assistant_memory::memory_pending, assistant_memory::memory_pending_corrections, assistant_memory::memory_commit,
             schedule_shutdown, cancel_shutdown,
             register_assistant_shortcut, unregister_assistant_shortcut, capture_hotkey,
             tts_synthesize, set_tts_key, get_tts_key,

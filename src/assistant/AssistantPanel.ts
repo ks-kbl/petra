@@ -2,14 +2,16 @@ import { lifeRuntime } from "./lifeRuntime";
 import { filterMentionable } from "./mentionScore";
 import { voiceCapabilityLine } from "./voiceTone";
 import { readTurn, keepTurnLocal, turnReplyGuide } from "./conversationTurn";
+import { advanceRegister, conversationReplyReminder, type ConversationRegister } from "./conversationRegister";
+import { evidenceScope, isGlobalScope, namedMemoryScope, SESSION_ONLY, type MemoryScope } from "./memoryScope";
 import { builtinConversationExamples } from "./builtinPersonas";
 import { recentDiaryBrief, weeklyDiaryMood } from "../features/diary/DiaryManager";
-import { extractDiaryFacts, memoryLineFor } from "./diaryMemory";
-import { textSimilarity } from "./memoryOps";
+import { canQueueEvidence, correctionTargets, explicitMemory, recallLongMemory, safeEvidence, type Evidence } from "./longTermMemory";
+import { dreamInBackground, loadLongMemory, memories, memoryMetric, pendingCorrectionIds, recallableMemories, processReflection, recordMemoryEvidence, reflectInBackground, resetPendingCorrections, writeExplicitMemory, type ReflectModel } from "./memoryBackground";
 import { searchPlan, hitRelevance, RELEVANCE_FLOOR, needsWebEvidence, collectWebEvidence, evidenceExcerpt, type WebHit, type WebEvidencePage } from "./searchQuery";
 import { invoke } from "@tauri-apps/api/core";
 import { readingHoldMs } from "../ui/bubbleTiming";
-import { chatStream, extractCommand, stripCommand, PROVIDERS, isProviderReady, type ChatMessage, type ToolCall, type MemoryEntry, type MemoryStore } from "./AssistantClient";
+import { chatStream, estimateTokens, extractCommand, stripCommand, PROVIDERS, isProviderReady, type ChatMessage, type ToolCall, type MemoryEntry } from "./AssistantClient";
 import { classifyEmotion, classifyAssistantEmotion, moodFallbackEmotion, reactNow, emotionEmoji, boostMood, getMood, type EmotionTag } from "./EmotionEngine";
 import type { AssistantProvider } from "../utils/settings";
 import { trackEvent } from "../features/diary/DiaryEventTracker";
@@ -17,7 +19,7 @@ import { dailyDraw, hasDrawnToday, getTodayDraw, getCollectionProgress } from ".
 import { loadDiaries, getDiary } from "../features/diary/DiaryManager";
 import { composePersonaAnchor, loadSettings, saveSettings } from "../utils/settings";
 import { getApiKey, currentKeyScope, normalizeOpenAIBase } from "./apiKey";
-import { buildLanguageInstruction, buildLanguageReminder, langNameOf, splitTranslation } from "../utils/outputLanguage";
+import { buildLanguageInstruction, langNameOf, splitTranslation } from "../utils/outputLanguage";
 import { appNameFromTitle, frontWindowForModel, isDesktopWindow, isOwnWindow } from "../utils/foregroundApp";
 import {
   buildCardCommentPrompt,
@@ -32,16 +34,6 @@ import {
   type GreetingRecord,
 } from "./greetingMemory";
 import { markGreetingForHistory } from "./greetingHistory";
-import {
-  emptyProfile,
-  normalizeProfile,
-  profileBlock,
-  shouldSynthesize,
-  buildProfileMessages,
-  parseProfileResponse,
-  type UserProfile,
-} from "./userProfile";
-import { applyMemoryOps, parseMemoryOps, formatMemoryForExtractor } from "./memoryOps";
 import { rankMemories } from "./memoryRank";
 import {
   recordMoodSample,
@@ -65,13 +57,6 @@ import {
   selfBlock,
   type SelfState,
 } from "./selfModel";
-import {
-  contentHash,
-  needsEmbedding,
-  normalizeEmbeddingCache,
-  mergeSemanticDuplicates,
-  type EmbeddingCache,
-} from "./semanticMerge";
 import {
   emptyNudgeState,
   normalizeNudgeState,
@@ -118,11 +103,8 @@ function idleHideMs(): number {
   return Math.min(3600, sec) * 1000;
 }
 const HIST_KEY = "live2d-pet-assistant-history";
-const MEM_KEY = "live2d-pet-assistant-memory";
 /** 用户画像：只喂模型看，不在界面展示（用户要求"从对话过程侧面体现"） */
-const PROFILE_KEY = "live2d-pet-assistant-profile";
 /** 长期记忆条数上限。原来是 80，聊一个月就停止学习；画像层接管 prompt 后素材可以多存 */
-const MEM_LIMIT = 200;
 /** 更早对话的滚动摘要：补窗口截断后的上下文，长聊不失忆 */
 const SUMMARY_KEY = "live2d-pet-assistant-chat-summary";
 /** 情绪趋势采样：每天一个点，最近 14 天（只进 prompt，不露界面） */
@@ -132,9 +114,6 @@ const NUDGE_KEY = "petra-memory-nudge";
 /** 自我状态：长期相处形成的性格偏移（每天结算一次，极慢） */
 const SELF_KEY = "petra-self-state";
 /** 记忆向量缓存（语义查重用；端点不支持就整条链路静默跳过） */
-const EMB_KEY = "petra-memory-embeddings";
-/** 端点不支持 embedding 的标记（记日期，24 小时内不再试，避免每条消息都撞一次 404） */
-const EMB_UNSUPPORTED_KEY = "petra-embedding-unsupported";
 /** 主动问候话题记录：最近几次问候的 summary / 是否被回复，用于避免一天内重复话题 */
 const GREETING_LOG_KEY = "petra-greeting-log";
 
@@ -143,18 +122,12 @@ let bubbles: HTMLElement | null = null;
 let input: HTMLTextAreaElement;
 let allowAllShell: HTMLInputElement;
 let history: ChatMessage[] = [];
-let memory: MemoryStore = [];
-let userProfile: UserProfile = emptyProfile();
+let conversationRegister: ConversationRegister = "default";
+let conversationScope: MemoryScope | undefined;
 let chatSummary: ChatSummary = emptyChatSummary();
-/** 上次后台提取记忆时的 history 长度：按"新增了多少条"触发，而不是按长度取余 */
-let lastExtractedAt = 0;
-/** 这一轮用户是不是在纠正我（"记错了/我没说过/别记这个"）→ 立刻跑一次提取 */
-let pendingCorrection = false;
 let moodSamples: MoodSample[] = [];
 let nudgeState: NudgeState = emptyNudgeState();
 let selfState: SelfState = emptySelfState();
-let memoryEmbeddings: EmbeddingCache = {};
-let embeddingUnsupportedDay = "";
 let timer: number | null = null;
 let busy = false;
 /** 本次启动是否已从磁盘加载过历史（只加载一次，见 openAssistant / triggerProactive） */
@@ -631,192 +604,6 @@ export function setLifecycle(onOpen: () => void, onClose: () => void) {
   lifecycleOnClose = onClose;
 }
 
-function loadMemory() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(MEM_KEY) || "[]");
-    if (Array.isArray(raw) && raw.length > 0) {
-      // 迁移旧格式（string[] → MemoryEntry[]）
-      if (typeof raw[0] === "string") {
-        memory = (raw as string[]).map((s, i) => ({
-          id: `migrated_${i}`,
-          category: "other" as const,
-          content: s,
-          keywords: [],
-          source: "user_said" as const,
-          createdAt: Date.now(),
-          lastUsedAt: Date.now(),
-          importance: 2 as const,
-        }));
-        saveMemory(); // 持久化新格式
-      } else {
-          memory = raw as MemoryStore;
-      }
-      // 记忆衰减：importance=3 且超过 30 天未引用 → 归档
-      const now = Date.now();
-      const DECAY_DAYS = 30 * 86400000;
-      const ARCHIVE_KEY = MEM_KEY + "-archive";
-      const toArchive = memory.filter(m => m.importance === 3 && (now - m.lastUsedAt) > DECAY_DAYS);
-      if (toArchive.length > 0) {
-        // 追加到归档存储
-        try {
-          const archived = JSON.parse(localStorage.getItem(ARCHIVE_KEY) || "[]") as MemoryStore;
-          archived.push(...toArchive);
-          localStorage.setItem(ARCHIVE_KEY, JSON.stringify(archived.slice(-200)));
-        } catch { /* 忽略 */ }
-        // 从活跃记忆中移除
-        memory = memory.filter(m => !(m.importance === 3 && (now - m.lastUsedAt) > DECAY_DAYS));
-        saveMemory();
-      }
-    } else {
-      memory = [];
-    }
-  } catch {
-    memory = [];
-  }
-}
-function saveMemory() {
-  try {
-    localStorage.setItem(MEM_KEY, JSON.stringify(memory.slice(-MEM_LIMIT)));
-  } catch {
-    /* 忽略 */
-  }
-}
-
-/**
- * 记忆超上限时的淘汰：先扔最琐碎的（importance 数字越大越琐碎），
- * 同档次再扔最久没被引用的。之前是 `slice(-80)` 硬切最旧的，
- * 会把"用户叫小明"这种核心记忆切掉、留下昨天的碎事。
- */
-function pruneMemory() {
-  while (memory.length > MEM_LIMIT) {
-    let victim = 0;
-    for (let i = 1; i < memory.length; i++) {
-      const a = memory[i], b = memory[victim];
-      if (a.importance > b.importance || (a.importance === b.importance && a.lastUsedAt < b.lastUsedAt)) victim = i;
-    }
-    memory.splice(victim, 1);
-  }
-}
-
-function loadUserProfile() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(PROFILE_KEY) || "null");
-    userProfile = normalizeProfile(raw);
-  } catch {
-    userProfile = emptyProfile();
-  }
-}
-
-function saveUserProfile() {
-  try {
-    localStorage.setItem(PROFILE_KEY, JSON.stringify(userProfile));
-  } catch {
-    /* 忽略 */
-  }
-}
-
-function loadMemoryEmbeddings() {
-  try {
-    memoryEmbeddings = normalizeEmbeddingCache(JSON.parse(localStorage.getItem(EMB_KEY) || "null"));
-  } catch {
-    memoryEmbeddings = {};
-  }
-  try {
-    embeddingUnsupportedDay = localStorage.getItem(EMB_UNSUPPORTED_KEY) || "";
-  } catch {
-    embeddingUnsupportedDay = "";
-  }
-}
-
-function saveMemoryEmbeddings() {
-  try {
-    // 只留还活着的记忆，别让缓存无限膨胀
-    const alive = new Set(memory.map((m) => m.id));
-    const trimmed: EmbeddingCache = {};
-    for (const [id, v] of Object.entries(memoryEmbeddings)) {
-      if (alive.has(id)) trimmed[id] = v;
-    }
-    memoryEmbeddings = trimmed;
-    localStorage.setItem(EMB_KEY, JSON.stringify(trimmed));
-  } catch {
-    /* 忽略 */
-  }
-}
-
-function embeddingBlockedToday(): boolean {
-  const today = new Date();
-  const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
-  return embeddingUnsupportedDay === key;
-}
-
-function markEmbeddingUnsupported() {
-  const today = new Date();
-  embeddingUnsupportedDay = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
-  try {
-    localStorage.setItem(EMB_UNSUPPORTED_KEY, embeddingUnsupportedDay);
-  } catch {
-    /* 忽略 */
-  }
-}
-
-/**
- * 语义查重：给记忆算 embedding，把"换了说法其实是同一件事"的条目合并掉。
- *
- * 只在后台跑，不参与聊天召回打分 —— 所以不会给回复加任何延迟。
- * 端点不支持 /embeddings（DeepSeek、不少中转站）或没网时，标记当天不再尝试，
- * 记忆照旧按 2-gram 去重，功能退化但不报错。
- */
-let embeddingRunning = false;
-async function refreshMemoryEmbeddings(s: any, apiKey: string) {
-  if (embeddingRunning) return;
-  if (embeddingBlockedToday()) return;
-  const ep = backgroundEndpoint(s);
-  if (!ep) return;
-  const need = needsEmbedding(memoryEmbeddings, memory).slice(0, 32);
-  if (!need.length) return;
-  embeddingRunning = true;
-  try {
-    const model = String(s?.assistant?.embeddingModel || "text-embedding-3-small");
-    const res = await fetch(`${ep.base}/embeddings`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, input: need.map((m) => m.content) }),
-    });
-    if (!res.ok) {
-      // 404/400 基本都是端点压根没有 /embeddings：今天不再试
-      markEmbeddingUnsupported();
-      return;
-    }
-    const json = await res.json();
-    const data = Array.isArray(json?.data) ? json.data : [];
-    if (!data.length) {
-      markEmbeddingUnsupported();
-      return;
-    }
-    need.forEach((m, i) => {
-      const v = data[i]?.embedding;
-      if (Array.isArray(v) && v.length >= 8) {
-        memoryEmbeddings[m.id] = { h: contentHash(m.content), v: v.map((x: unknown) => Number(x)) };
-      }
-    });
-    saveMemoryEmbeddings();
-
-    const result = mergeSemanticDuplicates(memory, memoryEmbeddings, 0.9);
-    if (result.merged > 0) {
-      memory = result.memory;
-      for (const id of result.removedIds) delete memoryEmbeddings[id];
-      saveMemoryEmbeddings();
-      saveMemory();
-      // 记忆发生了变化，画像跟着重算
-      void synthesizeUserProfile(s, apiKey, true);
-    }
-  } catch {
-    markEmbeddingUnsupported();
-  } finally {
-    embeddingRunning = false;
-  }
-}
-
 function loadSelfState() {
   try {
     selfState = normalizeSelfState(JSON.parse(localStorage.getItem(SELF_KEY) || "null"));
@@ -872,7 +659,7 @@ function saveNudgeState() {
  * 这一轮要不要"顺口问一句"。
  * 频率受控（3 小时冷却、每天 2 次），命中就把它标记成刚用过，避免下一轮又提同一件事。
  */
-function takeTurnNudge(userText = ""): string {
+function takeTurnNudge(userText = "", scope?: MemoryScope): string {
   try {
     if (isCurrentStateQuestion(userText)) return "";
     if (!shouldNudge(nudgeState)) return "";
@@ -887,16 +674,10 @@ function takeTurnNudge(userText = ""): string {
       saveNudgeState();
       return nudgeBlock({ content: loop });
     }
-    const cand = pickNudgeCandidate(recallRelevantMemories({ userText }, true));
+    const cand = pickNudgeCandidate(recallLongMemory(recallableMemories(), userText, false, false, scope));
     if (!cand) return "";
     nudgeState = markNudged(nudgeState);
     saveNudgeState();
-    // 记一次"用过了"：不然同一件事会被反复挑中
-    const orig = memory.find((m) => m.id === cand.id);
-    if (orig) {
-      orig.lastUsedAt = Date.now();
-      saveMemory();
-    }
     return nudgeBlock(cand);
   } catch {
     return "";
@@ -905,19 +686,19 @@ function takeTurnNudge(userText = ""): string {
 
 /** 用户这轮可能在问旧事：自动检索一次完整历史，避免只靠摘要和最近 120 条 */
 const PAST_REFERENCE_RE =
-  /(之前|上次|以前|刚才|那天|昨天|前天|我说过|我让你|还记得|提醒|计时|待办|那个事|前面说|早先|刚刚说)/;
+  /(之前|上次|以前|刚才|那天|昨天|前天|我说过|我让你|还记得|说好的|定好的|那个事|前面说|早先|刚刚说)/;
 
 async function autoRecallHistory(text: string): Promise<string> {
   const t = (text || "").trim();
   if (!t || !PAST_REFERENCE_RE.test(t)) return "";
   try {
-    const found = await invoke<string>("search_chat_history", { query: t, days: 30, limit: 4 });
+    const found = await invoke<string>("search_chat_history", { query: t, days: 0, limit: 4 });
     if (!found || found.startsWith("没有找到") || found.startsWith("检索词为空")) return "";
     const clipped = found.length > 3000 ? `${found.slice(0, 3000)}\n…（检索结果较长，已截断）` : found;
     return (
       "【自动检索到的相关旧对话（供参考，不要逐条复述）】\n" +
       clipped +
-      "\n【怎么用】如果用户问的是过去发生的事，以这段原文为准；如果用户只是问当前状态，不要提这些旧事。"
+      "\n【怎么用】仅供核对历史；新更正和有效约定优先，不能把旧说法当成当前事实。如果只是问当前状态，不要提这些旧事。"
     );
   } catch {
     return "";
@@ -951,7 +732,6 @@ function sampleMoodNow() {
 /** 注入用的"关于主人"上下文：画像 + 最近情绪状态（都只进 system prompt） */
 function personaContextBlock(): string {
   return [
-    profileBlock(userProfile),
     selfBlock(selfState),
     moodBlock(summarizeMood(moodSamples)),
   ].filter(Boolean).join("\n\n");
@@ -1059,6 +839,7 @@ function saveHistory() {
 // ---------- 主动问候：对话活动判断 + 话题记录 ----------
 function markConversationActivity(): void {
   lastConversationActivityAt = Date.now();
+  memoryWork?.abort();
   conversationEpoch++;
 }
 
@@ -1976,25 +1757,13 @@ export async function openAssistant(modelRect?: { left: number; top: number; rig
   markConversationActivity();
   ensureInput();
   ensureBubbles();
-  loadMemory();
-  loadUserProfile();
+  void loadLongMemory().catch(logMemoryFailure);
   loadChatSummary();
   loadMoodSamples();
   loadNudgeState();
-  loadMemoryEmbeddings();
   loadSelfState();
   // 打开对话面板也是一次"见到用户"，顺手采一个情绪点（比以前只在聊天/问候后采样更连续）
   sampleMoodNow();
-  // 素材够了就在后台重算一份画像（不阻塞打开面板；没配 Key 就跳过）
-  void (async () => {
-    try {
-      const key = await ensureApiKey();
-      if (key) {
-        void synthesizeUserProfile(loadSettings(), key);
-        void refreshMemoryEmbeddings(loadSettings(), key);
-      }
-    } catch { /* 没有 Key / 后端未就绪：等下次打开再说 */ }
-  })();
   // 历史只在**本次启动第一次打开**时从磁盘加载一次：
   //  · 以前每次打开都无条件重载 —— 工具执行/确认中会把内存里尚未落盘的 assistant+tool
   //    序列覆盖掉，配对丢失后每轮请求 400；
@@ -2130,6 +1899,7 @@ export async function clearHistory(): Promise<void> {
   if (busy || sending || clearingHistory) throw new Error("请等当前对话结束后再清空");
   clearingHistory = true;
   conversationEpoch++;
+  memoryWork?.abort();
   try {
     await historyLoading;
     await historyWrites;
@@ -2140,7 +1910,9 @@ export async function clearHistory(): Promise<void> {
     history = [];
     historyLoaded = true;
     resetChatSummary();
-    lastExtractedAt = 0;
+    conversationRegister = "default";
+    conversationScope = undefined;
+    resetPendingCorrections();
     clearBubbles();
   } finally { clearingHistory = false; }
 }
@@ -2280,10 +2052,10 @@ async function sendTurn(text: string) {
   const outLang = s.assistant.outputLanguage;
   // 输出语言只影响本轮指令，不能替代清空历史。
   await ensureHistoryLoaded();
+  await loadLongMemory().catch(logMemoryFailure);
   const now = Date.now();
   const turn = readTurn(text, history, pendingImages.length + pendingTextFiles.length > 0, now);
   const localTurn = keepTurnLocal(turn.intent);
-  const turnNudge = turn.intent === "open" && text.trim() ? takeTurnNudge(text) : "";
   lifeRuntime.noteUserMessage(text, now, turn);
   // 附件：文本文件直接并进正文（模型立刻看得到）；图片只在本轮请求里编码成多模态，
   // 历史里只留一句占位，避免 base64 把 chat-history 和请求体一起撑爆。
@@ -2309,17 +2081,71 @@ async function sendTurn(text: string) {
     activeImageRefs = sentImages.map(({ mask: _mask, selected: _selected, ...ref }) => ref);
     activeImageAt = Date.now();
   }
-  // 用户提到"之前/上次/让你/计时"等旧事：先自动检索一次完整历史（模型也保留工具备查）
-  const historyRecall = localTurn || explicitEdit ? "" : await autoRecallHistory(text || composed);
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑。
   // 但它**不进历史**——交给 chatStream 的 tailInstruction 在发送时贴到最后一行，
   // 否则之后每一条历史 user 消息都会带着同一句提醒，纯烧 token。
-  const langReminder = buildLanguageReminder(outLang ?? "");
+  const registerTurn = advanceRegister(conversationRegister, text, turn.intent === "close");
+  conversationRegister = registerTurn.next;
+  const langReminder = conversationReplyReminder(outLang ?? "", registerTurn.forReply);
   const userContent = composed;
-  // 用户在纠正我（"记错了/我没说过/别记这个"）：记下来，这轮回复完立刻跑一次记忆提取，
-  // 不等攒够 6 条 —— 否则 AI 会带着错的记忆再聊好几轮。
-  const correctingNow = detectCorrection(text);
-  if (correctingNow) pendingCorrection = true;
+  const scopeName = namedMemoryScope(text);
+  if (scopeName || isGlobalScope(text)) conversationScope = scopeName;
+  const scope = evidenceScope(text, conversationScope);
+  if (turn.intent === "close") conversationScope = undefined;
+  const memoryRequest = explicitMemory(text);
+  const correctingNow = detectCorrection(text) || /^(?:刚才|上次|前面)(?:那个|那条|记的).{0,10}(?:不对|错了)|^(?:忘掉|把.+忘掉)/.test(text.trim());
+  const memoryIntent: Evidence["intent"] = correctingNow ? "correction" : memoryRequest ? "remember" : "normal";
+  let memoryOutcome: "saved" | "pending" | "unavailable" | "session" | "clarify" | "" = memoryIntent === "normal" ? "" : "unavailable";
+  if (scope === SESSION_ONLY && memoryIntent !== "normal") memoryOutcome = "session";
+  let thisCorrection: string[] = [];
+  // 只入队用户真正输入的文字，不含附件、截图、工具结果或助手发言。
+  if (scope !== SESSION_ONLY && canQueueEvidence(text, memoryIntent) && !explicitEdit && (turn.intent !== "close" || memoryIntent !== "normal")) {
+    const previousUser = memoryIntent === "normal" ? undefined : history.slice().reverse().find(m => m.role === "user" && typeof m.content === "string" && (!m.ts || now - m.ts <= 20 * 60_000));
+    const reference = (previousUser?.content ?? "").split("\n\n")[0].trim();
+    const safeReference = /^(?:【附件|（用户只发|（另外附图)/.test(reference) ? "" : reference;
+    try {
+      const evidence = { text: text.trim(), at: now, intent: memoryIntent, scope,
+        ...(safeReference && safeEvidence(safeReference) ? { reference: safeReference.slice(0, 500) } : {}) };
+      if (correctingNow) thisCorrection = correctionTargets(memories(), evidence);
+      const job = await recordMemoryEvidence(evidence);
+      if (memoryIntent !== "normal") {
+        memoryOutcome = "pending";
+        const model = memoryModel(s, apiKey);
+        if (memoryIntent === "remember" && await writeExplicitMemory(job)) memoryOutcome = "saved";
+        else if (model) {
+          const result = await processReflection(model, [job], AbortSignal.timeout(4500));
+          if (result === "saved") memoryOutcome = "saved";
+          else if (result === "consumed") memoryOutcome = "clarify";
+        }
+      }
+    } catch (e) { logMemoryFailure(e); }
+  }
+  if (correctingNow) {
+    // 旧滚动摘要可能复述被纠正的结论。丢弃派生摘要而不碰聊天原文。
+    chatSummary = { ...emptyChatSummary(), coveredCount: history.length };
+    saveChatSummary();
+  }
+  const skipRecall = (localTurn && !correctingNow) || explicitEdit || isCurrentStateQuestion(text);
+  const wantsPast = PAST_REFERENCE_RE.test(text.trim());
+  const priorQuery = /^(?:那|然后|这个|那个|还是|照|按|继续|接着)/.test(text.trim()) && text.trim().length <= 30
+    ? (history.slice().reverse().find(m => m.role === "user")?.content ?? "").split("\n")[0].slice(0, 120) : "";
+  const memoryQuery = [text.trim(), priorQuery].filter(Boolean).join(" ");
+  const usable = recallableMemories().filter(e => !thisCorrection.includes(e.id));
+  const recalled = skipRecall ? [] : recallLongMemory(usable, memoryQuery, true, wantsPast, scope);
+  const hasRelated = !skipRecall && recallLongMemory(usable, memoryQuery, false, wantsPast, scope).length > 0;
+  const blocked = pendingCorrectionIds();
+  const historicalConflict = correctingNow || recallLongMemory(memories(), memoryQuery, false, true, scope).some(e => blocked.has(e.id));
+  // 原文搜索没有项目索引，有明确项目时不要把另外项目的对话灌回来。
+  const allowHistory = !skipRecall && !scope && !historicalConflict;
+  const historyRecall = wantsPast && allowHistory && !hasRelated ? await autoRecallHistory(memoryQuery) : "";
+  const turnNudge = !skipRecall && !historicalConflict && !scope && turn.intent === "open" && text.trim() ? takeTurnNudge(text, scope) : "";
+  memoryMetric("recall", { entries: recalled.length, historical: Number(Boolean(historyRecall)), suppressed: blocked.size, skipped: Number(skipRecall) });
+  const scopeGuide = scope?.startsWith("project:")
+    ? "【本轮范围】针对当前项目回答。前文其他项目的做法不适用；无本项目把握就询问，不要套用。" : "";
+  const memoryOutcomeGuide = memoryOutcome === "saved" ? "【本轮记忆结果】用户明确请求的记忆已保存，可以自然确认。"
+    : memoryOutcome === "session" ? "【本轮约定】仅在当前会话使用，不声称永久保存；直接自然接话。"
+    : memoryOutcome === "clarify" ? "【本轮结果】没有确认长期记忆变更；若缺少对象，直接问用户具体指哪件事，不报后台流程。"
+    : memoryOutcome ? "【本轮记忆结果】本轮没有确认记忆已保存；不准声称已经记住、已经改掉或删除。指代不明确时可简短问用户具体指什么。" : "";
   // 社交事件打点（零成本，不改人格）
   noteSocialEvents(text, correctingNow);
   // 消息真正发出去才算"回应了主动问候"（没回应则下一轮问候要换话题）
@@ -2334,7 +2160,9 @@ async function sendTurn(text: string) {
   // 生气了可以"不干活"：只拒社交类请求，第二次必做、每天最多 2 次、
   // 说「认真的」立刻照做（边界见 refusal.ts）。拒绝也要说清楚为什么。
   {
-    const refuseLine = explicitEdit || turn.intent === "repair" || turn.intent === "close" || turn.intent === "progress" ? "" : lifeRuntime.maybeRefuse(text, Date.now());
+    const hasRegister = (!outLang || outLang === "zh-cn") && registerTurn.forReply !== "default";
+    const refuseLine = explicitEdit || !!memoryOutcome || hasRegister || turn.intent === "repair" || turn.intent === "close" || turn.intent === "progress"
+      ? "" : lifeRuntime.maybeRefuse(text, Date.now());
     if (refuseLine) {
       const b = addBubble("ai", refuseLine);
       scheduleFade(b, 9000);
@@ -2407,7 +2235,7 @@ async function sendTurn(text: string) {
         diaryBrief ? `【你最近写过的日记（只有主题，要全文就用 view_diary）】\n${diaryBrief}` : "",
         moodWeek ? `【这几天的情绪】${moodWeek}` : "",
       ].filter(Boolean).join("\n\n");
-      const ctxMemories = localTurn || !text.trim() ? [] : recallRelevantMemories({ userText: text }, true);
+      const ctxMemories = recalled;
       const langInstruction = buildLanguageInstruction(s.assistant.outputLanguage ?? "", { pinChinese: true });
       // 生图能力要和模型说清楚：没配生图接入就**当场如实说明**，别硬调工具再报"接口没连上"。
       // 生图现在是独立接入（自己的供应商/端点/Key），不再看对话端点"像不像能画图"。
@@ -2427,7 +2255,7 @@ async function sendTurn(text: string) {
         (autoScreenAttached ? "\n\n" + AUTO_SCREEN_NOTE : "") +
         (musicCtx ? "\n\n" + musicCtx : "") +
         (expiredNote ? "\n\n" + expiredNote : "") +
-        "\n\n" + turnReplyGuide(turn.intent, turn.replyToGreeting) + "\n\n" + langInstruction;
+        "\n\n" + turnReplyGuide(turn.intent, turn.replyToGreeting) + "\n\n" + [scopeGuide, memoryOutcomeGuide, langInstruction].filter(Boolean).join("\n\n");
 
       const res = await chatStream(
         s.assistant.provider,
@@ -2453,13 +2281,13 @@ async function sendTurn(text: string) {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
           ...(imagesForTurn.length ? { userImages: imagesForTurn } : {}),
           // 没接入生图（或没填 Key）时干脆不暴露这个工具，模型就不会"先调一下试试"再报错
-          disabledTools: imgState.ready ? (editSources.length ? [] : ["edit_image"]) : ["generate_image", "edit_image"],
+          disabledTools: [...(!allowHistory ? ["search_chat_history"] : []), ...(imgState.ready ? (editSources.length ? [] : ["edit_image"]) : ["generate_image", "edit_image"])],
           extraTools: pluginRuntime.getOpenAITools(),
           // 画像 + 最近情绪只进本轮附加上下文：模型知道"这是什么样的人、最近过得怎样"，
           // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
           profileText: [localTurn ? "" : personaContextBlock(), turnNudge, historyRecall].filter(Boolean).join("\n\n"),
           // 长聊之后补上被窗口切掉的旧对话，避免"聊到一半突然不认识你"
-          historySummary: localTurn ? "" : summaryBlock(chatSummary),
+          historySummary: skipRecall || scope || historicalConflict ? "" : summaryBlock(chatSummary),
           // 语言提醒只贴在本轮请求最后一行，不写进历史
           ...(langReminder ? { tailInstruction: langReminder } : {}),
           // 人设锚点：人设完整文本在 system 最前面，太远了，这里再补一句短提醒
@@ -2578,15 +2406,6 @@ async function sendTurn(text: string) {
     saveHistory();
     ttsPlayer.flush();
 
-    // P3 主动学习：每攒够 6 条新消息提取一次（后台运行，不阻塞 UI）。
-    // 以前用 `history.length % 5 === 0`：tool 调用会让长度跳着涨，同一余数在长会话里反复命中，
-    // 提取次数不可控；改成按"自上次以来新增条数"触发。
-    const correcting = pendingCorrection;
-    pendingCorrection = false;
-    if (history.length - lastExtractedAt >= 6 || correcting) {
-      lastExtractedAt = history.length;
-      void extractMemoriesFromChat(s, apiKey, correcting);
-    }
     // 每轮记一个情绪采样（判断"他这几天状态怎么样"用）
     sampleMoodNow();
     if (!getBubbleText(loading).trim()) setBubbleText(loading, "(空回复)");
@@ -2761,33 +2580,6 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
         tool_call_id: tc.id,
         content: withHint(truncateToolResult(tc.name, result), repeatHint),
       });
-      continue;
-    }
-    if (tc.name === "remember") {
-      const content = String(tc.args.content ?? "").trim();
-      const category = String(tc.args.category ?? "other") as MemoryEntry["category"];
-      const importance = Math.min(3, Math.max(1, Number(tc.args.importance) || 2)) as MemoryEntry["importance"];
-      if (content) {
-        // 走统一的增删改层：同一件事换个说法不会存成两条，超上限按重要度淘汰
-        const res = applyMemoryOps(
-          memory,
-          [{ op: "add", content, category, importance }],
-          { keywordsOf: extractKeywords, maxCount: MEM_LIMIT, source: "user_said" },
-        );
-        memory = res.memory;
-        pushHistory({ role: "tool", tool_call_id: tc.id, content: res.added ? "已记住" : "已更新记忆" });
-        saveMemory();
-        // handleToolCalls 没有 apiKey：Key 缓存在 ensureApiKey 里，这里异步取一次
-        void (async () => {
-          try {
-            const key = await ensureApiKey();
-            // importance=1 是用户亲口给的核心信息，立刻重算画像，不等攒满 6 条
-            if (key) void synthesizeUserProfile(loadSettings(), key, importance === 1);
-          } catch { /* 忽略 */ }
-        })();
-      } else {
-        pushHistory({ role: "tool", tool_call_id: tc.id, content: "内容为空" });
-      }
       continue;
     }
     if (tc.name === "delete_wrong_history") {
@@ -3257,70 +3049,6 @@ async function handleToolCalls(calls: ToolCall[], loading: HTMLElement, budget: 
   }
 }
 
-/** 从中文文本中提取关键词（简单规则，不依赖分词库） */
-function extractKeywords(text: string): string[] {
-  // 提取引号内容、2-6字中文词组、英文单词
-  const keywords: string[] = [];
-  // 引号内容
-  const quoted = text.match(/[""「」『』]([^""「」『』]{1,20})[""「」『』]/g);
-  if (quoted) keywords.push(...quoted.map(q => q.slice(1, -1)));
-  // 英文单词
-  const english = text.match(/[a-zA-Z]{2,}/g);
-  if (english) keywords.push(...english.map(w => w.toLowerCase()));
-  // 中文2-6字片段（滑动窗口取高频）
-  const cnRuns = text.match(/[\u4e00-\u9fff]{2,}/g);
-  if (cnRuns) {
-    for (const run of cnRuns) {
-      for (let len = Math.min(6, run.length); len >= 2; len--) {
-        for (let i = 0; i <= run.length - len; i++) {
-          keywords.push(run.slice(i, i + len));
-        }
-      }
-    }
-  }
-  return [...new Set(keywords)].slice(0, 20);
-}
-
-/**
- * 根据当前场景召回相关记忆。
- *
- * 具体打分逻辑搬到了 memoryRank.ts（纯函数 + 单测）：BM25 + 近义扩展 + 2-gram 相似度，
- * 解决"用户说加班到三点、 памяти里有熬夜却召不回"的问题。
- */
-/**
- * 把刚写完的日记里"明确的、具体的事件"吸收进记忆库。
- *
- * 为什么要专门做这一步：日记和记忆原本各存各的，她日记里写着"今天他终于把论文交了"，
- * 聊天时却完全想不起来。这里只抽事实、不抽感想，带日期入记忆，并做相似度去重
- * （同一天补写、重复启动都不会灌进去一堆重复条目）。
- */
-export function absorbDiaryFacts(entries: { date: string; content: string }[]): number {
-  if (!entries.length) return 0;
-  loadMemory();
-  let added = 0;
-  const now = Date.now();
-  for (const entry of entries) {
-    for (const fact of extractDiaryFacts(entry)) {
-      const line = memoryLineFor(fact);
-      const dup = memory.some((m) => textSimilarity(m.content, line) > 0.82);
-      if (dup) continue;
-      memory.push({
-        id: `diary_${entry.date}_${added}_${now}`,
-        category: "event",
-        content: line,
-        keywords: ["日记", entry.date],
-        source: "ai_inferred",
-        createdAt: now,
-        lastUsedAt: now,
-        importance: 2,
-      });
-      added += 1;
-    }
-  }
-  if (added > 0) saveMemory();
-  return added;
-}
-
 function recallRelevantMemories(context: {
   timeOfDay?: string;
   currentApp?: string;
@@ -3328,8 +3056,7 @@ function recallRelevantMemories(context: {
   idleMinutes?: number;
   userText?: string;
 }, requireMatch = false): MemoryEntry[] {
-  if (memory.length === 0) return [];
-  return rankMemories(memory, context, { limit: 4, minScore: 5, requireMatch }).map((r) => r.entry);
+  return rankMemories(recallableMemories().filter(e => e.status === "active" && !e.scope), context, { limit: 4, minScore: 5, requireMatch }).map((r) => r.entry);
 }
 
 /**
@@ -3346,110 +3073,59 @@ function backgroundEndpoint(s: any): { base: string; model: string } | null {
   return { base, model };
 }
 
-/** P3 主动学习：从最近对话中提取用户信息，后台轻量调用 */
-async function extractMemoriesFromChat(s: any, apiKey: string, correcting = false) {
-  // 满了先按"最琐碎 + 最久没用"淘汰，而不是从此停止学习（长期使用必然会撞上限）
-  pruneMemory();
-  const recentMsgs = history.slice(-12).filter(m => m.role === "user" || m.role === "assistant");
-  if (recentMsgs.length < 3) return;
-  const transcript = recentMsgs.map(m => `${m.role}: ${m.content}`).join("\n");
-  // 提取器能看到已有记忆的 id，才能判断"这是新信息 / 该改旧的 / 旧的已经不作数了"。
-  // 只输出 add 的话，事实一变新旧会同时留着，模型看到互相矛盾的记忆只能瞎猜。
-  const extractPrompt = [
-    {
-      role: "system",
-      content:
-        "你是记忆整理器。看过这位用户的已有记忆和最近对话，决定要怎么更新记忆库，只输出 JSON：\n" +
-        '{"ops":[{"op":"add","content":"…","category":"…","importance":2}]}\n' +
-        "三种操作：\n" +
-        "- add：新出现的信息（偏好/习惯/作息/关系/计划/情绪倾向）。\n" +
-        "- update：已有记忆需要修正、补充、或事实变了 —— 必须带 id，content 写新的完整说法。\n" +
-        "- delete：用户否认了某条，或那件事已经不成立 —— 必须带 id。\n" +
-        "规则：\n" +
-        "1. 同一件事只留一条，不要换个说法再 add 一遍；用户纠正你时 update 对应那条。\n" +
-        "2. 事实发生变化（换工作、搬家、宠物送人、项目结束）用 update 覆盖旧结论，不要两条并存。\n" +
-        "3. category: identity/preference/habit/schedule/relationship/event/other；importance: 1=核心(称呼/身份/长期偏好) 2=重要 3=琐碎。\n" +
-        "4. 只记用户本人的信息，不要把助理自己说的话当事实，也不要记这次的临时任务细节。\n" +
-        "5. 没有值得记的就输出 {\"ops\":[]}。只输出 JSON，不要解释。\n" +
-        (correcting
-          ? "6. 用户这一轮明确在纠正你或否认某件事：优先 update 或 delete 相关旧记忆，绝对不要新增一条与旧结论并存的记忆。"
-          : ""),
-    },
-    {
-      role: "user",
-      content: `已有记忆（id 可用于 update/delete）：\n${formatMemoryForExtractor(memory)}\n\n最近对话：\n${transcript}`,
-    },
-  ];
-  try {
-    // 端点解析见 backgroundEndpoint：非 custom 也按实际 provider 走（曾因硬编码 DeepSeek 静默失败）
-    const ep = backgroundEndpoint(s);
-    if (!ep) return;
-    const { base, model } = ep;
-    const res = await fetch(`${base}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages: extractPrompt, temperature: 0.1 }),
-    });
-    if (!res.ok) return;
-    const json = await res.json();
-    const text = json.choices?.[0]?.message?.content ?? "";
-    const ops = parseMemoryOps(text);
-    if (!ops.length) return;
-    const applied = applyMemoryOps(memory, ops, {
-      keywordsOf: extractKeywords,
-      maxCount: MEM_LIMIT,
-      source: "ai_inferred",
-    });
-    if (!applied.changed) return;
-    memory = applied.memory;
-    saveMemory();
-    // 有新素材就（按阈值）重算画像：这一步才是"越聊越懂他"的来源。
-    // 用户刚纠正过就直接重算，别让画像带着旧结论再撑半天。
-    void synthesizeUserProfile(s, apiKey, correcting);
-    // 顺带补算向量做语义查重（后台，端点不支持就当天停手）
-    void refreshMemoryEmbeddings(s, apiKey);
-  } catch { /* 静默失败，不影响用户体验 */ }
+function logMemoryFailure(_: unknown): void {
+  // 不记录内容、模型响应或参与整理的历史。
+  console.debug("[记忆] 本次后台操作未完成");
 }
 
-/**
- * 用户画像提炼：把零散记忆重写成"这是个什么样的人"，后台跑，不阻塞对话、不弹任何提示。
- *
- * 用户明确要求画像**不在软件里直接查看**，所以这里没有任何 UI 出口 —— 画像只进 system prompt，
- * 由模型在聊天里自然地"侧面体现"。失败一律静默：画像只是锦上添花，坏掉不能影响正常聊天。
- */
-let profileSynthesizing = false;
-async function synthesizeUserProfile(s: any, apiKey: string, force = false) {
-  if (profileSynthesizing) return;
-  // force：用户刚亲口给了核心信息（称呼/身份这类），别等攒够 6 条，立刻重算一次
-  if (force) {
-    if (memory.length < 3) return;
-  } else if (!shouldSynthesize(userProfile, memory.length)) {
-    return;
-  }
-  const ep = backgroundEndpoint(s);
-  if (!ep) return;
-  profileSynthesizing = true;
-  try {
-    const res = await fetch(`${ep.base}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: ep.model,
-        messages: buildProfileMessages(memory, userProfile),
-        temperature: 0.3,
-      }),
+function memoryModel(settings: ReturnType<typeof loadSettings>, key: string): ReflectModel | null {
+  const endpoint = backgroundEndpoint(settings);
+  if (!endpoint || !isProviderReady(settings.assistant, key)) return null;
+  return async (messages, signal) => {
+    const timeout = AbortSignal.timeout(30_000);
+    const res = await fetch(`${endpoint.base}/chat/completions`, {
+      method: "POST", signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+      body: JSON.stringify({ model: endpoint.model, messages, temperature: 0.1 }),
     });
-    if (!res.ok) return;
+    if (!res.ok) throw new Error("记忆模型请求未完成");
     const json = await res.json();
-    const text = json.choices?.[0]?.message?.content ?? "";
-    const next = parseProfileResponse(text, userProfile, memory.length);
-    if (next) {
-      userProfile = next;
-      saveUserProfile();
+    const content = json?.choices?.[0]?.message?.content;
+    const input = json?.usage?.prompt_tokens;
+    const output = json?.usage?.completion_tokens;
+    memoryMetric("reflection", {
+      input: Number.isFinite(input) ? input : estimateTokens(JSON.stringify(messages)),
+      output: Number.isFinite(output) ? output : estimateTokens(typeof content === "string" ? content : ""),
+      estimated: Number(!Number.isFinite(input) || !Number.isFinite(output)),
+    });
+    return content;
+  };
+}
+
+let memoryWork: AbortController | null = null;
+let memoryRetryAt = 0;
+let memoryFailures = 0;
+async function runMemoryMaintenance(): Promise<void> {
+  if (busy || sending || clearingHistory || proactivePending || memoryWork || Date.now() < memoryRetryAt) return;
+  const settings = loadSettings();
+  if (!settings.assistant.enabled) return;
+  const work = new AbortController();
+  memoryWork = work;
+  try {
+    const key = await ensureApiKey();
+    if (work.signal.aborted) return;
+    const model = memoryModel(settings, key);
+    if (model) await reflectInBackground(model, work.signal);
+    if (!isUserConversationActive() && !work.signal.aborted) await dreamInBackground(work.signal);
+    memoryFailures = 0;
+  } catch (e) {
+    if (!work.signal.aborted) {
+      memoryRetryAt = Date.now() + Math.min(120_000, 15_000 * 2 ** ++memoryFailures);
+      memoryMetric("retry", { failures: memoryFailures });
+      logMemoryFailure(e);
     }
-  } catch { /* 静默失败 */ } finally {
-    profileSynthesizing = false;
   }
+  finally { memoryWork = null; }
 }
 
 /**
@@ -3467,6 +3143,7 @@ async function updateChatSummary(s: any, apiKey: string) {
   const ep = backgroundEndpoint(s);
   if (!ep) return;
   summaryRunning = true;
+  const base = chatSummary;
   try {
     const res = await fetch(`${ep.base}/chat/completions`, {
       method: "POST",
@@ -3480,7 +3157,8 @@ async function updateChatSummary(s: any, apiKey: string) {
     if (!res.ok) return;
     const json = await res.json();
     const text = json.choices?.[0]?.message?.content ?? "";
-    const next = parseSummaryResponse(text, chatSummary.text, nextCoveredCount);
+    if (chatSummary !== base) return;
+    const next = parseSummaryResponse(text, base.text, nextCoveredCount);
     if (next) {
       chatSummary = next;
       saveChatSummary();
@@ -3587,6 +3265,7 @@ async function generateProactive(cancelled: () => boolean): Promise<boolean> {
 
   // 召回相关记忆（桌宠自己的窗口不当作"主人在用的软件"）
   const currentApp = rawWindow && !isOwnWindow(rawWindow) ? appNameFromTitle(rawWindow) : "";
+  await loadLongMemory().catch(logMemoryFailure);
   const recallRaw = recallRelevantMemories({ timeOfDay, currentApp, currentTitle: rawWindow });
   // 记忆按时间分类过滤：上午的"正在上网课"到了晚上就不该再提（现场情境已过期），
   // 太久远的小事也不再翻出来——这正是"提不提"的判断，见 mentionScore.ts
@@ -3651,11 +3330,6 @@ async function generateProactive(cancelled: () => boolean): Promise<boolean> {
     const deliveredAt = Date.now();
     lifeRuntime.markDelivered(mainText, deliveredAt);
 
-    for (const m of relevantMemories) {
-      const orig = memory.find(e => e.id === m.id);
-      if (orig) orig.lastUsedAt = Date.now();
-    }
-    saveMemory();
     boostMood("greeting_sent");
     // 问候也是观察用户状态的机会：顺便记一个情绪采样点
     sampleMoodNow();
@@ -3714,7 +3388,7 @@ export async function triggerCardCommentary(card: { rarity: string; theme: strin
   const colorHook = makeStreamColorHook(bubble);
   try {
     // enableTools=false：点评不需要工具，省 token
-    await chatStream(s.assistant.provider, apiKey, s.assistant.model, tmpHistory, s.assistant.persona, memory, s.assistant.customBaseUrl, (d) => {
+    await chatStream(s.assistant.provider, apiKey, s.assistant.model, tmpHistory, s.assistant.persona, [], s.assistant.customBaseUrl, (d) => {
       colorHook.push(d);
       ttsPlayer.pushDelta(d);
     }, false, langInstruction);
@@ -3751,9 +3425,9 @@ export async function triggerCardCommentary(card: { rarity: string; theme: strin
     lifecycleOnClose?.();
   }
 }
-// 记忆初始化
-loadMemory();
-loadUserProfile();
+// 后台反思只处理已显式入队的增量，不自动上传旧聊天档案。
+void loadLongMemory().catch(logMemoryFailure);
+window.setInterval(() => void runMemoryMaintenance(), 15_000);
 loadChatSummary();
 loadMoodSamples();
 loadNudgeState();
