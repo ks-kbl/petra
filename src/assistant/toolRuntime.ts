@@ -24,7 +24,6 @@ export interface ToolSpec {
 export const TOOL_SPECS: Record<string, ToolSpec> = {
   launch_application: { required: ["application"] },
   run_shell: { required: ["command"], maxResultChars: 4000, confirm: true },
-  remember: { required: ["content"] },
   delete_wrong_history: { required: ["keywords"] },
   set_volume: {},
   set_reminder: { required: ["minutes", "message"] },

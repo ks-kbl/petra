@@ -58,3 +58,32 @@ assert.equal(keepTurnLocal(progress.intent), true);
 assert.notEqual(readTurn('这不是正在给你动刀子嘛', [], false, now).intent, 'progress');
 assert.notEqual(readTurn('这不是正在给你动刀子嘛', [earlier('assistant', greeted[0].content, 86_400_000)], false, now).intent, 'progress');
 console.log('conversation-turn: pass');
+
+{
+  const { advanceRegister, conversationReplyReminder } = require('./build/assistant/conversationRegister.js');
+  let state = 'default';
+  const send = (text, closing = false) => {
+    const turn = advanceRegister(state, text, closing);
+    state = turn.next;
+    return turn.forReply;
+  };
+  for (const line of ['你可以用文言文跟我讲话吗', '甚乖，吾欣慰哉', '重赏', '嗯？', '句式呢', '赏红烧肉之', '', '帮我查一下天气']) {
+    assert.equal(send(line), 'classical', line);
+    assert.match(conversationReplyReminder('', state), /整段都按文言句式/);
+  }
+  assert.equal(send('用白话翻译这一段'), 'classical');
+  assert.equal(send('说白话吧'), 'plain');
+  assert.equal(send('还有呢'), 'plain');
+  assert.equal(send('换回文言文'), 'classical');
+  assert.equal(send('别再用文言文了'), 'plain');
+  assert.equal(send('接下来用文言和我聊天'), 'classical');
+  assert.equal(send('拜拜', true), 'classical');
+  assert.equal(state, 'default');
+  for (const line of ['用文言文翻译这段', '文言文是什么？', '他说“用文言文跟我讲话”', '能用文言文写段自我介绍吗']) {
+    assert.equal(send(line), 'default', line);
+  }
+  assert.match(conversationReplyReminder('ja', 'classical'), /必须用日语/);
+  assert.doesNotMatch(conversationReplyReminder('ja', 'classical'), /文体约定/);
+  assert.match(conversationReplyReminder('zh-cn', 'plain'), /现代汉语白话/);
+  assert.equal(conversationReplyReminder('', 'default'), '');
+}
