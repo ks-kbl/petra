@@ -91,7 +91,7 @@ const greetingCall = /buildGreetingPrompt\(/;
 const cardCall = /buildCardCommentPrompt\(/;
 check("问候出口走 buildGreetingPrompt", greetingCall.test(panelSrc));
 check("抽卡点评出口走 buildCardCommentPrompt", cardCall.test(panelSrc));
-check("主聊天出口也用了末尾提醒", /buildLanguageReminder\(outLang/.test(panelSrc));
+check("主聊天出口也用了末尾提醒", /conversationReplyReminder\(outLang/.test(panelSrc) && /tailInstruction: langReminder/.test(panelSrc));
 check(
   "三条出口都通过 proactivePrompts / 提醒函数带语言指令（没有裸 prompt 直拼）",
   (panelSrc.match(/proactiveLangInstruction\(/g) || []).length >= 2,
@@ -109,6 +109,11 @@ check("问候 prompt 同时包含窗口检查与截图来源", insight.includes(
 check("问候 prompt 写入上一次未回复的问候", insight.includes("上一次问候用户没有回复") && insight.includes("又在敲代码呀"));
 check("问候 prompt 写入今天已问候话题", insight.includes("今天已经问候过的话题"));
 check("问候 prompt 要求换不同话题", insight.includes("必须换一个完全不同的话题"));
+const sharedParts = { timeStr: "2026/10/7 09:32:42", dayOfWeek: "星期三", memoryBlock: "", comfortLine: "", outputLanguage: "ja", sharedThread: "我测完这版告诉你" };
+const shared = pp.buildGreetingPrompt(sharedParts);
+check("问候可以引用用户主动约好的话头，禁止猜结果", /我测完这版告诉你/.test(shared) && /不催进度、不猜结果/.test(shared));
+check("上次问候未回复时不启用额外话头", !pp.buildGreetingPrompt({ ...sharedParts, previousGreeting: { greeting: "早呀" } }).includes(sharedParts.sharedThread));
+check("引用话头后仍把语言提醒放末尾", shared.endsWith(jaReminder));
 check("问候 prompt 要求输出 summary/greeting JSON", insight.includes('"summary"') && insight.includes('"greeting"'));
 
 const parsedGreeting = pp.parseGreetingResult('```json\n{"summary":"主人在写代码","greeting":"写累了吧，喝口水～"}\n```');

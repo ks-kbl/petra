@@ -19,6 +19,8 @@ export interface GreetingRecord {
   greeting: string;
   /** 用户是否回复过这次问候 */
   replied: boolean;
+  /** 用户主动提过的事，同一话头只交给一次已送达问候。 */
+  sharedThreadKey?: string;
 }
 
 /** 本地日期键（YYYY-MM-DD），按用户所在时区，不按 UTC */
