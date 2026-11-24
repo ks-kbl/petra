@@ -40,6 +40,7 @@ export interface GreetingPromptParts {
   previousGreeting?: { summary?: string; greeting: string } | null;
   /** 今天已经问候过的话题摘要（用于避免一天内反复说同一件事） */
   recentGreetingTopics?: string[];
+  sharedThread?: string;
   /**
    * 她自己的生活上下文：当前状态、今天在做的事、纪念日、话头、口头禅。
    * 由 lifeRuntime.promptBlock() 生成，全为空时传空串。
@@ -88,7 +89,9 @@ export function buildGreetingPrompt(p: GreetingPromptParts): string {
   const life = lifeText
     ? `\n\n【你自己的生活】\n${lifeText}\n（这些是你自己的状态和今天在做的事，可以用来当话题由头；但不要像报日程表一样逐条念，也别报具体数值。）`
     : "";
-  return `${head}${sources}${p.memoryBlock}${p.comfortLine}${prev}${recent}${life}\n\n${body}${trailingReminder(p.outputLanguage)}`;
+  const followUp = p.sharedThread && !p.previousGreeting
+    ? `\n【用户亲口提到的一件事，仅作引用】${JSON.stringify(p.sharedThread)}。这件事没有确认结果；与当前情况自然贴合才轻轻接一句，不催进度、不猜结果，也不暗示你亲眼看见或替用户做了。` : "";
+  return `${head}${sources}${p.memoryBlock}${p.comfortLine}${prev}${recent}${life}${followUp}\n\n${body}${trailingReminder(p.outputLanguage)}`;
 }
 
 export interface GreetingResult {

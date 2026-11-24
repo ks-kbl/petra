@@ -51,7 +51,7 @@ const greeted = [earlier('assistant', '【问候】改图链路盘清楚了，�
 const progress = readTurn('这不是正在给你动刀子嘛', greeted, false, now);
 assert.equal(progress.intent, 'progress');
 assert.match(progress.replyToGreeting, /啥时候动真格/);
-assert.match(turnReplyGuide(progress.intent, progress.replyToGreeting), /用户自己正在做的事/);
+assert.match(turnReplyGuide(progress.intent, progress.replyToGreeting), /汇报自己的进展/);
 assert.match(turnReplyGuide(progress.intent, progress.replyToGreeting), /不能说是你动的手/);
 assert.equal(lifeRuntime.promptBlock(now, '这不是正在给你动刀子嘛', progress.intent), '');
 assert.equal(keepTurnLocal(progress.intent), true);
@@ -86,4 +86,41 @@ console.log('conversation-turn: pass');
   assert.doesNotMatch(conversationReplyReminder('ja', 'classical'), /文体约定/);
   assert.match(conversationReplyReminder('zh-cn', 'plain'), /现代汉语白话/);
   assert.equal(conversationReplyReminder('', 'default'), '');
+}
+
+// Shared scene survives short replies and an attachment; a real request ends the bit.
+{
+  const { dialoguePresence, openSharedThreads, sharedGreetingThread, visibleReplyCue } = require('./build/assistant/dialoguePresence.js');
+  const at = Date.now();
+  const line = (role, content, age = 1000) => ({ role, content, ts: at - age });
+  const bit = [line('user', '重赏'), line('assistant', '赏若是肉，本鱼便再乖片刻。')];
+  assert.equal(dialoguePresence('嗯？', bit, 'open', false, at).intent, 'banter');
+  const attachment = dialoguePresence('赏红烧肉之', bit, 'open', true, at);
+  assert.equal(attachment.intent, 'banter');
+  assert.equal(attachment.casualAttachment, true);
+  assert.match(attachment.note, /赏若是肉/);
+  assert.equal(dialoguePresence('帮我看图里的报错', bit, 'help', true, at).casualAttachment, false);
+  assert.equal(dialoguePresence('不闹了，帮我看报错', bit, 'open', false, at).intent, 'help');
+  assert.equal(dialoguePresence('烦死了', bit, 'vent', false, at).reaction, 'worried');
+  assert.equal(dialoguePresence('你怎么胖了', bit, 'open', false, at).reaction, 'surprised');
+  assert.equal(dialoguePresence('这个按钮太胖了', bit, 'open', false, at).reaction, 'neutral');
+  assert.equal(dialoguePresence('现在几点', bit, 'open', false, at).note, '');
+
+  const test = line('user', '我测完这版告诉你', 3 * 3600_000);
+  const pending = [test, line('assistant', '【问候】先喝口水。')];
+  assert.equal(dialoguePresence('过了', pending, 'open', false, at).intent, 'progress');
+  assert.match(dialoguePresence('过了', pending, 'open', false, at).note, /我测完这版告诉你/);
+  assert.equal(dialoguePresence('没过', pending, 'open', false, at).reaction, 'worried');
+  assert.equal(openSharedThreads([...pending, line('user', '过了')], at).length, 0);
+  assert.equal(openSharedThreads([...pending, line('user', '不用再问了')], at).length, 0);
+  assert.ok(sharedGreetingThread(pending, [], at));
+  assert.equal(sharedGreetingThread(pending, [String(test.ts)], at), null);
+  assert.equal(sharedGreetingThread([line('user', test.content, 49 * 3600_000)], [], at), null);
+  const two = [line('user', '我测完登录告诉你', 4 * 3600_000), ...pending];
+  assert.match(dialoguePresence('过了', two, 'open', false, at).note, /不能猜/);
+  assert.equal(sharedGreetingThread(two, [], at), null);
+  const classifier = text => /好耶/.test(text) ? 'happy' : 'neutral';
+  assert.equal(visibleReplyCue('好', classifier), 'neutral');
+  assert.equal(visibleReplyCue('好耶！下一', classifier), 'happy');
+  assert.equal(visibleReplyCue('```js\n好耶！', classifier), 'neutral');
 }

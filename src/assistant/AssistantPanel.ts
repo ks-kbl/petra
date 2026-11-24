@@ -1,6 +1,7 @@
 import { lifeRuntime } from "./lifeRuntime";
 import { filterMentionable } from "./mentionScore";
 import { voiceCapabilityLine } from "./voiceTone";
+import { dialoguePresence, sharedGreetingThread, visibleReplyCue } from "./dialoguePresence";
 import { readTurn, keepTurnLocal, turnReplyGuide } from "./conversationTurn";
 import { advanceRegister, conversationReplyReminder, type ConversationRegister } from "./conversationRegister";
 import { evidenceScope, isGlobalScope, namedMemoryScope, SESSION_ONLY, type MemoryScope } from "./memoryScope";
@@ -872,6 +873,7 @@ function loadGreetingLog(): GreetingRecord[] {
         summary: typeof r.summary === "string" ? r.summary : "",
         greeting: r.greeting,
         replied: r.replied === true,
+        ...(typeof r.sharedThreadKey === "string" ? { sharedThreadKey: r.sharedThreadKey } : {}),
       }));
   } catch {
     return [];
@@ -891,9 +893,9 @@ function saveGreetingLog(records: GreetingRecord[]): void {
   }
 }
 
-function recordGreeting(summary: string, greeting: string): void {
+function recordGreeting(summary: string, greeting: string, sharedThreadKey?: string): void {
   const records = loadGreetingLog();
-  records.push({ at: Date.now(), summary: summary.trim(), greeting: greeting.trim(), replied: false });
+  records.push({ at: Date.now(), summary: summary.trim(), greeting: greeting.trim(), replied: false, sharedThreadKey });
   saveGreetingLog(records);
 }
 
@@ -2054,7 +2056,9 @@ async function sendTurn(text: string) {
   await ensureHistoryLoaded();
   await loadLongMemory().catch(logMemoryFailure);
   const now = Date.now();
-  const turn = readTurn(text, history, pendingImages.length + pendingTextFiles.length > 0, now);
+  const rawTurn = readTurn(text, history, pendingImages.length + pendingTextFiles.length > 0, now);
+  const presence = dialoguePresence(text, history, rawTurn.intent, pendingImages.length > 0, now);
+  const turn = { ...rawTurn, intent: presence.intent };
   const localTurn = keepTurnLocal(turn.intent);
   lifeRuntime.noteUserMessage(text, now, turn);
   // 附件：文本文件直接并进正文（模型立刻看得到）；图片只在本轮请求里编码成多模态，
@@ -2138,7 +2142,7 @@ async function sendTurn(text: string) {
   // 原文搜索没有项目索引，有明确项目时不要把另外项目的对话灌回来。
   const allowHistory = !skipRecall && !scope && !historicalConflict;
   const historyRecall = wantsPast && allowHistory && !hasRelated ? await autoRecallHistory(memoryQuery) : "";
-  const turnNudge = !skipRecall && !historicalConflict && !scope && turn.intent === "open" && text.trim() ? takeTurnNudge(text, scope) : "";
+  const turnNudge = !presence.suppressAmbient && !skipRecall && !historicalConflict && !scope && turn.intent === "open" && text.trim() ? takeTurnNudge(text, scope) : "";
   memoryMetric("recall", { entries: recalled.length, historical: Number(Boolean(historyRecall)), suppressed: blocked.size, skipped: Number(skipRecall) });
   const scopeGuide = scope?.startsWith("project:")
     ? "【本轮范围】针对当前项目回答。前文其他项目的做法不适用；无本项目把握就询问，不要套用。" : "";
@@ -2161,7 +2165,7 @@ async function sendTurn(text: string) {
   // 说「认真的」立刻照做（边界见 refusal.ts）。拒绝也要说清楚为什么。
   {
     const hasRegister = (!outLang || outLang === "zh-cn") && registerTurn.forReply !== "default";
-    const refuseLine = explicitEdit || !!memoryOutcome || hasRegister || turn.intent === "repair" || turn.intent === "close" || turn.intent === "progress"
+    const refuseLine = explicitEdit || !!memoryOutcome || hasRegister || presence.suppressAmbient || turn.intent === "vent" || turn.intent === "repair" || turn.intent === "close" || turn.intent === "progress"
       ? "" : lifeRuntime.maybeRefuse(text, Date.now());
     if (refuseLine) {
       const b = addBubble("ai", refuseLine);
@@ -2170,7 +2174,8 @@ async function sendTurn(text: string) {
       return;
     }
   }
-  reactNow(userEmo);
+  const listeningCue = presence.reaction;
+  if (!explicitEdit) reactNow(listeningCue);
   boostMood("chat");
   if (userEmo !== "neutral") boostMood(userEmo);
   // 截图：模型也可以自己用 capture_screen 触发；但用户明显在说"眼前这个东西"时，
@@ -2216,7 +2221,15 @@ async function sendTurn(text: string) {
     }
     const imgState = await imageReadyState();
     let finished = false;
-    let streamEmo: EmotionTag = "neutral";
+    let expressionPlayed = false;
+    let speakingCue: EmotionTag = "neutral";
+    const reactToReply = (cue: EmotionTag) => {
+      if (cue === "neutral" || expressionPlayed) return;
+      expressionPlayed = true;
+      // 听到同一结果时已经有反应，不在几秒内再播相同动作。
+      if (cue !== listeningCue) reactNow(cue);
+    };
+    ttsPlayer.setEmotion("neutral");
     while (budget.nextRound()) {
       if (budget.rounds > 1) setBubbleText(loading, "");
       // token 优化：记忆按场景/话题召回（≤6 条），而非全量注入 system prompt
@@ -2255,8 +2268,9 @@ async function sendTurn(text: string) {
         (autoScreenAttached ? "\n\n" + AUTO_SCREEN_NOTE : "") +
         (musicCtx ? "\n\n" + musicCtx : "") +
         (expiredNote ? "\n\n" + expiredNote : "") +
-        "\n\n" + turnReplyGuide(turn.intent, turn.replyToGreeting) + "\n\n" + [scopeGuide, memoryOutcomeGuide, langInstruction].filter(Boolean).join("\n\n");
+        "\n\n" + turnReplyGuide(turn.intent, turn.replyToGreeting) + "\n\n" + [presence.note, scopeGuide, memoryOutcomeGuide, langInstruction].filter(Boolean).join("\n\n");
 
+      let replyLead = "";
       const res = await chatStream(
         s.assistant.provider,
         apiKey,
@@ -2268,8 +2282,12 @@ async function sendTurn(text: string) {
         (delta) => {
           streamed = true;
           colorHook.push(delta);
-          // 情绪标签通常在开头几字就出现：先喂给 TTS，后面合成的句子就能带上语气
-          ttsPlayer.setEmotion(colorHook.lastEmotion());
+          if (speakingCue === "neutral" && replyLead.length < 160) {
+            replyLead = (replyLead + delta).slice(0, 160);
+            speakingCue = visibleReplyCue(replyLead, classifyAssistantEmotion);
+            reactToReply(speakingCue);
+          }
+          ttsPlayer.setEmotion(speakingCue);
           ttsPlayer.pushDelta(delta);
         },
         true,
@@ -2281,7 +2299,7 @@ async function sendTurn(text: string) {
           ...(screenshot.image ? { screenImage: screenshot.image } : {}),
           ...(imagesForTurn.length ? { userImages: imagesForTurn } : {}),
           // 没接入生图（或没填 Key）时干脆不暴露这个工具，模型就不会"先调一下试试"再报错
-          disabledTools: [...(!allowHistory ? ["search_chat_history"] : []), ...(imgState.ready ? (editSources.length ? [] : ["edit_image"]) : ["generate_image", "edit_image"])],
+          disabledTools: [...(!allowHistory ? ["search_chat_history"] : []), ...(presence.casualAttachment ? ["capture_screen"] : []), ...(imgState.ready ? (editSources.length ? [] : ["edit_image"]) : ["generate_image", "edit_image"])],
           extraTools: pluginRuntime.getOpenAITools(),
           // 画像 + 最近情绪只进本轮附加上下文：模型知道"这是什么样的人、最近过得怎样"，
           // 但不会被告知"有一份档案/记录"。turnNudge 是偶尔"顺口问一句"的旧事。
@@ -2294,12 +2312,13 @@ async function sendTurn(text: string) {
           ...(personaAnchor ? { personaAnchor } : {}),
         },
       );
-      if (colorHook.lastEmotion() !== "neutral") streamEmo = colorHook.lastEmotion();
 
       if (res.toolCalls.length) {
         // 工具调用：执行后进入下一轮
         if (budget.rounds === 1 && !streamed) setBubbleText(loading, "");
         await handleToolCalls(res.toolCalls, loading, budget, screenshot, editSources);
+        speakingCue = "neutral";
+        ttsPlayer.setEmotion("neutral");
         continue;
       }
 
@@ -2327,7 +2346,7 @@ async function sendTurn(text: string) {
         } catch { /* 忽略 */ }
       })();      // 情感反馈
       const finalEmo = classifyAssistantEmotion(mainText);
-      const aiEmo = finalEmo !== "neutral" ? finalEmo : streamEmo;
+      const aiEmo = finalEmo !== "neutral" ? finalEmo : speakingCue;
       setBubbleText(loading, "");
       bubbleBody(loading).append(document.createTextNode(aiEmo !== "neutral" ? `${emotionEmoji(aiEmo)} ${mainText}` : mainText));
       if (transText) {
@@ -2363,7 +2382,7 @@ async function sendTurn(text: string) {
         })();
       }
       if (aiEmo !== "neutral") {
-        reactNow(aiEmo);
+        reactToReply(visibleReplyCue(mainText.trimEnd() + (/[。！？!?]$/.test(mainText.trimEnd()) ? "" : "。"), classifyAssistantEmotion));
         boostMood(aiEmo);
       }
       // 颜色：识别不到情绪时用当前心情兜底，避免大部分回复都是白气泡
@@ -2405,6 +2424,10 @@ async function sendTurn(text: string) {
     }
     saveHistory();
     ttsPlayer.flush();
+    const speakingEpoch = conversationEpoch;
+    ttsPlayer.onIdle(() => {
+      if (conversationEpoch === speakingEpoch) ttsPlayer.setEmotion("neutral");
+    });
 
     // 每轮记一个情绪采样（判断"他这几天状态怎么样"用）
     sampleMoodNow();
@@ -3289,6 +3312,7 @@ async function generateProactive(cancelled: () => boolean): Promise<boolean> {
   const greetLog = loadGreetingLog();
   const previous = previousUnansweredGreeting(greetLog, Date.now());
   const todayTopics = recentGreetingTopics(greetLog, Date.now(), 3);
+  const sharedThread = previous ? null : sharedGreetingThread(history, greetLog.flatMap(r => r.sharedThreadKey ? [r.sharedThreadKey] : []), Date.now());
   const prompt = buildGreetingPrompt({
     lifeBlock: greetingLifeBlock(),
     timeStr,
@@ -3300,6 +3324,7 @@ async function generateProactive(cancelled: () => boolean): Promise<boolean> {
     outputLanguage: outLang,
     previousGreeting: previous ? { summary: previous.summary, greeting: previous.greeting } : null,
     recentGreetingTopics: todayTopics,
+    sharedThread: sharedThread?.quote,
   });
 
 
@@ -3342,19 +3367,23 @@ async function generateProactive(cancelled: () => boolean): Promise<boolean> {
       div.textContent = transText;
       bubbleBody(bubble).appendChild(div);
     }
+    const emo = visibleReplyCue(mainText.trimEnd() + (/[。！？!?]$/.test(mainText.trimEnd()) ? "" : "。"), classifyAssistantEmotion);
+    ttsPlayer.setMoodTone(lifeRuntime.voiceTone());
+    ttsPlayer.setEmotion(emo);
+    reactNow(emo);
     ttsPlayer.pushDelta(mainText);
     ttsPlayer.flush();
-
-    const finalEmo = classifyAssistantEmotion(mainText);
-    const emo = finalEmo !== "neutral" ? finalEmo : "love";
-    reactNow(emo);
+    const speakingEpoch = conversationEpoch;
+    ttsPlayer.onIdle(() => {
+      if (conversationEpoch === speakingEpoch) ttsPlayer.setEmotion("neutral");
+    });
     bubble.dataset.emotion = bubbleEmotion(emo);
 
     // 关键：主动问候也是正常对话，必须写进主历史并标【问候】，
     // 这样用户下一句回复时，模型知道"自己刚刚主动说过什么"。
     pushHistory({ role: "assistant", content: markGreetingForHistory(greeting), ts: deliveredAt });
     saveHistory();
-    recordGreeting(parsed.summary || mainText.slice(0, 80), mainText);
+    recordGreeting(parsed.summary || mainText.slice(0, 80), mainText, sharedThread?.key);
 
     if (ttsPlayer.configured) {
       ttsPlayer.onIdle(() => scheduleFade(bubble, 3000));
