@@ -81,45 +81,13 @@ src-tauri/target/release/bundle/msi/Petra_<版本>_x64_en-US.msi.sig    # update
 
 ---
 
-## 四、生成 / 更新 latest.json
+## 四、更新清单（latest.json）
 
-`release/latest.json` 是 updater 的元数据文件，指向 GitHub Release：
-
-```json
-{
-  "version": "0.1.x",
-  "notes": "Petra v0.1.x",
-  "pub_date": "2026-xx-xxTxx:xx:xxZ",
-  "platforms": {
-    "windows-x86_64": {
-      "signature": "<从 .sig 文件读取的内容>",
-      "url": "https://github.com/ks-kbl/petra/releases/latest/download/Petra_0.1.x_x64-setup.exe"
-    }
-  }
-}
-```
-
-其中 `signature` 字段 = **`.sig` 文件的完整内容**（base64，非路径）。
+客户端读取的是 [GitHub 最新正式 Release 的 `latest.json` 附件](https://github.com/ks-kbl/petra/releases/latest/download/latest.json)，不是仓库源码中的文件。发布 CI 使用 tauri-action 构建并签名安装包、生成并上传清单，再通过 `scripts/normalize-updater-metadata.mjs` 归一化清单并重新上传。**不维护或提交仓库内的清单副本。**
 
 ### 4.1 Legacy updater 兼容性约束（重要）
 
-> **Petra v0.1.5 legacy updater 固定读取 `platforms["windows-x86_64"]`，
-> 且只能直接启动 EXE**（把下载内容保存为 `.exe` 后 `Command::new(path).spawn()`）。
-
-因此在仍需兼容 v0.1.5 的时期：
-
-```text
-platforms["windows-x86_64"]      必须指向 NSIS updater（Petra_*_x64-setup.exe）
-platforms["windows-x86_64-nsis"] 指向 NSIS（同上，保持一致）
-platforms["windows-x86_64-msi"]  指向 MSI（供支持 MSI 的客户端 / 人工安装）
-```
-
-- **不要**让 `windows-x86_64` 指向 MSI（Tauri 默认行为）——否则旧客户端会下载 MSI 却当作 EXE 启动而失败
-- GitHub Actions workflow 已加入 **normalization 步骤**（`scripts/normalize-updater-metadata.mjs`），
-  在 `latest.json` 生成后自动把 `windows-x86_64` 覆盖为 `windows-x86_64-nsis` 的 url/signature，
-  永久保证每次发布都满足此约束，无需手工维护
-
-更新后提交 `release/latest.json` 并 push（这是唯一需要入库的更新相关文件）。
+Petra v0.1.5 legacy updater 固定读取 `platforms["windows-x86_64"]`，并将下载内容作为 `.exe` 启动。归一化步骤把 `windows-x86_64-nsis` 的 URL 和签名复制到 `windows-x86_64`，并保留 `windows-x86_64-msi`。不要单独手改 URL、版本或签名；清单中的 URL 和签名必须对应同一次构建的安装包。
 
 ### 4.2 Stable channel 约束（重要）
 
@@ -159,18 +127,11 @@ prerelease = false
 
 ---
 
-## 五、上传 GitHub Release
+## 五、通过 CI 发布 GitHub Release
 
-1. 打 tag：`git tag v0.1.x && git push origin v0.1.x`
-2. 创建 GitHub Release（可用 `gh release create` 或网页）
-3. 上传资产：
-   - `Petra_0.1.x_x64-setup.exe`
-   - `Petra_0.1.x_x64-setup.exe.sig`
-   - `release/latest.json`（已入库，Release 附件可不重复传）
-4. 将 Release 设为 **Latest**（非 prerelease）
-
-> updater 检查的 URL 是 `https://github.com/ks-kbl/petra/releases/latest/download/latest.json`，
-> 指向 Release 附件的 `latest.json`。
+1. 确认待发布提交及版本号、更新日志无误后，为该提交打版本 tag `v<版本>` 并推送该 tag。
+2. 等待 `.github/workflows/release.yml` 完成。由 CI 创建正式 Release 并上传签名安装包和 `latest.json`，不要提前手工创建同名 Release 或上传同名附件。
+3. 确认 [最新正式 Release 的更新清单](https://github.com/ks-kbl/petra/releases/latest/download/latest.json) 可访问、版本与 tag 一致、Windows x64 默认项指向对应的 NSIS 安装包。再核对安装包可下载、签名能校验。
 
 ---
 
