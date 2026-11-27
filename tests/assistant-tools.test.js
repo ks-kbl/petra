@@ -173,6 +173,8 @@ const fakeMem = [
 const sys = ac.systemPrompt("你是猫娘");
 check("人格设定仍在最前面", sys.startsWith("你是猫娘"));
 check("BASE_PROMPT 仍在 system 里", sys.includes("严格按照上面的人格设定"));
+check("内置对白默认用大白话并避免无故断句", /先在心里想清楚/.test(sys) && /默认用自然的大白话/.test(sys) && /一个完整意思尽量放在一句里/.test(sys));
+check("标点与语气服务于意思，不限死句数或覆盖文体约定", /表达真实的语气/.test(sys) && /少用比喻/.test(sys) && /用户明确要求文言、其他语言或特定文体时照约定执行/.test(sys));
 check("★ system 里不再有记忆/时间/画像（否则前缀缓存整段失效）", !sys.includes("关于用户的记忆") && !sys.includes("现在：") && !sys.includes("咖啡"));
 check("★ system 逐字节稳定", ac.systemPrompt("你是猫娘") === ac.systemPrompt("你是猫娘"));
 
