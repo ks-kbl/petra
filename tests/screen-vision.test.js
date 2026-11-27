@@ -52,6 +52,12 @@ const { validateToolArgs } = require("./build/assistant/toolRuntime.js");
     await run(history, { tailInstruction });
     assert.ok(requests[4].messages[3].content.endsWith(tailInstruction));
     assert.equal(imageHistory[0].content, "赏红烧肉之", "文体提醒不写入历史");
+    const cancelled = advanceRegister(opening.next, "我说不用说文言了");
+    const replyMode = advanceRegister(cancelled.next, "这个呢");
+    const white = conversationReplyReminder("", replyMode.forReply);
+    await run(history, { userImages: [image], tailInstruction: white });
+    assert.match(white, /切回白话/);
+    assert.ok(requests[5].messages[3].content[0].text.endsWith(white));
     console.log("screen-vision: all assertions passed");
   } finally {
     global.fetch = originalFetch;

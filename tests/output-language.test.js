@@ -113,6 +113,7 @@ const sharedParts = { timeStr: "2026/10/7 09:32:42", dayOfWeek: "星期三", mem
 const shared = pp.buildGreetingPrompt(sharedParts);
 check("问候可以引用用户主动约好的话头，禁止猜结果", /我测完这版告诉你/.test(shared) && /不催进度、不猜结果/.test(shared));
 check("上次问候未回复时不启用额外话头", !pp.buildGreetingPrompt({ ...sharedParts, previousGreeting: { greeting: "早呀" } }).includes(sharedParts.sharedThread));
+check("中文主动问候也尊重显式文体切换", pp.buildGreetingPrompt({ ...sharedParts, outputLanguage: "", registerReminder: "现在和接下来的对话都用白话" }).endsWith("现在和接下来的对话都用白话"));
 check("引用话头后仍把语言提醒放末尾", shared.endsWith(jaReminder));
 check("问候 prompt 要求输出 summary/greeting JSON", insight.includes('"summary"') && insight.includes('"greeting"'));
 

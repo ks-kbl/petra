@@ -71,6 +71,25 @@ console.log('conversation-turn: pass');
     assert.equal(send(line), 'classical', line);
     assert.match(conversationReplyReminder('', state), /整段都按文言句式/);
   }
+  // 实际聊天记录：不需要等模型口头确认才变更本地状态。
+  for (const phrase of ['不用说文言了', '我说不用说文言了', '我刚才说，不用说文言了', '你怎么还吾不吾的', '你怎么还在说文言文？']) {
+    assert.equal(advanceRegister('classical', phrase).next, 'plain', phrase);
+  }
+  const ts = 1800000000000;
+  const recent = [
+    { role: 'user', content: '你怎么还吾不吾的', ts: ts - 5000 },
+    { role: 'assistant', content: '汝令吾以文言对答。今若厌之，吾便改称我。', ts: ts - 3500 },
+  ];
+  assert.equal(advanceRegister('classical', '不用了', false, recent, ts).next, 'plain');
+  assert.equal(advanceRegister('classical', '不用了', false, recent, ts + 3600000).next, 'classical');
+  assert.equal(advanceRegister('classical', '不用了', false, [{ ...recent[1], content: '要我帮你设提醒吗？' }], ts).next, 'classical');
+  for (const phrase of ['他说「我说不用说文言了」', '文言文里的吾是什么意思？', '不用文言文翻译这一段']) {
+    assert.equal(advanceRegister('classical', phrase).next, 'classical', phrase);
+  }
+  const cancelled = advanceRegister('classical', '我说不用说文言了');
+  const followUp = advanceRegister(cancelled.next, '那你在干什么');
+  assert.equal(followUp.forReply, 'plain');
+  assert.match(conversationReplyReminder('', followUp.forReply), /旧文言指令.{0,15}不再作为文体依据/);
   assert.equal(send('用白话翻译这一段'), 'classical');
   assert.equal(send('说白话吧'), 'plain');
   assert.equal(send('还有呢'), 'plain');
