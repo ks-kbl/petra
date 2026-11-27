@@ -2088,7 +2088,7 @@ async function sendTurn(text: string) {
   // 语言提醒压在用户消息末尾：模型对末尾最敏感，放中段会被后面的中文语境带跑。
   // 但它**不进历史**——交给 chatStream 的 tailInstruction 在发送时贴到最后一行，
   // 否则之后每一条历史 user 消息都会带着同一句提醒，纯烧 token。
-  const registerTurn = advanceRegister(conversationRegister, text, turn.intent === "close");
+  const registerTurn = advanceRegister(conversationRegister, text, turn.intent === "close", history, now);
   conversationRegister = registerTurn.next;
   const langReminder = conversationReplyReminder(outLang ?? "", registerTurn.forReply);
   const userContent = composed;
@@ -3325,6 +3325,7 @@ async function generateProactive(cancelled: () => boolean): Promise<boolean> {
     previousGreeting: previous ? { summary: previous.summary, greeting: previous.greeting } : null,
     recentGreetingTopics: todayTopics,
     sharedThread: sharedThread?.quote,
+    registerReminder: outLang && outLang !== "zh-cn" ? "" : conversationReplyReminder(outLang, conversationRegister),
   });
 
 
